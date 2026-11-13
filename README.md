@@ -1,194 +1,316 @@
-# Borrowed Prefill
+# Yuzuri
 
-**During a prefill the GPU's dense weights sit idle. Borrow their VRAM for the
-prefill chunk, give it back before decode: a KTransformers + SGLang hybrid
-prefills 3-4x faster on the same card, with the same KV pool.**
+Yuzuri is a speed mod for KTransformers + SGLang.
 
-Qwen3.8-Flash-Next (NVFP4 MoE, 2x RTX 5070 Ti 16 GB, dual EPYC 7452):
+KTransformers + SGLang serves large mixture-of-experts models on small GPUs, with the experts in host memory.
 
-| | without | with Borrowed Prefill |
+Yuzuri adds three things to that server:
+
+- faster long prompts
+- faster decode
+- the model's full context, up to 1,048,576 tokens
+
+It is a Python package that an unchanged SGLang loads at startup.
+No SGLang or kt-kernel file is replaced.
+
+It serves models of 26B to over 300B parameters.
+
+The number of cards, their memory and the host's sockets are read at launch.
+None of them is assumed.
+
+## What it does
+
+- **Prefill lend.**
+  During a long prompt the GPU-resident weights give their VRAM to the prefill.
+  They come back layer by layer, at the same addresses.
+
+- **KV loan and plan.**
+  The KV pool's free pages go to the prefill too.
+  Each request's chunk is sized to its prompt, from the memory free at that moment.
+
+- **Hot lend.**
+  Between prompts the pool's free pages hold more experts on the GPU.
+  The slots follow the routing.
+  A prompt takes back only the slots its chunk needs; the rest keep their experts through the prefill.
+
+- **Host KV.**
+  The pool is made at the model's context.
+  The rows a card cannot hold sit in pinned host memory.
+  A prompt's own rows are on the card before its prefill reads them.
+
+- **Streamed prefill.**
+  A prompt's experts stream to the GPU from the CPU's own copy, in the checkpoint's format.
+
+One command starts the server.
+
+Nothing is sized by hand:
+
+- no memory fraction
+- no context to cut
+- no hot-expert count to pick
+
+## What it needs
+
+- A server already built on KTransformers + SGLang: SGLang with kt-kernel's CPU experts, in one Python venv.
+
+- SGLang as upstream ships it, or with your own patches.
+  - Yuzuri replaces no SGLang file. It attaches to the functions its features live in when the server starts.
+  - A function that has moved or changed shape stops the launch and names it.
+  - So does an SGLang that already carries one of Yuzuri's mechanisms.
+  - Checked on commits `58484246d26523eaf1a7f16ab524deee288d2120` and
+    `d193c34ae4b138aae4b8c0479ff395b0138a0156` (702 commits later).
+
+- Linux and NVIDIA GPUs (CUDA), one or more, of any memory size. AMD GPUs are not supported.
+  - What a card cannot hold stays in host memory: experts, and the KV rows past the card.
+  - Measured on SM120 cards of 16 GB.
+
+- Host memory for the experts and for the KV past the cards.
+
+[deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)
+(tag `2026-11-05-0936`) builds a venv with kt-kernel and the toolkit.
+
+Its SGLang is patched with mechanisms Yuzuri brings itself, so Yuzuri stops on it.
+Put an unpatched SGLang checkout ahead of it: `PYTHONPATH=<sglang checkout>/python`, for `setup.sh` and for the launch.
+
+## Install
+
+```sh
+git clone https://github.com/05yuki/yuzuri.git
+yuzuri/setup.sh --package <the server's venv>
+```
+
+What `setup.sh --package` does:
+
+- It first imports the venv's SGLang and kt-kernel with Yuzuri's hooks on, without a GPU.
+  Nothing is changed when that fails.
+
+- It builds Yuzuri's KV library.
+
+- It writes `yuzuri.pth` into the venv.
+
+- Where the venv has `nvidia-cuda-nvcc`, it installs the `nvidia-cuda-tileiras` of the same version beside it.
+
+What it leaves alone:
+
+- SGLang is not modified.
+
+- kt-kernel and FlashInfer are not modified either.
+  - Six of their Python files need Yuzuri's edits (`patches/`).
+  - A launch makes edited copies of the installed files under `~/.cache/yuzuri` (`YUZURI_CACHE`) and loads those.
+  - An edit that does not fit the installed file stops `setup.sh`, and a launch, naming the line it looked for.
+
+- kt-kernel's C++ extension is not rebuilt.
+  - `setup.sh` reports what that build lacks and what Yuzuri turns off for it (`tools/check-kt-kernel.py`).
+  - Those are NVFP4 one-byte scale codes for the hot lend's refill, and GGUF weight types.
+
+To undo it:
+
+- The `.pth` file does nothing unless the server is started through `tools/serve.py --package`.
+
+- `tools/install-pth.py <venv> --remove` gives the server back.
+  Nothing else of Yuzuri is in the venv.
+
+## Serve
+
+```sh
+yuzuri/tools/serve.py --package --venv <the server's venv> --config-dir <checkpoint dir> --tp 1
+```
+
+- `--tp 1` is one card and the CPU socket it hangs from.
+  `--tp 2` is two cards, one rank a socket.
+  Nothing else changes between them.
+
+- The profile is built from the checkpoint.
+  - The experts' format comes from the safetensors headers.
+  - The model's layers and context come from its config.
+  - No model is listed anywhere.
+
+- `--dry-run` prints the arithmetic and stops: weights, KV a token, threads, the resident hot experts.
+
+- `--profile <name>` takes a measured command line from `profiles/` instead.
+
+- The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`.
+
+- The first launch of an NVFP4 model compiles FlashInfer's cuTile kernels.
+
+## Features
+
+Every feature is on by default, and each can be turned off on its own.
+
+```sh
+yuzuri/tools/serve.py --list-features
+yuzuri/tools/serve.py ... --without hot-lend,host-kv
+yuzuri/tools/serve.py ... --features stream-prefill,prefill-lend
+```
+
+| feature | what it does | needs |
 |---|---|---|
-| 38K-token prompt | 1,337 tok/s | **4,154 tok/s** |
-| 105K-token prompt | 1,367 tok/s | **4,596 tok/s** |
-| decode | 58.5 tok/s | 59.3 tok/s |
-| KV pool | 231,616 tokens | 262,144 tokens |
-| output | | bit-identical |
+| `kv-vmm` | the KV pool on remappable memory, pages mapped as used | |
+| `stream-prefill` | a prompt's experts streamed to the GPU from kt-kernel's arenas | |
+| `prefill-lend` | the GPU-resident weights' VRAM lent to a streamed prefill | `stream-prefill` |
+| `kv-lend-plan` | the KV pool's free pages lent to the prefill, each request's chunk planned | `kv-vmm`, `prefill-lend` |
+| `swa-lend` | a hybrid sliding-window pool sized for the plan and lent outside prefill | `kv-lend-plan` |
+| `hot-lend` | the pool's free pages hold more experts on the GPU, following the routing | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| `host-kv` | the pool at the model's context, the rows past the card in host memory | `kv-vmm`, `kv-lend-plan` |
+| `cutile-nvfp4` | NVFP4 GPU experts on FlashInfer's cuTile MoE from the checkpoint's bytes | |
+| `cpu-gpu-overlap` | the CPU hand-off packed by one kernel, the shared expert after the CPU request | |
+| `host-allreduce` | all-reduce through host memory, for cards without peer access | |
+| `live-topk` | the sparse-attention indexer's top-k selected while the scores are made | |
+| `rope-tables` | the RoPE tables mapped as the context grows | `kv-vmm` |
+| `embed-on-host` | the token embedding read from pinned host memory | |
+| `mm-on-demand` | a multimodal model's encoder in host memory, on the card while it runs | |
 
-Five more models, including DeepSeek V4.1 at a 1M-token context, are in
-[Results](#results). The details behind every section are in
-[docs/details.md](docs/details.md).
+- A feature turned on without what it needs stops the launch with what to add.
 
-## How it works
+- The fixes (the thinking default, no shared-expert fusion under KT, the load timeout) have no switch.
 
-In a KTransformers hybrid (CPU experts; attention and hot experts on the GPU),
-a long prompt is prefilled by streaming the experts over PCIe, chunk by chunk.
-Every forward has a fixed transfer cost, so a larger chunk is faster, but on a
-16 GB card the chunk only gets what decode leaves free.
+## Expert formats
 
-During a prefill the lend releases the decoder weights' VRAM with
-[torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) (the
-addresses stay, so the decode CUDA graphs stay valid) and streams each layer
-back from a pinned host copy just before it runs. Everything is back before
-the next decode step. The chunk grows, the forward count drops, and the KV
-pool keeps every token it would have without the lend.
+| format | CPU experts | GPU experts and streamed prefill |
+|---|---|---|
+| bf16 | kt-kernel BF16 | FlashInfer CUTLASS |
+| ModelOpt or compressed-tensors NVFP4 | kt-kernel NVFP4 | FlashInfer cuTile, from the checkpoint's bytes |
+| MXFP4 | kt-kernel MXFP4 | Marlin, W16 streamed groups |
+| GGUF | kt-kernel LLAMAFILE | GGUF rows, MMQ streamed groups |
 
-Optionally (**the plan**), a prefill also borrows the KV pool's free pages, and
-the chunk is sized per request from the memory free at that moment.
+- Weights and scales stay in the checkpoint's form.
+
+- An NVFP4 checkpoint runs at its own precision: W4A4 when it stores activation scales, W4A16 when it does not.
+
+- Nothing is converted to a precision the checkpoint lacks.
+
+- The GPU kernels named are the ones the measured SM120 cards ran.
 
 ## Results
 
-2x RTX 5070 Ti 16 GB (PCIe 4.0 x16, no P2P), dual EPYC 7452, CPU experts in
-kt-kernel (AVX2). Tokens/s, without -> with the lend, on the same server.
+Two RTX 5070 Ti 16 GB, two EPYC 7452, 512 GB DDR4, one request at a time.
 
-| Model | chunk | 38K prompt | 114K prompt | decode | quality |
-|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next NVFP4 | 2048 -> 16384 | 1,336-1,337 -> **4,153-4,154** | 1,367 -> **4,596** (105K) | 58.5-58.7 -> 54.8-59.3 | bit-identical |
-| Qwen3.5-35B-A3B bf16 | 2048 -> 32768 | 1,568 -> **6,492-6,507** | 1,533 -> **6,406** | 91-97 -> 98-100 | bit-identical |
-| MiMo-V2.6-Flash MXFP4 | 2048 -> 22528 | 525 -> **1,962-1,978** | 496 -> **1,550** | 30-32 -> 32 | within run-to-run spread |
-| DeepSeek V4.1-Flash MXFP4, 1M ctx | 2048 -> 6144 | 255 -> **576** | 259 -> **596** | 25.4-25.6 -> 27.6-28.0 | NLL z -1.90 |
-| DeepSeek V4-Flash-Vision MXFP4 | 2048 -> 16384 | 601 -> **900-919** | 598 -> **849** | 36.5-39.9 -> 42.5-44.8 | NLL z -0.58 |
-| GLM-5.3-Flash NVFP4 experts | 2048 -> 14336 | 163 -> **327** | 155 -> **292** | 18.3 -> 19.9-20.1 | NLL z -0.35 / -1.04 |
+TP=2 is both cards and both sockets.
+TP=1 is one card and the socket next to it.
 
-TP=2 over both sockets. V4.1 keeps its 1,048,576-token KV pool and prefills a
-989,154-token prompt at 406 tok/s. On one card and one socket the lend is what
-makes room for a prefill at all: Qwen3.5 893-894 -> **5,142-5,157** tok/s at
-38K, Flash-Next **3,030-3,069** where it ran out of memory without it. Vision
-and GLM also gained hot experts (10 -> 12, 0 -> 10).
+- **on** is `serve.py` with its defaults.
+  Every pool is the model's context.
 
-*Bit-identical*: top-20 next-token logprobs match the base server bit for bit.
-*NLL z*: the same tokens read teacher-forced on both servers, z of the mean
-log-prob difference (negative = lend side lower).
+- **off** is `serve.py --features none`.
+  It is the same SGLang, kt-kernel and checkpoint.
+  It has a 4,096-token prefill chunk and SGLang's own share of the card for the pool.
 
-**With the plan**, a 35,000-token prompt (tokens/s, without -> with the plan):
+- Decode: Japanese prose, 1,024 tokens, the median of four prompts.
 
-| Model | into an empty pool | with another 35K cached | KV pool |
-|---|---|---|---|
-| Qwen3.8-Flash-Next NVFP4 | 4,736 -> **5,452** | 4,834 -> 4,808 | same |
-| Qwen3.5-35B-A3B bf16 | 6,446 -> **8,178** | 6,809 -> **8,883** | same |
-| DeepSeek V4.1-Flash, 1M ctx | 452 -> **603** | 609 -> **787** | 1,027,072 -> 1,048,576 |
-| DeepSeek V4-Flash-Vision | | 839 -> 857 | same |
-| MiMo-V2.6-Flash | | 1,915 -> 1,834 | same |
-| GLM-5.3-Flash NVFP4 experts | 320 -> 321 | 322 -> 323 | 201,280 -> **217,408** |
-| Qwen3.8-Flash-Next GGUF (IQ3_S) | | 4,636 -> 4,391 | same |
+- 35K prefill: the first 35,000-token prompt after the launch, in tokens a second.
 
-It gains where the chunk count drops; Vision, MiMo and GLM keep theirs at 35K.
-Decode is untouched, NLL identical or within launch noise, no run out of
-memory. With prompts cached around every lending window, hashing every page in
-use before and after found 0 changed (Flash-Next, MiMo, Vision). Empty cells:
-the first long prompt of that launch carried the streamer's one-time setup.
+- 131K prefill: a 131,072-token prompt, in tokens a second.
 
-## Quick start
+- Long decode: 256 tokens after the 131K prompt.
 
-**From nothing** (Flash-Next from a GGUF: both patched trees, a venv, kt-kernel
-built for your CPU and GPU, a sized launch):
+TP=2:
 
-```sh
-tools/install.sh ~/kt-serve                                                 # 10-20 min
-tools/make-config-dir.py <HF dir> <gguf dir> ~/kt-serve/config
-~/kt-serve/venv/bin/python tools/make-draft-dir.py <mtp gguf> <HF dir> ~/kt-serve/draft   # optional
-tools/serve.py --profile flash-next-gguf --venv ~/kt-serve/venv --tree ~/kt-serve/sglang \
-               --config-dir ~/kt-serve/config --gguf <gguf dir> --draft-dir ~/kt-serve/draft --tp 1 --calibrate
-```
+| model | experts | | pool | decode | 35K prefill | 131K prefill | long decode |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 131.7 tok/s | 7,256 tok/s | 6,633 tok/s | 50.4 tok/s |
+| | | off | 262,144 | 46.6 tok/s | 343 tok/s | 353 tok/s | 42.5 tok/s |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 104.2 tok/s | 4,113 tok/s | 2,387 tok/s | 33.6 tok/s |
+| | | off | 37,474 | 36.4 tok/s | 220 tok/s | does not fit the pool | |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 67.0 tok/s | 4,149 tok/s | 4,201 tok/s (150K) | 47.6 tok/s |
+| | | off | 82,368 | 45.6 tok/s | 270 tok/s | does not fit the pool | |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 67.9 tok/s | 4,024 tok/s | 4,659 tok/s | 61.5 tok/s |
+| | | off | 262,144 | 53.9 tok/s | 419 tok/s | 422 tok/s | 53.2 tok/s |
+| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 44.2 tok/s | 1,675 tok/s | 1,463 tok/s | 33.4 tok/s |
+| | | off | 115,480 | 25.7 tok/s | 94 tok/s | does not fit the pool | |
+| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | 24.6 tok/s | 1,871 tok/s | 2,178 tok/s | 24.7 tok/s |
+| | | off | does not start | | | | |
 
-`serve.py` probes the host and the model and prints the command with its
-arithmetic (`--dry-run` stops there). The context is the model's own and the
-KV pool is the context; the card's remainder goes to hot experts, and the
-memory fraction follows from that. `--calibrate` reads the first launch's log,
-keeps what it measured and relaunches if the plan moved (later launches start
-from those numbers). The plan is on when the tree has kv-vmm built
-(`install.sh` builds it; `--no-plan` turns it off). Profiles:
-`flash-next-gguf`, `flash-next-nvfp4`, `glm53-flash`, `dsv4-flash-vision`,
-`mimo-v26-flash`.
+TP=1:
 
-**On a server you already run:**
+| model | experts | | pool | decode | 35K prefill | 131K prefill | long decode |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 77.8 tok/s | 4,961 tok/s | 3,891 tok/s | 35.5 tok/s |
+| | | off | 87,048 | 36.2 tok/s | 218 tok/s | does not fit the pool | |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 69.0 tok/s | 3,009 tok/s | 1,343 tok/s | 25.9 tok/s |
+| | | off | 6,366 | 28.5 tok/s | does not fit the pool | does not fit the pool | |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 43.2 tok/s | 2,741 tok/s | 1,879 tok/s | 31.5 tok/s |
+| | | off | does not start | | | | |
 
-```sh
-pip install torch_memory_saver==0.0.9.post1          # in the server's venv
-python patches/sglang-kt-stream-graph-keep.py <sglang tree>
-python patches/sglang-kt-stream-shared-graph-inputs.py <sglang tree>   # DeepSeek V4 trees only
-python patches/sglang-kt-prefill-lend.py <sglang tree>                 # the patch for your tree, below
-KT_PREFILL_LEND=1 <your launcher>                                      # first launch calibrates, ~2 min
-```
+- "Does not start": the weights leave no room for a pool under SGLang's default share of the card, and the
+  launch stops asking for a larger `--mem-fraction-static`.
 
-| Tree | Patch |
-|---|---|
-| Qwen3.8-Flash-Next (SGLang v0519 fork) | `patches/sglang-kt-prefill-lend.py` |
-| DeepSeek V4 and its copies (V4.1, Vision, MiMo) | `patches/sglang-dsv41-kt-prefill-lend.py` |
-| Qwen3.5 (upstream SGLang, bf16 streamer) | `patches/sglang-qwen35-kt-prefill-lend.py` |
-| GLM-5.3 (full-GPU prefill) | `patches/sglang-glm53-kt-prefill-lend.py` |
+- These are one host's numbers.
+  On another server, compare the same prompts with and without Yuzuri:
+  - `tools/check.py --json after.json` against the server
+  - the same with `serve.py --features none`, for `before.json`
+  - `tools/check.py --compare before.json after.json`
 
-Also patch the installed kt-kernel (`patches/kt-kernel-shared-gpu-output.py`,
-then `patches/kt-kernel-lend-gpu-output.py`, on `kt_kernel/experts_base.py`),
-and source `tools/kt-lend-auto.sh` in your launcher to have the chunk picked
-for you. For the plan: `kv-vmm/build.sh`, then
-`python kv-vmm/sglang-kt-kv-vmm.py <sglang tree>` and the row-block patch for
-your streamer; for the hot lend, `python kv-vmm/sglang-kt-kv-hot-lend.py <sglang tree>`
-and `KT_KV_HOT_LEND=1 KT_KV_HOT_EXTRA=<X>`. Every step in full:
-[docs/details.md](docs/details.md#applying-it).
+- The launches measured had an earlier launch's record of the prefill's memory cost (see Limits).
 
-Then send a long prompt and watch `nvidia-smi`: usage climbs for the prefill
-and drops back for decode. `KT_PREFILL_LEND=0` turns it off.
+- The Flash-Next TP=1 row is the mean of two launches.
+  Its 131K prefill was 2,054 and 1,703 tok/s in the two.
 
-## Hot experts (GGUF)
+## Limits
 
-`hot/` adds a GPU hot-expert cache that follows decode's routing, and lends
-the KV pool's free pages to more hot experts in decode. Flash-Next from
-Strata's IQ3_S GGUF, one MTP draft step, decode:
+- **Concurrent requests.**
+  One runs at a time by default.
+  `serve.py --max-running-requests 4` runs up to four.
+  - At the default, a request that arrives while another runs waits in SGLang's queue.
+  - With more, the streams decode together.
+  - The CPU reads every expert any of them routes to, so streams of the same kind of text gain the most.
+  - A long prompt holds the other streams while it prefills: the prefill lends the GPU's weights and free KV
+    pages to itself.
+    They resume when it returns.
+  - The hot slots use the pool's free pages, so they shrink as running requests fill the pool.
+  - A model with linear-attention state gets that many requests' state slots, and the plan counts their memory.
 
-| | hot experts per layer | decode | KV pool |
-|---|---|---|---|
-| two cards, dynamic cache | 168 | **119.9 tok/s** | 121,152 |
-| Strata 0.1.42 on the same two cards | | 97.2 | |
-| one card + one socket | 56 | 81.5-82.0 | 65,536 |
-| one card + one socket + the KV lend | 56 + 14-18 lent | **83.8-84.6** | 65,536 |
+- **Four requests, measured.**
+  Qwen3.5-35B-A3B bf16, four 512-token Japanese prose requests, tokens over wall time.
+  - TP=2: 93.9 tok/s one after another, 198.2 tok/s together.
+  - TP=1: 53.1 tok/s one after another, 85.2 tok/s together.
+  - A 52,000-token prompt arriving while three streams decode: all four finish.
+    No KV row is left in host memory during that prefill.
+  - The numbers in Results are one request at a time.
 
-## Hot experts in the KV pool's free pages (NVFP4, MXFP4)
+- **One host.**
+  Tested at TP=2 and TP=1.
+  Other card counts, card sizes and socket counts are read at launch the same way and are not measured.
 
-`kv-vmm/kt_kv_hot_lend.py` does the same for the GPU's own expert method:
-outside prefill the plan's free KV pages hold more hot experts, and a prefill
-or a request that needs the pages takes them back first. Decode, TP=2:
+- **Not tested:** EP, DP attention, PP.
 
-| Model | slots lent | decode without -> with |
-|---|---|---|
-| Qwen3.8-Flash-Next NVFP4 | X = 32 asked | 65.57 / 66.40 -> **67.97 / 67.69** |
-| DeepSeek V4.1-Flash MXFP4, 1M pool | 3-4 a layer | 28.95 -> **29.98** |
-| MiMo-V2.6-Flash MXFP4 | 3-4 a layer | 31.97 -> **32.80** |
-| DeepSeek V4-Flash-Vision MXFP4 | 2-3 a layer | 41.90 -> **42.57 / 43.54** |
+- **NVIDIA only.**
+  AMD and Intel GPUs are not supported.
+  - The KV pool, the lends and the hot slots are built on CUDA's virtual memory calls
+    (`cuMemAddressReserve`, `cuMemMap`), which ROCm does not have.
+  - The GPU experts run on FlashInfer's CUDA kernels.
 
-It pays where the CPU experts set the token time; a GPU-bound model (Qwen3.5
-bf16) loses a little. Setup and the NLL notes:
-[docs/details.md](docs/details.md#hot-experts-and-the-kv-pools-free-pages).
+- **GPU generation.**
+  Among NVIDIA cards, Yuzuri asks for none.
+  - A card the base server runs on is a card Yuzuri runs on.
+  - Its lends, plan and host KV use CUDA memory calls, not a generation's kernels.
+  - It also widens the base: the DSV4-family sparse attention gets paths for SM89 and for cards before SM80.
+  - Measured on SM120 only.
+    The other generations are supported and not yet launched with the package.
 
-## Requirements and limits
+- **Launch time.**
+  A launch takes minutes: kt-kernel pins every expert in host memory first.
 
-- Who it is for: people running a KTransformers hybrid who are comfortable
-  patching an SGLang tree. The expert streamer the patches edit is not in
-  upstream SGLang (`streamers/` has the versions they expect).
-- A streamed prefill (or GLM's full-GPU prefill); prefill runs eagerly, decode
-  graphs are fine.
-- Tested on one host: TP=2 over two sockets, TP=2 on one socket, TP=1 on one
-  card and one socket. Not tested: EP, DP attention, PP.
-- `expandable_segments` is refused by torch_memory_saver.
-- A model that reads another layer's weights during prefill faults instead of
-  reading stale data; `KT_PREFILL_LEND_SKIP` / `KT_PREFILL_LEND_RESIDENT` keep
-  such weights resident.
-- Measured one request at a time; concurrent serving is not measured beyond
-  the window transitions waiting for in-flight GPU work.
+- **1M context.**
+  Host KV at 1M context needs host memory for the whole pool.
 
-The rest, and every knob: [docs/details.md](docs/details.md).
+- **The first launch on new cards.**
+  It measures the prefill's memory cost before it reports ready.
+  It sizes SGLang's buffers for a 36,864-row chunk.
+  Later launches read what it measured from the cache directory.
+
+- **GGUF experts.**
+  They need a kt-kernel build with their weight types' CPU kernels.
+  `setup.sh --package` says when it lacks them.
 
 ## Related work
 
-[deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)
-runs all of this on SGLang main for DeepSeek V4.1-Flash-1017: the lend, the
-plan, a hot lend whose slots follow the routing, and the KV pool past the GPU
-in host memory (kv-vmm's split ranges), so one 16 GB card serves a 1M context.
+[Strata](https://github.com/Niko1221/Strata) lends slots of its GPU expert cache to the prompt path, inside its own engine.
 
-[Strata](https://github.com/Niko1221/Strata) lends slots of its GPU expert
-cache to the prompt path and refills them afterwards, inside its own engine.
-This patch lends the dense decoder weights as well, inside SGLang, keeping the
-decode graphs' addresses through torch_memory_saver.
+Yuzuri lends the dense weights and the KV pool's pages as well, inside SGLang.
 
 ## License
 
 Apache-2.0, like KTransformers and SGLang.
+
+`python/yuzuri/tree/` holds Yuzuri's versions of SGLang modules (see `python/yuzuri/NOTICE`).
+

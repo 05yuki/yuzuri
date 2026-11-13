@@ -88,6 +88,13 @@ def gpus():
         node = _read(f"/sys/bus/pci/devices/{bus_l}/numa_node", "-1")
         res.append({"index": int(idx), "uuid": uuid, "bus": bus, "numa_node": int(node), "name": name,
                     "vram_total": int(total) * 2**20, "vram_used": int(used) * 2**20, "compute_cap": cc})
+    # a GPU whose NUMA node the firmware does not report (-1: one-socket desktops do this) is on node 0 when there is
+    # one node, else spread over the nodes in GPU order; "numa_node_known" says which
+    nodes = sorted(n["node"] for n in numa_nodes()) or [0]
+    for g in res:
+        g["numa_node_known"] = g["numa_node"] >= 0
+        if g["numa_node"] < 0:
+            g["numa_node"] = nodes[0] if len(nodes) == 1 else nodes[g["index"] % len(nodes)]
     procs = subprocess.run([smi, "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True).stdout
     using = []

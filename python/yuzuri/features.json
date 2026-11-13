@@ -1,0 +1,38 @@
+{
+ "about": "Yuzuri's features, each with the switches serve.py sets to turn it off and the features it needs. serve.py --features / --without pick them; every feature is on by default. Names follow the recipe's tier-1 patches where they are the same feature.",
+ "features": [
+  {"name": "kv-vmm", "for": "the KV pool on remappable memory, pages mapped as used",
+   "requires": [], "off": {"KT_KV_VMM": "0"}},
+  {"name": "stream-prefill", "for": "a prompt's experts streamed to the GPU from kt-kernel's arenas",
+   "requires": [], "off": {"KT_GPU_STREAM_PREFILL": "0"}},
+  {"name": "prefill-lend", "for": "the GPU-resident weights' VRAM lent to a streamed prefill",
+   "requires": ["stream-prefill"], "off": {"KT_PREFILL_LEND": "0"}},
+  {"name": "kv-lend-plan", "for": "the KV pool's free pages lent to the prefill, each request's chunk planned",
+   "requires": ["kv-vmm", "prefill-lend"], "off": {"KT_PREFILL_KV_LEND": "0", "KT_PREFILL_PLAN": "0"}},
+  {"name": "swa-lend", "for": "a hybrid sliding-window pool sized for the plan and lent outside prefill",
+   "requires": ["kv-lend-plan"], "off": {"KT_PREFILL_SWA_LEND": "0"}},
+  {"name": "hot-lend", "for": "the pool's free pages hold more experts on the GPU, following the routing",
+   "requires": ["kv-vmm", "prefill-lend", "stream-prefill", "kv-lend-plan"], "off": {"KT_KV_HOT_LEND": "0"}},
+  {"name": "host-kv", "for": "the pool at the model's context, the rows past the card in host memory",
+   "requires": ["kv-vmm", "kv-lend-plan"], "off": {"KT_HOST_KV": "0"}},
+  {"name": "cutile-nvfp4", "for": "NVFP4 GPU experts on FlashInfer's cuTile MoE from the checkpoint's bytes",
+   "requires": [], "off": {"KT_CUTILE_NVFP4": "0"}},
+  {"name": "cpu-gpu-overlap", "for": "the CPU hand-off packed by one kernel, the shared expert after the CPU request",
+   "requires": [], "off": {"KT_HANDOFF_PACK": "0", "KT_SHARED_AFTER_SUBMIT": "0"}},
+  {"name": "host-allreduce", "for": "all-reduce through host memory (two cards without peer access)",
+   "requires": [], "off": {"SGLANG_HOST_STAGED_ALLREDUCE": "0", "SGLANG_LL_ALLREDUCE": "0"}},
+  {"name": "live-topk", "for": "the sparse-attention indexer's top-k selected while the scores are made",
+   "requires": [], "off": {"KT_IDX_LIVE_TOPK": "0"}},
+  {"name": "rope-tables", "for": "the RoPE tables mapped as the context grows",
+   "requires": ["kv-vmm"], "off": {"SGLANG_ROPE_LAZY": "0"}},
+  {"name": "embed-on-host", "for": "the token embedding read from pinned host memory",
+   "requires": [], "off": {"SGLANG_EMBED_ON_HOST": "0"}},
+  {"name": "mm-on-demand", "for": "a multimodal model's encoder in host memory, on the card while it runs",
+   "requires": [], "off": {"SGLANG_MM_ON_DEMAND": "0", "SGLANG_MM_PROCESSOR_DEVICE": ""}}
+ ],
+ "always": [
+  {"name": "thinking-default", "for": "a request without the thinking toggle takes SGLANG_DEFAULT_THINKING"},
+  {"name": "shared-experts-unfused", "for": "no shared expert fused into a routed MoE that KT serves on the CPU"},
+  {"name": "load-timeout", "for": "the barrier after an unbalanced load from SGLANG_UNBALANCED_LOAD_TIMEOUT_S"}
+ ]
+}

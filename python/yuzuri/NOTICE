@@ -1,0 +1,7 @@
+tree/ holds, besides Yuzuri's own modules, Yuzuri's versions of SGLang modules (manifest.json, "overlay"). Those are
+SGLang's files (https://github.com/sgl-project/sglang, Apache-2.0) at the commit in manifest.json, with Yuzuri's
+changes. tools/package-from-tree.py writes tree/ and manifest.json from a working SGLang tree.
+
+csrc/kv_vmm.c is deepseek-v4.1-flash-1017-ktransformers's kv-vmm/kv_vmm.c (https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers,
+Apache-2.0) with Yuzuri's changes: host-memory chunks placed per range, every chunk a range touches restored and
+placed, the mapped-bytes count the ledger reads. setup.sh --package builds it into tree/srt/layers/moe/libkv_vmm.so.

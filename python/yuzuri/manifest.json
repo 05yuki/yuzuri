@@ -1,0 +1,172 @@
+{
+ "sglang_checked": "58484246d26523eaf1a7f16ab524deee288d2120",
+ "fetched": [
+  "srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml/"
+ ],
+ "modules": [
+  {
+   "module": "sglang.srt.layers.moe.kt_cutile_nvfp4",
+   "path": "srt/layers/moe/kt_cutile_nvfp4.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_ep_methods",
+   "path": "srt/layers/moe/kt_ep_methods.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_cutlass_workspace",
+   "path": "srt/layers/moe/kt_cutlass_workspace.py"
+  },
+  {
+   "module": "sglang.srt.layers.quantization.kt_gguf_dense_ops",
+   "path": "srt/layers/quantization/kt_gguf_dense_ops.py"
+  },
+  {
+   "module": "sglang.kernels.ops.attention.dsv4.live_topk",
+   "path": "kernels/ops/attention/dsv4/live_topk.py"
+  },
+  {
+   "module": "sglang.kernels.ops.attention.sm89_dual_scope",
+   "path": "kernels/ops/attention/sm89_dual_scope.py"
+  },
+  {
+   "module": "sglang.kernels.ops.quantization.fp8_block_gemv",
+   "path": "kernels/ops/quantization/fp8_block_gemv.py"
+  },
+  {
+   "module": "sglang.srt.distributed.device_communicators.host_staged_allreduce",
+   "path": "srt/distributed/device_communicators/host_staged_allreduce.py"
+  },
+  {
+   "module": "sglang.srt.distributed.device_communicators.ll_allreduce",
+   "path": "srt/distributed/device_communicators/ll_allreduce.py"
+  },
+  {
+   "module": "sglang.srt.layers.host_embedding",
+   "path": "srt/layers/host_embedding.py"
+  },
+  {
+   "module": "sglang.srt.layers.kt_sm75_ops",
+   "path": "srt/layers/kt_sm75_ops.py"
+  },
+  {
+   "module": "sglang.srt.layers.lazy_rope_table",
+   "path": "srt/layers/lazy_rope_table.py"
+  },
+  {
+   "module": "sglang.srt.layers.mm_on_demand",
+   "path": "srt/layers/mm_on_demand.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_dense",
+   "path": "srt/layers/moe/kt_gguf_dense.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_dense_qwen4exp",
+   "path": "srt/layers/moe/kt_gguf_dense_qwen4exp.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_dense_v41",
+   "path": "srt/layers/moe/kt_gguf_dense_v41.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_dequant",
+   "path": "srt/layers/moe/kt_gguf_dequant.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_draft",
+   "path": "srt/layers/moe/kt_gguf_draft.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_hot",
+   "path": "srt/layers/moe/kt_gguf_hot.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_moe_mmq",
+   "path": "srt/layers/moe/kt_gguf_moe_mmq.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_moe_multi",
+   "path": "srt/layers/moe/kt_gguf_moe_multi.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_gguf_tables",
+   "path": "srt/layers/moe/kt_gguf_tables.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_handoff_pack",
+   "path": "srt/layers/moe/kt_handoff_pack.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_hot_cache",
+   "path": "srt/layers/moe/kt_hot_cache.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_kv_hot_lend",
+   "path": "srt/layers/moe/kt_kv_hot_lend.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_kv_prefill_lend",
+   "path": "srt/layers/moe/kt_kv_prefill_lend.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_kv_vmm",
+   "path": "srt/layers/moe/kt_kv_vmm.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_launch_timing",
+   "path": "srt/layers/moe/kt_launch_timing.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_cpus",
+   "path": "srt/layers/moe/kt_cpus.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_ledger",
+   "path": "srt/layers/moe/kt_ledger.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_lend",
+   "path": "srt/layers/moe/kt_lend.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_lend_probe",
+   "path": "srt/layers/moe/kt_lend_probe.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_pinned",
+   "path": "srt/layers/moe/kt_pinned.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_prefill_plan",
+   "path": "srt/layers/moe/kt_prefill_plan.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_threshold",
+   "path": "srt/layers/moe/kt_stream_threshold.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_prefill",
+   "path": "srt/layers/moe/kt_stream_prefill.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_prefill_bf16",
+   "path": "srt/layers/moe/kt_stream_prefill_bf16.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_prefill_gguf",
+   "path": "srt/layers/moe/kt_stream_prefill_gguf.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_prefill_gguf_nvme",
+   "path": "srt/layers/moe/kt_stream_prefill_gguf_nvme.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.kt_stream_prefill_nvfp4",
+   "path": "srt/layers/moe/kt_stream_prefill_nvfp4.py"
+  },
+  {
+   "module": "sglang.srt.layers.moe.mxfp4_fp32_moe",
+   "path": "srt/layers/moe/mxfp4_fp32_moe.py"
+  }
+ ]
+}

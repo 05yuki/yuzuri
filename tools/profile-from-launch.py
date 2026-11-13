@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--experts")
     ap.add_argument("--draft-dir")
     ap.add_argument("--cache-dir")
+    ap.add_argument("--recipe", help="the recipe checkout: its paths become {recipe}")
     ap.add_argument("--weights", default='{"gguf": false, "experts_from": false, "embed_host": 0, "draft": "none"}')
     a = ap.parse_args()
     if a.pid:
@@ -55,7 +56,7 @@ def main():
     # the command: python -m sglang.launch_server ... -> from "-m" on
     if "-m" in cmd:
         cmd = cmd[cmd.index("-m"):]
-    paths = {k: os.path.abspath(v) for k, v in (("config_dir", a.config_dir), ("experts_dir", a.experts), ("draft_dir", a.draft_dir), ("cache_dir", a.cache_dir)) if v}
+    paths = {k: os.path.abspath(v) for k, v in (("config_dir", a.config_dir), ("experts_dir", a.experts), ("draft_dir", a.draft_dir), ("cache_dir", a.cache_dir), ("recipe", a.recipe)) if v}
 
     def sub_paths(v):
         for k, p in sorted(paths.items(), key=lambda kv: -len(kv[1])):
@@ -102,8 +103,12 @@ def main():
             v = "{draft_hot}"
         elif k in ("KT_HOT_SEED",):
             v = "{hot_seed}"
-        elif k in ("KT_EXPERT_PLACEMENT",) and v not in ("none", ""):
+        elif k in ("KT_EXPERT_PLACEMENT", "KT_KV_HOT_PLACEMENT") and v not in ("none", ""):
             v = "{placement}"
+        elif k == "KT_KV_VMM_LIB":
+            v = "{recipe}/build/libkv_vmm.so"
+        elif k in ("TORCH_EXTENSIONS_DIR", "TORCHINDUCTOR_CACHE_DIR", "SGLANG_CACHE_DIR"):
+            continue  # serve.py sets them under the recipe
         else:
             v = sub_paths(v)
         penv[k] = v
@@ -115,7 +120,7 @@ def main():
     # card (the context is the model's, the pool is the context, the hot experts take what is left)
     d = {"kv_dtype": "fp8" if defaults.get("kv_cache_dtype", "").startswith("fp8") else "bf16",
          "mamba_slots": int(defaults.get("mamba_slots", 8) or 8), "pools": int(defaults.get("pools", 1) or 1),
-         "chunk": int(defaults.get("chunk", 0) or 0), "threads": int(threads) if threads else None,
+         "chunk": None, "threads": None,  # the lend and the plan size the chunk, the host the threads
          "free_min_gb": 1.0}
     prof = {"name": a.name, "description": f"captured from a launch ({'pid ' + str(a.pid) if a.pid else a.command})",
             "weights": json.loads(a.weights), "defaults": {tp: d}, "command": command,

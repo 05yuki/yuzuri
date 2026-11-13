@@ -52,7 +52,9 @@ def plan(host, model, a):
     if len(gpus) < tp:
         raise SystemExit(f"{len(gpus)} GPUs for tp {tp}")
     ranks = gpus[:tp]
-    vram = min(g["vram_total"] for g in ranks)
+    # what each card has for this server: its memory less what other processes hold at the launch (a desktop, another
+    # server), the smallest over the ranks
+    vram = min(g["vram_total"] - g.get("vram_used", 0) for g in ranks)
     notes = []
     b = model["buckets"]
     dense = b.get("dense", {}).get("bytes", 0) / tp + b.get("hc", {}).get("bytes", 0)  # hc replicated
@@ -91,21 +93,21 @@ def plan(host, model, a):
     e = model.get("experts")
     slot = e["bytes_per_expert_mean"] / tp if e else 0  # the experts are tensor-parallel too: a rank holds 1/tp of a slot
     layer_slots = slot * (e["moe_layers"] if e else 0)
-    if a.context_auto and kv_tok > 0:
-        # the model's context does not leave --min-hot slots a layer: the largest context that does, whole pages
-        room = budget - (fixed - kv) - a.min_hot * layer_slots - (kv - a.context * kv_tok)
+    # the context is the model's and the pool is the context, whatever the card holds: the KV past the GPU
+    # lives in host memory (host KV), and on a card that cannot hold it the plan says so
+    # instead of cutting it
+    fit = a.context
+    if kv_tok > 0:
+        room = budget - (fixed - kv) - a.min_hot * layer_slots
         fit = int(room // kv_tok) // 4096 * 4096
         if fit < a.context:
-            notes.append(f"the model's context {a.context} needs {(a.context * kv_tok) / GiB:.2f} GiB of KV a rank; with "
-                         f"{a.min_hot} hot experts a layer {max(0, fit)} fits on this card (more cards, fp8 KV, or a "
-                         f"smaller --context)")
-            fixed -= (a.context - max(0, fit)) * kv_tok
-            kv -= (a.context - max(0, fit)) * kv_tok
-            a.context = max(0, fit)
+            notes.append(f"the model's context {a.context} needs {(a.context * kv_tok) / GiB:.2f} GiB of KV a rank; "
+                         f"with {a.min_hot} hot experts a layer the card holds {max(0, fit)} tokens of it: the rest "
+                         f"of the KV goes to host memory (host KV; sparse-attention models), or more cards")
     left = budget - fixed
-    hot = 0
-    if e and left > 0:
-        hot = int(left // slot // e["moe_layers"])
+    # the resident hot experts are the profile's minimum; every other slot is the hot lend's, in the KV pool's
+    # free pages, as many as the free memory holds at the time (nothing to size here)
+    hot = a.min_hot if e else 0
     # KT_HOT_KV_LEND: the empty pool's pages carry slots as well (~90% of the pool), given back as the KV grows;
     # the fixed KT_GPU_EXPERTS is the plan minus those (the TP1 default takes them, TP2 measured no gain)
     lent = int(kv * 0.9 // slot // e["moe_layers"]) if e and slot else 0
@@ -139,7 +141,7 @@ def plan(host, model, a):
     if busy:
         notes.append("GPUs in use: " + ", ".join(f"{u['name']}({u['pid']})" for u in busy))
     return {"tp": tp, "gpus": [g["uuid"] for g in ranks], "gpu_nodes": [g["numa_node"] for g in ranks],
-            "vram_per_rank": vram, "mem_fraction": int(budget / vram * 1000) / 1000, "budget": budget,
+            "vram_per_rank": vram, "mem_fraction": 1.0, "budget": budget,
             "graphs": graphs, "free_min": a.free_min_gb * GiB,
             "terms": ({"weights_fixed": cal["weights_fixed"], "draft": 0 if cal.get("includes_draft") else draft, "kv_pool": kv, "linear_states": lin, "overhead": cal["overhead"]} if cal else
                       {"dense+hc": dense, "lm_head": lm_head, "token_table": embed, "draft": draft, "kv_pool": kv,
@@ -147,7 +149,10 @@ def plan(host, model, a):
             "pool_predicted_tokens": int((budget - fixed + kv - hot * slot * (e["moe_layers"] if e else 0)) / max(1, kv / max(1, a.context))) if cal else None,
             "left_for_hot": left, "hot_experts_per_layer": hot, "lent_from_empty_pool": lent, "moe_layers": e["moe_layers"] if e else 0,
             "hot_fixed_with_kv_lend": max(0, hot - lent), "expert_slot_per_rank": slot,
-            "context": a.context, "model_context": a.model_context, "kv_bytes_per_token": kv_tok, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
+            "context": a.context, "model_context": a.model_context,
+            # without the package's pool (kv-vmm, host KV off): the tokens of KV the card itself holds, and SGLang's
+            # static share of the card that leaves the graphs and the decode's free memory
+            "card_context": max(4096, min(a.context, fit)), "card_fraction": round(budget / vram, 3), "kv_bytes_per_token": kv_tok, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
             "cpu_pools": pools, "threads": threads, "ram_need_experts_ple": ram_need, "notes": notes}
 
 
