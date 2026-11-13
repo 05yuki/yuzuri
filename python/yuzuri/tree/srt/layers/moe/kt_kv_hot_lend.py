@@ -102,7 +102,9 @@ DYNAMIC = os.environ.get("KT_KV_HOT_DYNAMIC_SLOTS", "0") == "1"
 DYN_EVERY = max(1, int(os.environ.get("KT_KV_HOT_DYN_EVERY", "32") or 32))
 DYN_SWAPS = int(os.environ.get("KT_KV_HOT_DYN_SWAPS", "2") or 2)
 DYN_HALF_LIFE = float(os.environ.get("KT_KV_HOT_DYN_HALF_LIFE", "256") or 256)
-DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "1.0") or 1.0)  # replace when new > victim x this
+# replace when new > victim x this: 2.0 on every model (at 1.0 near-equal experts trade places every round, and each
+# trade is a load that a prompt and the decode beside it pay for)
+DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "2.0") or 2.0)
 DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "512") or 512)  # rounds between log lines
 # GGUF swaps loaded by a background pool into pinned staging
 DYN_ASYNC = os.environ.get("KT_KV_HOT_DYN_ASYNC", "1") == "1"
