@@ -327,6 +327,25 @@ def _dev_pages():
     return dp if dp < STATE["n"] + 1 else None
 
 
+def window_back(rem: int) -> int:
+    """Bytes a new prompt of rem tokens maps back in the window that is open: a window's lend goes back whole when an
+    allocation runs past the pages it kept (it kept them for the prompt that opened it), or in part
+    (_take_back). The plan takes them out of the room first: a second 35,000-token prompt planned its chunk on the 5.23 GB that were lent, its first
+    allocation mapped them back, and the forward ran out of memory (Flash-Next GGUF, one card, no host KV, 11-17)."""
+    if STATE.get("lent") is None or STATE.get("owner") == "hot" or STATE.get("alloc") is None:
+        return 0
+    held = int(HELD["pages"].numel()) if HELD["pages"] is not None else 0
+    short = -(-(int(rem) + RESERVE) // STATE["ps"]) + 1 - (_free_count(STATE["alloc"]) - held)
+    if short <= 0:
+        return 0
+    if not PARTIAL or not STATE.get("tensors"):
+        return int(STATE["bytes"])
+    # the pages it is short of and a band at each end (_take_back), and the part chunks at a run's ends
+    band = max(C // pb for _, pb, C, _ in STATE["tensors"])
+    per_page = sum(pb for _, pb, _, _ in STATE["tensors"])
+    return min(int(STATE["bytes"]), (short + 2 * band) * per_page + sum(2 * C for _, _, C, _ in STATE["tensors"]))
+
+
 def loan_estimate(scheduler, rem: int) -> int:
     """Bytes a window for a request with rem prompt tokens to go could borrow
     (kt_prefill_plan). Only the allocator's free page count enters it, which is
@@ -571,10 +590,15 @@ def _take_back(short: int, why: str) -> bool:
     """The hot lend's lowest-numbered pages back to the free list, short of them and the pages one more chunk
     holds: the chunks under them are mapped again, the others stay unmapped. False: the whole lend goes back
     (restore)."""
-    if not PARTIAL or STATE.get("owner") != "hot" or not STATE.get("tensors") or STATE["lent"].numel() < short:
+    # a window's lend too: its memory is the window's free room, which the plan left for it (window_back). Whole, a
+    # second prompt's pages mapped all 5.23 GB back and the weights found 3.31 GB of the 3.87 they need at the
+    # window's end (Flash-Next GGUF, one card, no host KV, 11-17)
+    if (not PARTIAL or STATE.get("owner") not in ("hot", "window") or not STATE.get("tensors")
+            or STATE["lent"].numel() < short):
         return False
     t0 = time.perf_counter()
     a = STATE["alloc"]
+    hot = STATE.get("owner") == "hot"
     lent = STATE["lent"] = torch.sort(STATE["lent"]).values
     band = max(C // pb for _, pb, C, _ in STATE["tensors"])
     cut = int(lent[min(int(lent.numel()), short + band) - 1])
@@ -584,7 +608,7 @@ def _take_back(short: int, why: str) -> bool:
         _, pb, C, c0 = STATE["tensors"][ti]
         go[ti] = sorted(i for i in idx if c0 + i * C < (cut + 1) * pb)
         need += len(go[ti]) * C
-    if need:
+    if need and STATE.get("owner") == "hot":
         for fn in PARTIAL_SHRINK:
             fn(need, why)
     back, ok = 0, True
@@ -618,7 +642,8 @@ def _take_back(short: int, why: str) -> bool:
              f"{STATE['partial_max']:.1f})")
     # the allocation that asked takes its pages next; the rest of the band is not lent again until a page is freed
     # (a grow 1 s after a take-back unmapped the same 384 MiB, and the next allocation took it back, 11-10)
-    STATE["more_floor"] = _free_count(a) - short + 1
+    if hot:
+        STATE["more_floor"] = _free_count(a) - short + 1
     return True
 
 

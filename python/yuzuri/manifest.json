@@ -53,6 +53,10 @@
    "path": "srt/layers/kt_sm75_ops.py"
   },
   {
+   "module": "sglang.srt.layers.kt_nan_trace",
+   "path": "srt/layers/kt_nan_trace.py"
+  },
+  {
    "module": "sglang.srt.layers.lazy_rope_table",
    "path": "srt/layers/lazy_rope_table.py"
   },

@@ -478,7 +478,7 @@ def main():
             "hot_dynamic": "1" if hot else "0", "served_model_name": a.served_model_name or prof["name"],
             "placement": a.placement or "", "hot_seed": a.hot_seed or "", "draft_hot": a.draft_hot or "", "draft_gguf": "",
             "recipe": a.recipe or "", "kv_vmm_lib": kv_vmm_lib, "cache_root": cache_root, "lent": 0}
-    if a.draft_dir and w.get("draft") == "dir":
+    if a.draft_dir and (w.get("draft") == "dir" or os.path.exists(os.path.join(a.draft_dir, "kt_mtp_gguf.json"))):
         with open(os.path.join(a.draft_dir, "kt_mtp_gguf.json")) as f:
             vals["draft_gguf"] = json.load(f)["gguf"]
 
@@ -533,6 +533,8 @@ def main():
     for cond, block in (("draft_dir", "env_with_draft"), ("draft_hot", "env_with_draft_hot"), ("hot_seed", "env_with_hot_seed")):
         if getattr(a, cond) and block in prof:
             env.update(dict(zip(prof[block].keys(), fill(prof[block].values(), vals))))
+    if not env.get("KT_MTP_GGUF", "x"):
+        env.pop("KT_MTP_GGUF")  # a draft directory with its own safetensors
     # NVFP4 experts keep the checkpoint's one-byte e4m3 scale codes in kt-kernel's arenas when the installed
     # extension reads them (GeneralMOEConfig.scale_codes; the streamers and the hot lend then read the codes too),
     # else the scales folded to bf16: read from the venv, not set by a profile

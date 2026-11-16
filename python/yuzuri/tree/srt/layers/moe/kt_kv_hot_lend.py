@@ -113,8 +113,13 @@ DYN_HYST = float(_HYST_ENV or 2.0)
 DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "4096") or 4096)  # forwards between log lines
 # GGUF swaps loaded by a background pool into pinned staging
 DYN_ASYNC = os.environ.get("KT_KV_HOT_DYN_ASYNC", "1") == "1"
-DYN_ASYNC_CAP = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_CAP", "24") or 24))
-DYN_ASYNC_THREADS = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_THREADS", "2") or 2))
+# The staging holds one round's swaps: KT_KV_HOT_DYN_ASYNC_MB of pinned memory (512), no more items than a round's
+# budget over every layer. (24 items until 11-16: slots that start on experts nobody routes to took thousands of
+# forwards to reach the routed ones, and the cap went to the first layers.) KT_KV_HOT_DYN_ASYNC_CAP fixes the items.
+DYN_ASYNC_MB = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_MB", "512") or 512))
+DYN_ASYNC_CAP = int(os.environ.get("KT_KV_HOT_DYN_ASYNC_CAP", "0") or 0)
+# its threads: KT_KV_HOT_DYN_ASYNC_THREADS, else a quarter of the CPUs this process may run on, 2 to 8
+DYN_ASYNC_THREADS = int(os.environ.get("KT_KV_HOT_DYN_ASYNC_THREADS", "0") or 0)
 # KT_KV_HOT_DYN_VERIFY=1: before a batch's slots enter the table, read them back and compare them byte for byte with
 # the expert's GGUF rows read straight from the file (a check: it waits for the GPU)
 DYN_VERIFY = os.environ.get("KT_KV_HOT_DYN_VERIFY", "0") == "1"
@@ -928,9 +933,27 @@ class _AsyncGGUF:
     """A batch of GGUF swaps, their rows copied out of kt-kernel's cache into a
     pinned staging pool by background threads, then queued to their slots by the scheduler's thread."""
 
-    pool = None  # one pinned uint8 tensor, DYN_ASYNC_CAP items of `item` bytes
+    pool = None  # one pinned uint8 tensor, `items` items of `item` bytes
     item = 0
+    items = 0
     ex = None
+
+    @classmethod
+    def cap(cls) -> int:
+        """The swaps one batch may hold (0: no GGUF layer with roles yet)."""
+        if not cls.item:
+            item = 0
+            for M in LAYERS:
+                if not _is_gguf(M) or M.idx not in DYN.get("roles", {}):
+                    continue
+                r = DYN["roles"][M.idx]
+                item = max(item, M.slots[r[("w13", False)]][0].numel() + M.slots[r[("w2", False)]][0].numel())
+            if not item:
+                return 0
+            cls.item = (item + 4095) // 4096 * 4096
+            budget = DYN_SWAPS * DYN_EVERY * max(1, len(LAYERS))
+            cls.items = DYN_ASYNC_CAP or max(1, min(budget, (DYN_ASYNC_MB << 20) // cls.item))
+        return cls.items
 
     @classmethod
     def ready(cls, swaps) -> bool:
@@ -942,19 +965,13 @@ class _AsyncGGUF:
         if cls.pool is None:
             from concurrent.futures import ThreadPoolExecutor
 
-            item = 0
-            for M in LAYERS:
-                if not _is_gguf(M) or M.idx not in DYN.get("roles", {}):
-                    continue
-                r = DYN["roles"][M.idx]
-                item = max(item, M.slots[r[("w13", False)]][0].numel() + M.slots[r[("w2", False)]][0].numel())
-            if not item:
+            if not cls.cap():
                 return False
-            cls.item = (item + 4095) // 4096 * 4096
-            cls.pool = torch.empty(DYN_ASYNC_CAP * cls.item, dtype=torch.uint8, pin_memory=True)
-            cls.ex = ThreadPoolExecutor(max_workers=DYN_ASYNC_THREADS, thread_name_prefix="kt-hot-swap")
-            _log(f"dynamic GGUF swaps load in the background: {DYN_ASYNC_THREADS} threads, "
-                 f"{DYN_ASYNC_CAP} x {cls.item / 2**20:.1f} MiB of pinned staging")
+            n = DYN_ASYNC_THREADS or max(2, min(8, len(os.sched_getaffinity(0)) // 4))
+            cls.pool = torch.empty(cls.items * cls.item, dtype=torch.uint8, pin_memory=True)
+            cls.ex = ThreadPoolExecutor(max_workers=n, thread_name_prefix="kt-hot-swap")
+            _log(f"dynamic GGUF swaps load in the background: {n} threads, "
+                 f"{cls.items} x {cls.item / 2**20:.1f} MiB of pinned staging")
         return True
 
     @classmethod
@@ -2084,21 +2101,32 @@ def _dyn_round_impl(dev) -> None:
             pays = cv > vv * DYN_HYST if bar is None else cv * tilt - vv > bar
         ok = (cv > 0) & (vv < np.inf) & ((vv == -np.inf) | pays)
         take = np.minimum(np.cumprod(ok, axis=1).sum(axis=1), budget)
-        for i, (L, r) in enumerate(zip(Ls, res)):
-            capped = DYN_ASYNC and _is_gguf(L)
-            for t in range(int(take[i])):
-                if capped and len(swaps) >= DYN_ASYNC_CAP:
-                    break
-                j, e = int(vi[i, t]), int(ci[i, t])
-                old = int(place[i, j])
-                se, so = float(cv[i, t]), (float(vv[i, t]) if old >= 0 else 0.0)
-                if j < L.k:
-                    swaps.append((L, 0, j, old, e))
-                    L.held[j] = e
-                else:
-                    swaps.append((L, 1, j - L.k, old, e))
-                    L.res_held[j - L.k] = e
-                moved += (se - so) / 2.0 + se
+        # The background loader's batch has a size (its staging). The pairs that gain the most go first, whichever
+        # layer they are in: an empty slot before any other, and a layer's pairs in their own order (their gain
+        # only falls), so a pair still swaps only while every pair before it did.
+        pairs = [(i, t) for i in range(len(Ls)) for t in range(int(take[i]))]
+        cap = _AsyncGGUF.cap() if DYN_ASYNC and any(_is_gguf(L) for L in Ls) else 0
+        if cap and len(pairs) > cap:
+            pairs.sort(key=lambda p: -(cv[p] - vv[p]))
+        left, shut = cap, set()
+        for i, t in pairs:
+            L = Ls[i]
+            if cap and _is_gguf(L):
+                if not left:
+                    shut.add(i)
+                if i in shut:
+                    continue
+                left -= 1
+            j, e = int(vi[i, t]), int(ci[i, t])
+            old = int(place[i, j])
+            se, so = float(cv[i, t]), (float(vv[i, t]) if old >= 0 else 0.0)
+            if j < L.k:
+                swaps.append((L, 0, j, old, e))
+                L.held[j] = e
+            else:
+                swaps.append((L, 1, j - L.k, old, e))
+                L.res_held[j - L.k] = e
+            moved += (se - so) / 2.0 + se
     _ck("decide")
     if swaps:
         for which, table in ((0, tbl), (1, rtbl)):
@@ -2138,8 +2166,12 @@ def _dyn_round_impl(dev) -> None:
     if DYN["calls"] - DYN.get("calls_logged", 0) >= DYN_LOG and DYN["seen"] is not None:
         res = bool(DYN.get("res"))
         hit, cpu = DYN.pop("hit", 0.0), DYN.pop("all", 0.0)
+        # Under EP a rank's slots hold only its own experts, and the counts are every rank's routes: the share is
+        # this rank's, and the ranks' shares add up to what the GPUs took.
+        ep = bool(LAYERS) and _ep(LAYERS[0])
         _log(f"dynamic round {DYN['rounds']}: the GPU took {hit / max(cpu, 1):.1%} of the routes"
              + (" (resident rows and slots)" if res else " past the resident experts")
+             + (f" on this rank's slots (rank {LAYERS[0].method.rank} of {LAYERS[0].method.world}: the ranks' shares add)" if ep else "")
              + f" over the last {DYN['rounds'] - DYN.get('rounds_logged', 0)} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
              f"({(DYN['swaps'] - DYN['swaps_logged']) / (max(DYN['calls'] - DYN.get('calls_logged', 0), 1) * max(len(LAYERS), 1)):.3f} "
              f"a forward and layer); {_drv_text()}")

@@ -139,6 +139,11 @@ def _format_of(suffix):
     return "MXFP4", f"packed weights {w}, block scales {scale}"
 
 
+def _has_weights(d):
+    """The directory holds a weight file SGLang's loader reads."""
+    return any(f.endswith((".safetensors", ".bin", ".pt")) for f in os.listdir(d))
+
+
 def probe(d):
     return json.loads(subprocess.run([sys.executable, os.path.join(HERE, "modelprobe.py"), d, "--json"],
                                      capture_output=True, text=True, check=True).stdout)
@@ -182,13 +187,25 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
     env = dict(COMMON_ENV)
     env.update(FORMAT_ENV.get(method, {}))
     env["KT_GPU_STREAM_GROUP"] = str(group)
+    if gguf and not _has_weights(config_dir):
+        # a config directory with no weight file (tools/make-config-dir.py): the dense tensors come from the GGUF
+        env["KT_GGUF_DENSE"] = "{experts_dir}"
+        if c.get("ple"):
+            # the config declares a per-layer token table: from a GGUF it is a sparse file mapping the CPU reads
+            # (kt_gguf_dense_qwen4exp), so SGLang's check that the card reads pageable memory does not apply
+            cmd += ["--ple-offload-embedding", "--ple-offload-backend", "file"]
+            env["SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"] = "1"
     return {
         "name": os.path.basename(config_dir.rstrip("/")),
         "description": f"auto: {c.get('architecture')}, experts {method} ({why}), stream group {group}",
         "command": cmd, "command_with_placement": ["--init-expert-location", "{placement}"],
         "env": env, "env_by_tp": {str(tp): {}},
         "weights": {"gguf": bool(gguf), "experts_from": bool(experts_dir and experts_dir != config_dir) or bool(gguf),
-                    "embed_host": 0, "draft": "none"},
+                    "embed_host": 0, "draft": "auto"},
+        # --draft-dir DIR: one draft step a pass; the draft's own tensors come from a GGUF when DIR names one
+        "command_with_draft": ["--speculative-algorithm", "NEXTN", "--speculative-num-steps", "1", "--speculative-eagle-topk", "1",
+                               "--speculative-num-draft-tokens", "2", "--speculative-draft-model-path", "{draft_dir}"],
+        "env_with_draft": {"KT_MTP_GGUF": "{draft_gguf}"},
         "defaults": {str(tp): {"kv_dtype": c.get("kv_store") or "bf16", "mamba_slots": 8 if linear else 1, "pools": tp, "chunk": None,
                                "threads": None, "free_min_gb": 1.0}},
         "min_hot": 1,

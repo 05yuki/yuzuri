@@ -713,6 +713,9 @@ def chunk_for(scheduler, chunk: int) -> int:
             else kt_kv_prefill_lend.loan_estimate(scheduler, rem))
     back = _on_demand_for(req)
     room = free + loan - _margin() - back
+    if req is not scheduler.chunked_req and kt_lend.STATE.get("phase") == "prefill":
+        # a prompt that comes into an open window: the pages the window lent come back mapped for it
+        room -= _max_over_ranks(scheduler, getattr(kt_kv_prefill_lend, "window_back", lambda rem: 0)(rem))
     # a new prompt's KV rows the card does not hold yet (host KV) come out of the room before its chunk is chosen:
     # moved after it from what the chunk left, a 131K prompt found the room spent and wrote its KV past the card's
     # 145,555 rows in host memory (Gemma 4, 258 s against 56 s, 11-09). The largest need over the ranks, so every

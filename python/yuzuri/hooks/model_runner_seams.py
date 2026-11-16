@@ -54,6 +54,10 @@ def _install(m):
                 b = lazy_rope_table.install(self.model)
                 if b:
                     logger.info(f"RoPE tables mapped as the context grows: {b / MIB:.1f} MiB no longer resident")
+            if os.environ.get("KT_NAN_TRACE") == "1":
+                from sglang.srt.layers import kt_nan_trace
+
+                kt_nan_trace.install(self.model)
             return got
 
         return load_model

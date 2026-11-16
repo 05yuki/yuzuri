@@ -80,6 +80,18 @@ def mmq_mul_mat(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, out: 
         kt_gguf_moe_mmq.mul_mat(x[r0 : r0 + step], qweight, qweight_type, out[r0 : r0 + step], qbuf)
 
 
+def mmq_tail_for(qweight: torch.Tensor, qweight_types) -> int:
+    """The most bytes MMQ reads past a 2-D GGUF weight's last row over the types it holds (0: none, or not MMQ's)."""
+    if not _MMQ_ON or qweight.dim() != 2 or qweight.dtype != torch.uint8:
+        return 0
+    tail = 0
+    for t in qweight_types:
+        if t in MMQ_PREFILL_TYPES:
+            block_size, type_size = gguf.GGML_QUANT_SIZES[t]
+            tail = max(tail, mmq_tail_bytes(t, qweight.shape[1] // type_size * block_size))
+    return tail
+
+
 def pad_for_mmq(qweight: torch.Tensor, qweight_types) -> "torch.Tensor | None":
     """A copy of a GGUF weight whose storage extends the MMQ tail past its last row (zeros), or None when it
     already does or MMQ does not take it. Done once at load, before any CUDA graph records the weight."""

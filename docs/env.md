@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-271 names.
+276 names.
 
 ## KT_
 
@@ -124,8 +124,9 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_KV_HOT_DYNAMIC_RESIDENT` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYNAMIC_SLOTS` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYN_ASYNC` | `"1"` | kt_kv_hot_lend.py |
-| `KT_KV_HOT_DYN_ASYNC_CAP` | `"24"` | kt_kv_hot_lend.py |
-| `KT_KV_HOT_DYN_ASYNC_THREADS` | `"2"` | kt_kv_hot_lend.py |
+| `KT_KV_HOT_DYN_ASYNC_CAP` | `"0"` | kt_kv_hot_lend.py |
+| `KT_KV_HOT_DYN_ASYNC_MB` | `"512"` | kt_kv_hot_lend.py |
+| `KT_KV_HOT_DYN_ASYNC_THREADS` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYN_EVERY` | `""` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYN_HALF_LIFE` | `"256"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYN_HYST` | `""` | kt_kv_hot_lend.py |
@@ -175,6 +176,8 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_MXFP4_STREAM_PIECE_KIB` | `"1024"` | kt_stream_prefill.py |
 | `KT_MXFP4_STREAM_READERS` | `"8"` | kt_stream_prefill.py |
 | `KT_MXFP4_STREAM_REPORT` | `"40"` | kt_stream_prefill.py |
+| `KT_NAN_TRACE` | - | model_runner_seams.py |
+| `KT_NAN_TRACE_LINES` | `"12"` | kt_nan_trace.py |
 | `KT_NUMA_NODES` | - | kt_ep_methods.py |
 | `KT_NVFP4_STREAM_W16` | `"0"` | kt_stream_prefill_nvfp4.py |
 | `KT_PREFILL_KV_LEND` | `"0"` | kt_kv_prefill_lend.py |
@@ -184,6 +187,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_PREFILL_KV_LEND_VERIFY` | `"0"` | kt_kv_prefill_lend.py |
 | `KT_PREFILL_LEND` | `"0"` | kt_lend.py |
 | `KT_PREFILL_LEND_CALIBRATING` | - | kt_ep_methods.py |
+| `KT_PREFILL_LEND_DEAD_MB` | `"64"` | kt_lend.py |
 | `KT_PREFILL_LEND_DEBUG` | `"0"` | kt_lend.py |
 | `KT_PREFILL_LEND_EMPTY_EACH_CHUNK` | `"1"` | kt_lend.py |
 | `KT_PREFILL_LEND_HINT` | `""` | kt_lend.py, kt_prefill_plan.py, kt_stream_threshold.py |
@@ -258,6 +262,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `SGLANG_GGUF_DEQUANT_SLICE_MB` | `"256"` | kt_gguf_dense_ops.py |
 | `SGLANG_GGUF_MMQ_ROWS` | `"64"` | kt_gguf_dense_ops.py |
 | `SGLANG_GGUF_MMQ_SLICE_MB` | `"32"` | kt_gguf_dense_ops.py |
+| `SGLANG_GGUF_MMVQ_HUGE_ROWS` | `"32768"` | gguf_dense.py |
 | `SGLANG_GGUF_PREFILL_MMQ` | `"1"` | kt_gguf_dense_ops.py |
 | `SGLANG_HICACHE_STAGING_MB` | `"32"` | hicache_staging_cap.py |
 | `SGLANG_HOST_STAGED_ALLREDUCE` | - | host_allreduce.py |

@@ -4,6 +4,9 @@ module keeps every call these do not take (kt_gguf_dense_ops holds the kernels' 
   fused_mul_mat_gguf        a batch of SGLANG_GGUF_MMQ_ROWS rows and more on llama.cpp's MMQ (the weight stays in
                             its GGUF blocks; SGLANG_GGUF_PREFILL_MMQ=0 turns it off), or, for a type MMQ does not
                             build, a sliced dequant + bf16 GEMM from SGLANG_GGUF_DEQUANT_ROWS rows
+                            a window of 2 to KT_GGUF_MOE_MAXM tokens (a speculative verify) reads each weight row
+                            once for all its tokens (kt_gguf_moe_multi; KT_GGUF_DENSE_MULTI=0 turns it off), and an
+                            lm_head (more than SGLANG_GGUF_MMVQ_HUGE_ROWS rows) goes to SGLang's MMQ from 2 tokens
   apply_gguf_embedding      Q5_K rows in float32 as gguf-py opens them, in steps
   GGUFLinearMethod.process_weights_after_loading   the bytes MMQ reads past a weight's last row, once, before any
                             decode graph records the weight
@@ -12,6 +15,8 @@ module keeps every call these do not take (kt_gguf_dense_ops holds the kernels' 
   GGUFEmbeddingMethod.process_weights_after_loading   code that ties an output head to the embedding reads .weight
   kt_sm75_ops               sgl-kernel's GGUF ops built for GPUs older than the wheel's arches (nothing on SM80+)
 """
+import os
+
 from yuzuri._finder import after_import
 from yuzuri.hooks._seam import rewrite, wrap
 
@@ -26,11 +31,24 @@ def _install(m):
     from sglang.srt.layers.quantization import kt_gguf_dense_ops as ops
 
     kt_sm75_ops.load_if_needed()
+    from sglang.srt.layers.moe import kt_gguf_moe_multi as multi
+
+    huge_rows = int(os.environ.get("SGLANG_GGUF_MMVQ_HUGE_ROWS", "32768"))
+    mmq_types = getattr(m, "MMQ_QUANT_TYPES", ()) if hasattr(m, "ggml_mul_mat_a8") else ()
 
     def make_mul(orig):
         def fused_mul_mat_gguf(x, qweight, qweight_type):
             if qweight_type in m.UNQUANTIZED_TYPES:
                 return orig(x, qweight, qweight_type)
+            n = x.shape[0]
+            if 2 <= n <= multi.MAX_TOKENS:
+                # a speculative verify window: each weight row read once for all its tokens (the same sums)
+                if qweight.shape[0] <= huge_rows:
+                    if multi.dense_ok(x, qweight, qweight_type):
+                        return multi.dense_a8_vec(x, qweight, qweight_type)
+                elif qweight_type in mmq_types:
+                    # an lm_head: MMVQ runs one block per row and token
+                    return m.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
             if ops.mmq_takes(x, qweight, qweight_type):
                 out = torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
                 ops.mmq_mul_mat(x, qweight, qweight_type, out)
@@ -69,6 +87,9 @@ def _install(m):
                 for key, value in vars(qweight).items():  # the attributes the loader reads off the parameter
                     setattr(padded_param, key, value)
                 layer.register_parameter("qweight", padded_param)
+            # whoever moves the weight's bytes (the prefill lend's spans and slots) keeps this many zero bytes after
+            # them: inside such a span pad_for_mmq sees a storage that already holds the tail and makes no copy
+            layer.qweight._kt_read_past = ops.mmq_tail_for(layer.qweight.data, types)
 
         return process_weights_after_loading
 

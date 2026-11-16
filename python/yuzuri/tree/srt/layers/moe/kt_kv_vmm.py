@@ -489,18 +489,22 @@ def _rows_now(index: int, loc, seq: int = 0) -> None:
         _spot_place(index, later, gen, int(FLIGHT.get("ahead", 0) or 0), "the pages ahead", got - used)
 
 
+VOCAB = 0  # the model's vocabulary without a host pool to say it (kt_lend.before_forward; -1: asked, unknown)
+
+
 def extend_room(device, rows=None, logprobs: bool = True, forward_batch=None) -> None:
     """kt_lend.before_forward, before a forward that does not stream (decode's memory): its KV rows on the card
     (_extend_rows), then the card's free memory up to what this forward takes (KT_HOST_KV_MARGIN_MB; rows: what the
     plan measured a row of a forward costs; with its input logprobs two vocab-wide fp32 rows a token). The hot lend
     gives the slots that cover what is short, the same count on every rank; the pool's rows yield only what the
     slots could not. The next decode brings them back (host_in_flight)."""
-    if HOST is None or not HOST.get("go") or device is None:
+    if device is None:
         return
     index = torch.device(device).index
     index = torch.cuda.current_device() if index is None else index
-    if not any(t.device.index == index for t in HOST_MADE):
-        return
+    # without a host pool on this card the hot lend's slots are the only room there is: they took all that was free,
+    # and a 480-token extend found 0.35 GiB and ran out on a 256 MiB buffer (Flash-Next GGUF on one card, 11-17)
+    host = HOST is not None and bool(HOST.get("go")) and any(t.device.index == index for t in HOST_MADE)
     own = 0
     if rows is not None:
         try:
@@ -509,12 +513,12 @@ def extend_room(device, rows=None, logprobs: bool = True, forward_batch=None) ->
             row = float(kt_prefill_plan.ROW or 0)
         except Exception:
             row = 0.0
-        own = int(row * int(rows)) + (2 * 4 * int(rows) * int(HOST.get("vocab", 0) or 0) if logprobs else 0)
+        own = int(row * int(rows)) + (2 * 4 * int(rows) * (int((HOST or {}).get("vocab", 0) or 0) or max(VOCAB, 0)) if logprobs else 0)
     # the forward's own memory stays out of the room its rows come into: without it the rows took what was free,
     # the forward was short of its logprobs, the rows went back, and the next forward brought them in again; twelve
     # 256-token scoring forwards after a 131K prompt each moved 0.84 GiB in and 0.94 out until none were left on the
     # card and the thirteenth did not fit (Flash-Next NVFP4 on one card, 11-11)
-    if forward_batch is not None:
+    if host and forward_batch is not None:
         _extend_rows(index, forward_batch, reserve=own + (64 << 20))
     need = margin() + own
     torch.cuda.empty_cache()
@@ -543,7 +547,7 @@ def extend_room(device, rows=None, logprobs: bool = True, forward_batch=None) ->
                 h.shrink(0, "a short extend", slots=v[0])
             torch.cuda.empty_cache()
             short = need - card_free(index)
-    if short > 0 and host_yield(index, short + (64 << 20), why="a short extend") < short:
+    if host and short > 0 and host_yield(index, short + (64 << 20), why="a short extend") < short:
         try:  # who holds the card when the pool's rows could not cover a forward
             from sglang.srt.layers.moe import kt_ledger
 

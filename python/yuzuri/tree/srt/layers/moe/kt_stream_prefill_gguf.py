@@ -423,14 +423,31 @@ class KTStreamPrefillGGUF:
             g = {k: v[:T] for k, v in self._pre_gin.items()}
             self._gin[T] = g
         if g is None:
-            f32 = torch.float32
-            g = {
-                "x": torch.zeros((T, self.K), dtype=torch.bfloat16, device=self.device),
-                "ids": torch.empty((T, physical_ids.shape[1]), dtype=torch.int32, device=self.device),
-                "w": torch.empty((T, physical_ids.shape[1]), dtype=f32, device=self.device),
-                "acc": torch.zeros((T, self.K), dtype=torch.bfloat16, device=self.device),
-                "out": torch.empty((T, self.K), dtype=torch.bfloat16, device=self.device),
-            }
+            # one set for every row count, views of the largest: a set a row count stayed on the card outside the
+            # lend scratch (nine of them held 909 MiB after two 35,000-token prompts in one window, and the
+            # weights could not come back, 11-17). A larger row count makes it anew, in the scratch, and the graphs
+            # captured on the old one go with it
+            own = getattr(self, "_own_gin", None)
+            if own is None or self._own_T < T:
+                if own is not None:
+                    torch.cuda.synchronize(self.device)
+                    self._gin.clear()
+                    self._graphs.clear()
+                    self._graph_use.clear()
+                    self._own_gin = own = None
+                kk, f32, bf = physical_ids.shape[1], torch.float32, torch.bfloat16
+                with _scratch_region():
+                    own = {
+                        "x": torch.empty((T, self.K), dtype=bf, device=self.device),
+                        "ids": torch.empty((T, kk), dtype=torch.int32, device=self.device),
+                        "w": torch.empty((T, kk), dtype=f32, device=self.device),
+                        "acc": torch.empty((T, self.K), dtype=bf, device=self.device),
+                        "out": torch.empty((T, self.K), dtype=bf, device=self.device),
+                    }
+                self._own_gin, self._own_T = own, T
+                _log(f"rank{self.rank} graph inputs for {T} rows: "
+                     f"{sum(v.numel() * v.element_size() for v in own.values()) >> 20} MiB in the lend scratch")
+            g = {k: v[:T] for k, v in self._own_gin.items()}
             self._gin[T] = g
         g["x"][:n].copy_(x)
         g["ids"][:n].copy_(physical_ids)

@@ -90,6 +90,7 @@ def _say_once(where, exc):
 ENABLED = os.environ.get("KT_PREFILL_LEND", "0") == "1"
 MIN_BYTES = int(os.environ.get("KT_PREFILL_LEND_MIN_BYTES", str(1 << 20)))
 TAG_WEIGHTS = "kt_lend_weights"
+TAG_COMPACT = "kt_lend_weights_compact"
 TAG_SCRATCH = "kt_lend_scratch"
 HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
 # 256 MiB (was 512): what a window adds outside torch's allocator measured 0 to
@@ -97,6 +98,8 @@ HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
 # the sequence is in the measured peak of a window, not in this margin
 MARGIN = int(os.environ.get("KT_PREFILL_LEND_MARGIN_MB", "256")) << 20
 DEBUG = os.environ.get("KT_PREFILL_LEND_DEBUG", "0") == "1"
+# the spans are made anew at the end of the load when they hold this much that no parameter reads
+DEAD_BYTES = int(os.environ.get("KT_PREFILL_LEND_DEAD_MB", "64")) << 20
 SKIP = [w for w in os.environ.get("KT_PREFILL_LEND_SKIP", "engram").split(",") if w]
 RESIDENT = [
     w for w in os.environ.get("KT_PREFILL_LEND_RESIDENT", "hc_").split(",") if w
@@ -177,6 +180,16 @@ def _nbytes(t) -> int:
         shape = getattr(t, "tensor_shape", None)
         return int(math.prod(shape)) * 9 // 8 if shape else 0
     return t.numel() * t.element_size()
+
+
+def _tail(q) -> int:
+    """Bytes past a parameter that a kernel reads and that must be zero: its
+    owner says so in _kt_read_past (a GGUF weight's MMQ tail: the kernel reads
+    a row out to 512 values). The layout keeps that room and zeroes it. Left
+    out, the kernel read the next parameter or a slot's old bytes there: a
+    block scale that is not finite times a zero activation is NaN in the last
+    output column of every row (Flash-Next GGUF at TP=1, 11-16)."""
+    return int(getattr(q, "_kt_read_past", 0) or 0)
 
 
 def _pinned_bounce(n: int):
@@ -277,6 +290,10 @@ def _mirror_open_gguf(host: torch.Tensor) -> None:
             if item[0] != "param":
                 continue
             off, n = item[4], item[5]
+            tail = STATE.get("tails", {}).get(i, {}).get(item[1], 0)
+            if tail:  # the zeros past the parameter come from the pinned copy
+                residual_parts.append((i, off + n, tail, base + off + n))
+                unmatched += tail
             pos = 0
             parts = []
             while pos < n:
@@ -909,6 +926,7 @@ def _relayout(i: int, counts) -> None:
         + [n for n in names if any(w in n for w in pfonly)]
     )
     active = pfo = None
+    tails = {}
     for name in names:
         q = params.get(name)
         if active is None and any(w in name for w in IDLE):
@@ -936,8 +954,11 @@ def _relayout(i: int, counts) -> None:
             continue
         if not lo <= q.data_ptr() < hi:
             counts["moved"] += 1
+        tail = _tail(q)
+        if tail:
+            tails[name] = tail
         new.append(("param", name, tuple(q.shape), q.dtype, off, _nbytes(q)))
-        off = _align(off + _nbytes(q))
+        off = _align(off + _nbytes(q) + tail)
     params = q = None
     span = _align(off)
     STATE.setdefault("active", {})[i] = span if active is None else active
@@ -965,6 +986,9 @@ def _relayout(i: int, counts) -> None:
             else layer.get_parameter(item[1])
         )
         _place(host, item).copy_(src)
+        if item[0] == "param" and tails.get(item[1]):
+            host[item[4] + item[5] : item[4] + item[5] + tails[item[1]]].zero_()
+    STATE.setdefault("tails", {})[i] = tails
     _point(layer, host, new)
     STATE["dev_spans"][i] = None
     del found, src
@@ -1034,6 +1058,42 @@ def after_module(module) -> None:
     STATE["counts"]["early"] += 1
 
 
+def _compact(host, bases) -> None:
+    """The spans were made for the layers as built. A load that takes parameters out of them (another format's dense
+    linears in place of the checkpoint's) leaves each span holding bytes no parameter reads. A torch_memory_saver
+    region is a torch MemPool: a segment freed in it is not handed back while the pool lives, and a span made anew is
+    cut from the old segment, so the dead bytes stay with the weights and every resume maps them again: 1.07 GiB a
+    card on a GGUF-dense launch, and a one-GPU launch without host KV could not bring its weights back for it
+    (chain 99). The spans are made at the size the layers read in a second region, and the load's region, now
+    empty, is paused for good: its physical memory goes back, its addresses stay."""
+    device = STATE["device"]
+    decs = [d.numel() for d in STATE["dev_spans"]]
+    dead = sum(f.numel() for f in STATE["dev_full"]) - sum(decs)
+    if dead < DEAD_BYTES:
+        return
+    free0 = torch.cuda.mem_get_info(device)[0]
+    for i, layer in enumerate(STATE["layers"]):
+        _point(layer, host[bases[i] : bases[i] + decs[i]], STATE["layouts"][i], limit=decs[i])
+        STATE["dev_spans"][i] = STATE["dev_full"][i] = None
+    torch.cuda.synchronize(device)
+    # the load's region stays out from here on, and the spans live in a region of their own
+    _tms().pause(TAG_WEIGHTS)
+    STATE["tag"] = TAG_COMPACT
+    free1 = torch.cuda.mem_get_info(device)[0]
+    for i, layer in enumerate(STATE["layers"]):
+        with _tms().region(tag=TAG_COMPACT):
+            dspan = torch.empty(decs[i], dtype=torch.uint8, device=device)
+        dspan.copy_(host[bases[i] : bases[i] + decs[i]])
+        _point(layer, dspan, STATE["layouts"][i], limit=decs[i])
+        STATE["dev_spans"][i] = STATE["dev_full"][i] = dspan
+    torch.cuda.synchronize(device)
+    got = torch.cuda.mem_get_info(device)[0] - free0
+    _log(
+        f"the spans held {dead / 2**30:.2f} GiB no parameter reads: made anew on {device}, "
+        f"{got / 2**30:.2f} GiB back ({(free1 - free0) / 2**30:.2f} GiB came off the card with all spans out)"
+    )
+
+
 def after_load() -> None:
     """After every module's weight processing, before the KV pool: take back
     what the loading rebound, move fused owners into the spans, mirror,
@@ -1073,6 +1133,7 @@ def after_load() -> None:
         nbytes=total,
         dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]),
     )
+    _compact(host, bases)
     if MIRROR in ("file", "gguf"):
         (_mirror_open_file if MIRROR == "file" else _mirror_open_gguf)(host)
         STATE["host"] = None
@@ -1097,6 +1158,7 @@ def after_load() -> None:
             if counts.get("gone_names")
             else ""
         )
+        + f"; {sum(len(t) for t in STATE.get('tails', {}).values())} parameters keep zero bytes after them"
         + f"); scratch {STATE['scratch_bytes'] / 1e9:.3f} GB released "
         f"until the first long prefill"
     )
@@ -1473,6 +1535,11 @@ def before_forward(forward_batch) -> None:
         runner = inspect.currentframe().f_back.f_locals.get("self")
         kt_kv_vmm.FLIGHT["pool"] = getattr(runner, "req_to_token_pool", None)
     kt_kv_vmm.flight_note(forward_batch)
+    if kt_kv_vmm.HOST is None and not kt_kv_vmm.VOCAB:
+        import inspect
+
+        cfg = getattr(inspect.currentframe().f_back.f_locals.get("self"), "model_config", None)
+        kt_kv_vmm.VOCAB = int(getattr(cfg, "vocab_size", 0) or 0) or -1
     if not ENABLED or STATE["phase"] == "load":
         kt_kv_vmm.maybe_place(forward_batch)
         return
@@ -1549,7 +1616,7 @@ def before_forward(forward_batch) -> None:
 
         kt_ledger.predict_start(dev, held, hot_stays=STATE["hot_stays"])
         free_p = torch.cuda.mem_get_info(dev)[0] - held
-        _tms().pause(TAG_WEIGHTS)
+        _tms().pause(STATE.get("tag", TAG_WEIGHTS))
         free_a = torch.cuda.mem_get_info(dev)[0] - held
         STATE["pause_freed"] = free_a - free_p
         if STATE["hot_stays"]:
@@ -1843,7 +1910,7 @@ def end_window() -> None:
             if getattr(kt_kv_prefill_lend, "SWA_ENABLED", False):
                 kt_kv_prefill_lend.swa_lend("end of window")
         _check_room(dev)
-        _tms().resume(TAG_WEIGHTS)
+        _tms().resume(STATE.get("tag", TAG_WEIGHTS))
         if STATE.get("mirror") is not None:
             m = STATE["mirror"]
             for f in m["reads"].values():  # a read-ahead still landing in a bounce
@@ -1942,6 +2009,10 @@ def _check_room(dev) -> None:
             free = torch.cuda.mem_get_info(dev)[0]
             _log(f"{dev}: {free / 1e9:.2f} GB free after the pool's rows went back, the weights need "
                  f"{need / 1e9:.2f} GB (the window's start freed {STATE.get('pause_freed', 0) / 1e9:.2f} GB)")
+    if free < need and DEBUG:
+        path = f"/tmp/kt-lend-kept-{dev.index}-short.pickle"
+        torch.cuda.memory._dump_snapshot(path)
+        _log(f"memory snapshot {path}")
     if free < need:
         raise RuntimeError(
             f"KT_PREFILL_LEND: the weights ({need / 1e9:.2f} GB) cannot come back on {dev}: "
