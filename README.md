@@ -266,7 +266,10 @@ TP=1:
 
 - The long decode is below the decode in every row, on and off.
   Attention reads 131K tokens of KV at each step.
-  On falls further than off, and the cause is not isolated yet.
+  On falls further than off, by design: the hot slots sit in free KV pages, and a 131K prompt takes those pages back.
+  Slots a rank held before and after the 131K prompt, two cards: Qwen3.5 3,445 → 2,965, Flash-Next NVFP4 4,550 → 2,822, Gemma 1,413 → 976, Flash-Next GGUF 3,592 → 1,438, MiMo 1,162 → 895.
+  One card: Qwen3.5 1,305 → 852, Gemma 466 → 211, Flash-Next NVFP4 599 → 610.
+  The slots come back when the KV rows are freed.
 
 - GLM runs without hot slots in both: its profile turns the hot lend off.
 
