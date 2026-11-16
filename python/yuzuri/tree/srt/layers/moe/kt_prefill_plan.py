@@ -8,8 +8,7 @@ remaining prompt needs and, for that count, the smallest equal chunk.
 A chunk of c rows whose forward ends at sequence s needs, above a window's start,
 
   cost(c, s) = FIXED + ROW * c + SEQ * s          (KT_PREFILL_PLAN_COST="FIXED_MiB,ROW_B,SEQ_B,CARRY_MiB",
-                                                   fitted by tools/kt-prefill-plan-constants.py
-                                                   over the lend's per-forward records)
+                                                   fitted over the lend's per-forward records)
 
 (+ CARRY for a chunk after the first of a window) and has
   room = free at the window's start + the free KV pages it borrows - kt_lend.MARGIN.
@@ -25,13 +24,25 @@ Without KT_PREFILL_PLAN_COST the older model applies: cost = KT_PREFILL_PLAN_ROW
 import math
 import os
 
+_SAID = set()
+
+
+def _say_once(where, exc):
+    """One line the first time a guarded step fails for a reason other than its module being off, so an SGLang that
+    changed under it shows in the log."""
+    if isinstance(exc, ImportError) or where in _SAID:
+        return
+    _SAID.add(where)
+    print(f"[yuzuri] {where}: {type(exc).__name__}: {exc} (said once)", flush=True)
+
+
 ENABLED = os.environ.get("KT_PREFILL_PLAN", "0") == "1"
 FREE = int(os.environ.get("KT_PREFILL_PLAN_FREE_MB", "0") or 0) << 20
 ROW_KB = int(os.environ.get("KT_PREFILL_PLAN_ROW_KB", "0") or 0) << 10
 _cost = [x for x in os.environ.get("KT_PREFILL_PLAN_COST", "").split(",") if x]
 FIXED, ROW, SEQ = ((int(float(_cost[0]) * (1 << 20)), float(_cost[1]), float(_cost[2]))
                    if len(_cost) >= 3 else (0, float(ROW_KB), 0.0))
-XS = 0.0  # kt-plan-online-cost.py: cross term, bytes a row a sequence token
+XS = 0.0  # cross term, bytes a row a sequence token
 # what a later chunk of a window holds from the earlier ones (4th field, MiB)
 CARRY = int(float(_cost[3]) * (1 << 20)) if len(_cost) >= 4 else 0
 LIVE = os.environ.get("KT_PREFILL_PLAN_LIVE", "1") == "1"
@@ -45,11 +56,11 @@ TAIL_STEPS = int(os.environ.get("KT_PREFILL_PLAN_TAIL_STEPS", "2" if _GGUF else 
 # request gets while there is no free-memory step to plan with (the first window
 # of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
 SAFE = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0)
-# no cost in the environment: measured from the windows this server runs (kt-plan-online-cost.py)
+# no cost in the environment: measured from the windows this server runs
 ONLINE = not _cost and ROW_KB == 0
 MEASURED = {"windows": 0, "row": 0.0, "max_rows": 0}
 LP = 0.0  # bytes a row whose input logprobs are computed, past a plain row (vocabulary-wide logits)
-# rid -> the chunk a request was planned at when the online cap bound it (kt-plan-online-cost.py: capped plans)
+# rid -> the chunk a request was planned at when the online cap bound it (capped plans)
 CAPPED = {}
 
 
@@ -209,13 +220,13 @@ def observe_window(rows: int, seq: int, grown: int, alloc: int = 0, window: int 
             LP = _lp_row(lp_pts)
             return
     pts = MEASURED.setdefault("points", [])
-    pts.append((float(rows), float(seq), float(grown), float(alloc), int(window), float(lp_rows)))  # kt-plan-seq-evidence.py
+    pts.append((float(rows), float(seq), float(grown), float(alloc), int(window), float(lp_rows)))
     del pts[:-64]
     if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":  # each forward the fit learns from
         print(f"[kt-plan] window {window}: {rows} rows at sequence {seq}, grew {grown >> 20} MiB "
               f"({alloc >> 20} MiB allocated)", flush=True)
     fixed, row, sq = _fit(pts)
-    # kt-plan-online-cost.py: per forward. A fit stands once the points hold two sizes.
+    # per forward. A fit stands once the points hold two sizes.
     MEASURED["fitted"] = MEASURED.get("fitted", False) or (
         len({p[0] for p in pts}) >= 2 and row < max(p[2] / p[0] for p in pts))
     if lp_rows <= 0 and MEASURED.get("lp_points") and all(len(p) > 5 and p[5] > 0 for p in pts[:-1]):
@@ -232,7 +243,7 @@ def observe_window(rows: int, seq: int, grown: int, alloc: int = 0, window: int 
 
 
 def _fit(pts):
-    """kt-plan-online-cost.py: the fit. FIXED + ROW * rows + SEQ * seq by least squares over the closed windows,
+    """the fit. FIXED + ROW * rows + SEQ * seq by least squares over the closed windows,
     then FIXED raised until no window grew more than the line says (an envelope from above). One window, or
     windows of one size, cannot separate the parts: all of the growth is then a row's, as before. A negative
     sequence term is dropped, a row term that is not positive falls back to the largest growth a row."""
@@ -305,7 +316,7 @@ def online_cap(chunk: int) -> int:
 STATS = {"plans": 0, "last": None}
 # what a request's own forward puts back on the GPU before its rows run, by name (bytes):
 # a model that keeps its vision tower on the host between images registers it
-# (sglang-dsv4-vision-on-demand.py), and a request with images is planned with that
+#, and a request with images is planned with that
 # much less room
 ON_DEMAND = {}
 
@@ -582,7 +593,7 @@ def _free_now(scheduler) -> int:
 
     from sglang.srt.layers.moe import kt_lend
 
-    # kt-plan-ledger-only.py: the ledger's free memory alone: in decode at the next window's start, in a window for its
+    # the ledger's free memory alone: in decode at the next window's start, in a window for its
     # chunks, with what earlier windows kept in the scratch added back (the start maps it, and the forwards' fitted
     # cost includes it). The decode-to-window step (pf_delta, or KT_PREFILL_PLAN_DELTA_MB from an earlier launch),
     # the in-window reading and the hot lend's spare are the ledger's holders now. Before a window start has been
@@ -618,9 +629,14 @@ def chunk_for(scheduler, chunk: int) -> int:
     from sglang.srt.layers.moe import kt_kv_prefill_lend
 
     getattr(kt_kv_prefill_lend, "bind_tree", lambda s: None)(scheduler)
+    if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "2":
+        q = getattr(scheduler, "waiting_queue", None)
+        print(f"[kt-plan] chunk_for({chunk}): chunked {scheduler.chunked_req is not None}, queue {type(q).__name__} "
+              f"of {len(q) if q is not None else None}, ready {_ready()}, windows {MEASURED['windows']}, row {ROW}",
+              flush=True)
     if not chunk or chunk <= 0:
         return chunk
-    # kt-plan-online-cost.py: the first window reaches the planner before anything is measured
+    # the first window reaches the planner before anything is measured
     if not _ready() and not (ENABLED and ONLINE and MEASURED["windows"] == 0):
         return chunk
     req = scheduler.chunked_req
@@ -643,25 +659,25 @@ def chunk_for(scheduler, chunk: int) -> int:
             ids = req.origin_input_ids + req.output_ids
             bound = getattr(req, "_compute_max_prefix_len", None)
             match_kv_cache(req, scheduler.tree_cache, ids, max_prefix_len=bound(len(ids)) if bound else None)
-        except Exception:
-            pass
+        except Exception as e:
+            _say_once("prefill plan: the cached prefix of a waiting request was not matched", e)
     rem, done = _remaining(req)
     if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1" and (rem > 2048 or done > 2048):
         print(f"[kt-plan] chunk_for {str(req.rid)[:8]}: {'a later chunk' if req is scheduler.chunked_req else 'queued'}"
               f", {rem} to prefill after {done}, planned {req.rid in PLAN}, rows up {req.rid in ROWS_UP}, "
               f"stream from {_stream_from()}", flush=True)
     if req is not scheduler.chunked_req:
-        # kt-swa-ledger-room.py: no SWA bound until this request is planned (a chunked one keeps its plan's)
+        # no SWA bound until this request is planned (a chunked one keeps its plan's)
         getattr(kt_kv_prefill_lend, "swa_room", lambda t, w="": None)(None)
     if rem <= 0:
         return chunk
     if ONLINE:
         _carry_in()
-        _sync_measured(scheduler)  # kt-plan-online-cost.py: same on every rank
+        _sync_measured(scheduler)  # same on every rank
         if MEASURED.get("drop"):  # one rank, no group to tell
             _drop_carried(MEASURED.pop("drop"))
     if ONLINE and MEASURED["windows"] == 0:
-        # nothing measured yet: the lend's own chunk, the first window measures (kt-plan-online-cost.py)
+        # nothing measured yet: the lend's own chunk, the first window measures
         MEASURED["blind"] = min(chunk, SAFE) if SAFE > 0 else chunk
         if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
             print(f"[kt-plan] first window allowed {MEASURED['blind']} rows unmeasured", flush=True)
@@ -689,7 +705,7 @@ def chunk_for(scheduler, chunk: int) -> int:
         print(f"[kt-plan] chunk_for {str(req.rid)[:8]}: no free memory read ({free}), unplanned", flush=True)
     if free <= 0:
         return min(chunk, SAFE) if SAFE > 0 else chunk
-    # kt-plan-ledger-free.py: in a window the loan is out already, in its free memory
+    # in a window the loan is out already, in its free memory
     from sglang.srt.layers.moe import kt_lend
 
     # (a hot lend standing through the window gives its slots to a chunk that needs them: kt_lend._hot_topup)
@@ -793,7 +809,7 @@ def chunk_for(scheduler, chunk: int) -> int:
     if n > 1:
         c = min(c, _even(rem, n))
     if swa is not None and swa[1] > 0:
-        # kt-swa-ledger-room.py: the SWA tokens the room holds past the chunk's own cost, at least the chunk's rows
+        # the SWA tokens the room holds past the chunk's own cost, at least the chunk's rows
         # held at once plus the window and two pages (sglang's need for it)
         own = FIXED + (CARRY if n > 1 else 0) + (ROW + lpc) * c + SEQ * (done + rem) + XS * c * (done + rem)
         held = c if rem <= c else c * max(1, int(swa[3]))
@@ -872,7 +888,7 @@ def chunk_for(scheduler, chunk: int) -> int:
     return _window_chunk(req, rem, done, max(chunk, c))
 
 
-def _fit(pts):  # kt-plan-online-cost.py: non-negative (this definition replaces the ones above)
+def _fit(pts):  # non-negative (this definition replaces the ones above)
     """FIXED + ROW * rows + SEQ * seq + XS * rows * seq with no negative term: every subset of the terms that keeps
     ROW is fitted by least squares, the one with the least error among those with no negative coefficient stands,
     then FIXED is raised until no forward grew more than the fit says. Sets XS; returns (FIXED, ROW, SEQ)."""
@@ -912,7 +928,7 @@ def _fit(pts):  # kt-plan-online-cost.py: non-negative (this definition replaces
     return int(fixed), row, sq
 
 
-# kt-plan-seq-evidence.py: the terms on the allocated bytes, a sequence term only where a request's chunks grew
+# the terms on the allocated bytes, a sequence term only where a request's chunks grew
 SEQ_TOL = int(os.environ.get("KT_PREFILL_PLAN_SEQ_TOL_MB", "32")) << 20
 SEQ_WHY = "no request has run two equal chunks yet"
 
@@ -943,7 +959,7 @@ def _seq_growth(pts):
     return seen, grow
 
 
-def _fit(pts):  # kt-plan-seq-evidence.py (this definition replaces the ones above)
+def _fit(pts):  # this definition replaces the ones above
     """FIXED + ROW * rows + SEQ * seq + XS * rows * seq. The terms are chosen on the allocated bytes: a sequence term
     only when a run of equal chunks grew past SEQ_TOL along its sequence, then with the cross term first (rows x
     sequence; SEQ alone under-stated Vision's indexer logits at a larger chunk), and the fewest terms within 16 MiB a

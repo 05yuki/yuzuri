@@ -269,7 +269,7 @@ class KTStreamPrefillGGUF:
         types, part_bytes = self._layer_types[layer_idx], self._part_bytes[layer_idx]
         p2l = self._physical_to_logical(layer_idx)
         E, N, K = self.E, self.N, self.K
-        # under KT_GGUF_STREAM_EP whole experts, this rank's share of them (kt-gguf-bank-ep.py)
+        # under KT_GGUF_STREAM_EP whole experts, this rank's share of them
         world, r = (1, 0) if self.ep else (self.world, self.rank)
         lo, hi = getattr(self, "_bank_range", (0, E))
         banks = []

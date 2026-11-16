@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 kv-vmm/libkv_vmm.so
 python/yuzuri/tree/srt/layers/moe/libkv_vmm.so
-python/yuzuri/tree/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml/
+python/yuzuri/tree/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml/*
+!python/yuzuri/tree/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml/LICENSE

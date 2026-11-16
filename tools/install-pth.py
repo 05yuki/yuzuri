@@ -33,8 +33,11 @@ if "--fetched-from" in sys.argv:
             sys.exit(f"{s} not found: run the recipe's setup first")
         shutil.copytree(s, d, dirs_exist_ok=True)
         print(f"copied {s} -> {d}")
-text = f"{here}\nimport yuzuri._boot\n"
-if os.path.exists(pth) and open(pth).read() != text:
+# line 1 puts the package on sys.path (site skips it when the directory is gone); line 2 starts Yuzuri only where the
+# package is still there, so a checkout that was moved or deleted leaves the venv's Python silent
+old = f"{here}\nimport yuzuri._boot\n"
+text = f"{here}\nimport os; os.path.isfile({os.path.join(here, 'yuzuri', '_boot.py')!r}) and __import__('yuzuri._boot')\n"
+if os.path.exists(pth) and open(pth).read() not in (text, old):
     sys.exit(f"{pth} exists for another Yuzuri:\n{open(pth).read()}remove it first (--remove)")
 with open(pth, "w") as f:
     f.write(text)

@@ -1,7 +1,5 @@
-"""GPU-streamed prefill for KT CPU experts, NVFP4 (ModelOpt) edition, on the public recipe's SGLang tree
-(3edea93c + tiers): the v0519 tree's module retargeted to runtime_context, without its GGUF branch
-and its preallocation hook; installed beside the MXFP4 streamer by patches/sglang-kt-stream-nvfp4-pin.py
-(11-04).
+"""GPU-streamed prefill for KT CPU experts, NVFP4 (ModelOpt) edition, beside the MXFP4 streamer
+(kt_stream_prefill.py picks it by the experts' format).
 
 Above KT_GPU_STREAM_PREFILL tokens a MoE layer's CPU experts are not computed
 on the CPU: each rank DMAs its TP part of the experts, G at a time, straight
@@ -37,7 +35,7 @@ import time
 import traceback
 
 # KT_STREAM_GRAPH_KEEP: CUDA graphs kept for row counts other than the
-# largest (a prompt's last chunk has its own; sglang-kt-stream-graph-keep.py)
+# largest (a prompt's last chunk has its own)
 GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
 from typing import Dict, List, Optional
 
@@ -60,11 +58,11 @@ STREAM_THRESHOLD = kt_stream_threshold.START
 GROUP_SIZE = int(os.environ.get("KT_GPU_STREAM_GROUP", "8") or 8)
 TIMING = os.environ.get("KT_GPU_STREAM_TIMING") == "1"
 # Chunks shorter than the prefill chunk run padded through the full chunk's
-# graphs (patches/sglang-qwen38-stream-fixed-rows.py).
+# graphs.
 FIXED_ROWS = os.environ.get("KT_GPU_STREAM_FIXED_ROWS", "0") == "1"
 
 
-# sglang-kt-stream-row-block.py: rows per CUTLASS MoE call inside a group (0 = the chunk)
+# rows per CUTLASS MoE call inside a group (0 = the chunk)
 ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
 
 
@@ -80,7 +78,7 @@ def _chunk_rows() -> int:
     except Exception:
         return 0
 # One-byte block scales from pinned host memory instead of kt-kernel's FP32
-# scale arenas (patches/sglang-qwen38-stream-scale-bytes.py).
+# scale arenas.
 SCALE_BYTES = os.environ.get("KT_GPU_STREAM_SCALE_BYTES", "0") == "1"
 SCALE_BYTES_VERIFY = os.environ.get("KT_GPU_STREAM_SCALE_BYTES_VERIFY", "0") == "1"
 
@@ -122,7 +120,7 @@ def _align64(n: int) -> int:
     return (n + 63) & ~63
 
 
-# KT_SCALE_ARENA_CODES=1 (kt-kernel, kt-scale-arena-codes.py): a scale arena block is a one-byte code per 16 elements
+# KT_SCALE_ARENA_CODES=1 (kt-kernel): a scale arena block is a one-byte code per 16 elements
 # (64-aligned), then the matrix's 256-entry fp32 table. The streamer copies those blocks and expands them into the
 # fp32 layout the rest of it reads (raw_s), on the device.
 CODES = os.environ.get("KT_SCALE_ARENA_CODES", "0") == "1"
@@ -207,7 +205,7 @@ class _DeviceSlot:
         u8 = torch.uint8
 
         def empty(shape):
-            # patches/sglang-kt-prefill-lend.py: resident only during a prefill
+            # resident only during a prefill
             return kt_lend.scratch_empty(shape, u8, device)
 
         self.w13_weight = empty((G, 2 * N, K // 2))
@@ -282,7 +280,7 @@ def preallocate(layer):
 
 
 class StreamUnsupported(RuntimeError):
-    """The experts' checkpoint lacks what the W4A4 path reads (kt-stream-nvfp4-w16.py streams it in W16)."""
+    """The experts' checkpoint lacks what the W4A4 path reads (KT_NVFP4_W4A16 streams it in W16)."""
 
 
 _GLOBAL_SUFFIXES = (".weight_scale_2", ".weight_global_scale")  # ModelOpt: scale_2; compressed-tensors: its reciprocal
@@ -374,7 +372,7 @@ class KTStreamPrefill:
             _check_modelopt_scales(method.kt_config.weight_path)
             self.w16 = False
         else:
-            # kt-stream-nvfp4-w16.py: without ModelOpt's scales the checkpoint is W4A16 and streams in W16
+            # without ModelOpt's scales the checkpoint is W4A16 and streams in W16
             try:
                 _check_modelopt_scales(method.kt_config.weight_path)
                 self.w16 = os.environ.get("KT_NVFP4_STREAM_W16", "0") == "1"
@@ -405,7 +403,7 @@ class KTStreamPrefill:
                 raise RuntimeError(
                     f"KT_GPU_STREAM_PREFILL: N={self.N} K={self.K} would need padded block scales")
         else:
-            # kt-stream-nvfp4-w16-buffers.py: the bf16 group buffers take four times a packed slot's bytes; the
+            # the bf16 group buffers take four times a packed slot's bytes; the
             # group shrinks by that factor so they stay one packed slot's size
             self.G = max(1, self.G // 4)
         self.slots = _prealloc.get(self.device.index) or [
@@ -416,7 +414,7 @@ class KTStreamPrefill:
         self._cutlass_fused_moe = cutlass_fused_moe
         self._activation_type = _activation_type(layer.moe_runner_config)
         self.swiglu_limit = self.swiglu_alpha = self.swiglu_beta = None
-        # the activation SGLang's CUTLASS mapping gives the layer, whatever it is (kt-activation-generic.py)
+        # the activation SGLang's CUTLASS mapping gives the layer, whatever it is
         self._use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
         self._workspace = None
         self._workspace_tokens = 0
@@ -964,7 +962,7 @@ class KTStreamPrefill:
         acc.add_(out)
 
     def _moe_rows(self, slot, g, g1, g2, n, x, local, topk_weights, out):
-        """One CUTLASS MoE call over a block of rows (sglang-kt-stream-row-block.py)."""
+        """One CUTLASS MoE call over a block of rows."""
         self._cutlass_fused_moe(
             input=x,
             token_selected_experts=local,
@@ -1251,7 +1249,7 @@ class KTStreamPrefill:
         g = self._graph_inputs(T, x, physical_ids, topk_weights)
         self._set_layer_inputs(g, layer, layer_idx)
         cur = torch.cuda.current_stream(self.device)
-        if SCALE_BYTES and not self.w16 and not self.cutile:  # kt-stream-nvfp4-w16-buffers.py: W4A4's bytes
+        if SCALE_BYTES and not self.w16 and not self.cutile:  # W4A4's bytes
             self._build_scale_bytes(layer_idx)
         self._stage(layer_idx, 0, groups[0], stats)
         for gi, experts in enumerate(groups):

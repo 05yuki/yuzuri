@@ -21,7 +21,7 @@
   "-m",
   "sglang.launch_server",
   "--host",
-  "0.0.0.0",
+  "{host}",
   "--port",
   "{port}",
   "--model-path",

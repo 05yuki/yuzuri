@@ -26,7 +26,7 @@ How it works
 - KT_HOT_SEED=<placement json> fills the slots at start from a map
   (physical_to_logical_map, first N per layer); without it they start as
   logical 0..N-1.
-- KT_HOT_KV_LEND=1 (kt_hot_kv_lend.py): more slots per layer, ids N.., in free
+- KT_HOT_KV_LEND=1 (kt_kv_hot_lend.py): more slots per layer, ids N.., in free
   KV pages. A slot entry is the resident logical id, -1 for an empty slot the
   policy fills first, -2 for a slot that does not exist (not lent now). The
   kernels read every slot through per-layer pointer tables; base tables
@@ -331,7 +331,7 @@ class HotCache:
             d = self._down_source(layer_idx, method, down)[logical].view(w2.shape[1], -1)
         if slot >= self.N:
             # a lent slot: KV pages, no lend mirror (lent slots are given back
-            # before every streamed prefill, kt_hot_kv_lend.py)
+            # before every streamed prefill, kt_kv_hot_lend.py)
             v13, v2 = self.lent_views[(layer_idx, slot)]
             v13[:N].copy_(g, non_blocking=True)
             v13[N:].copy_(u, non_blocking=True)
@@ -394,7 +394,7 @@ class HotCache:
                         return f"{name}: layer {li} slot {sl} holds {e} but the table says {int(self.log2slot_cpu[li, e])}"
         return ""
 
-    # -- lent slots (kt_hot_kv_lend.py) -------------------------------------------
+    # -- lent slots (kt_kv_hot_lend.py) -------------------------------------------
 
     def lend_slot(self, layer_idx: int, slot: int, v13: torch.Tensor, v2: torch.Tensor) -> None:
         assert self.slot2log[layer_idx][slot] == ABSENT, (layer_idx, slot)

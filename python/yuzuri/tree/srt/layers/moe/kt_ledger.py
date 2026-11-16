@@ -1,4 +1,4 @@
-"""The lend ledger, step 1 (kt-ledger.py): one account of a device's memory at each change of the lend's state,
+"""The lend ledger, step 1: one account of a device's memory at each change of the lend's state,
 read only. See the patch's docstring for the parts."""
 
 import ctypes
@@ -89,21 +89,57 @@ def snapshot(dev, state: str, why: str) -> None:
     if prev is not None and abs(other - prev[1]) > TOL:
         line += " (past the tolerance)"
     print(line, flush=True)
-    if TENSORS and state == "D" and why == "window end" and index not in _LISTED:
-        _LISTED.add(index)
+    if state == "D" and why == "window end" and _LISTED.get(index, 0) < TENSORS:
+        _LISTED[index] = _LISTED.get(index, 0) + 1
         _tensors(index, reserved)
 
 
-TENSORS = os.environ.get("KT_LEDGER_TENSORS", "0") == "1"
-_LISTED = set()
+TENSORS = int(os.environ.get("KT_LEDGER_TENSORS", "0") or 0)
+_LISTED = {}
+
+
+def _holders(t) -> str:
+    """Who refers to this tensor, two steps up: the containers and the objects that own them."""
+    import gc
+    import types
+
+    if t is None:
+        return "?"
+    out = []
+    for r in gc.get_referrers(t):
+        if isinstance(r, types.FrameType) or r is t:
+            continue
+        if isinstance(r, (dict, list, tuple)):
+            ups = []
+            for u in gc.get_referrers(r):
+                if isinstance(u, types.FrameType):
+                    continue
+                if isinstance(u, dict):
+                    ups += [type(w).__name__ for w in gc.get_referrers(u)
+                            if not isinstance(w, (types.FrameType, dict, list, tuple))][:2] or ["dict"]
+                elif not isinstance(u, (list, tuple)):
+                    ups.append(type(u).__name__)
+            key = ""
+            if isinstance(r, dict):
+                key = next((f"[{k!r}]" for k, v in r.items() if v is t), "")
+            out.append(f"{type(r).__name__}{key} of {'/'.join(sorted(set(ups))[:3]) or '?'}")
+        else:
+            out.append(type(r).__name__)
+    return ", ".join(sorted(set(out))[:4]) or "nothing gc sees"
+
+
+def listing(index: int) -> None:
+    """The same listing, asked for from outside (the hot lend's regrow, before it empties torch's cache)."""
+    if TENSORS:
+        _tensors(index, torch.cuda.memory_reserved(index))
 
 
 def _tensors(index: int, reserved: int) -> None:
-    """KT_LEDGER_TENSORS=1: once a card, at the first window's end, the tensors alive on it by storage, largest
+    """KT_LEDGER_TENSORS=N: at a card's first N window ends, the tensors alive on it by storage, largest
     first, named where a module holds them. What "torch" in the line above is made of."""
     import gc
 
-    names, seen = {}, {}
+    names, seen, objs_by = {}, {}, {}
     objs = gc.get_objects()
     for o in objs:
         try:
@@ -122,6 +158,7 @@ def _tensors(index: int, reserved: int) -> None:
                 if k not in seen:
                     seen[k] = (int(st.nbytes()), tuple(o.shape), str(o.dtype).replace("torch.", ""),
                                names.get(k, "?"))
+                    objs_by[k] = o
         except Exception:
             pass
     rows = sorted(seen.values(), reverse=True)
@@ -129,6 +166,28 @@ def _tensors(index: int, reserved: int) -> None:
     print(f"[kt-ledger] cuda:{index} tensors: {len(rows)} storages, {sum(r[0] for r in rows) / m:.0f} MiB named by "
           f"their storages; torch allocated {torch.cuda.memory_allocated(index) / m:.0f} MiB, reserved "
           f"{reserved / m:.0f} MiB", flush=True)
+    # the segments torch cannot give back: partly used, with what sits in them (a tensor's storage is found by
+    # its address)
+    try:
+        ptrs = {k: v for k, v in seen.items()}
+        segs = [sg for sg in torch.cuda.memory_snapshot() if sg["device"] == index]
+        part = [sg for sg in segs if 0 < sg["active_size"] < sg["total_size"]
+                and sg["total_size"] - sg["active_size"] >= 8 * m]
+        held = sum(sg["total_size"] - sg["active_size"] for sg in part)
+        print(f"[kt-ledger] cuda:{index} segments: {len(segs)}, {len(part)} partly used with 8 MiB or more idle, "
+              f"{held / m:.0f} MiB idle in them", flush=True)
+        for sg in sorted(part, key=lambda sg: sg["active_size"] - sg["total_size"])[:12]:
+            act = []
+            for blk in sg["blocks"]:
+                if blk["state"] == "active_allocated":
+                    who = ptrs.get(blk["address"])
+                    act.append(f"{blk['size'] / m:.1f}" + (f" {who[3]} {who[1]} {who[2]}" if who else " (no tensor)"))
+                    if who and sg["total_size"] - sg["active_size"] >= 64 * m:
+                        act[-1] += " held by " + _holders(objs_by.get(blk["address"]))
+            print(f"[kt-ledger] cuda:{index}   segment {sg['total_size'] / m:.0f} MiB, idle "
+                  f"{(sg['total_size'] - sg['active_size']) / m:.0f}: " + "; ".join(act[:6]), flush=True)
+    except Exception as e:
+        print(f"[kt-ledger] cuda:{index} segments: {e!r}", flush=True)
     groups = {}
     for nb, shape, dt, name in rows:
         g = groups.setdefault((name, shape, dt, nb), [0])
@@ -139,7 +198,7 @@ def _tensors(index: int, reserved: int) -> None:
               flush=True)
 
 
-# step 2 (kt-plan-ledger-free.py reads it): the free memory a window starts with, from what each holder gives back
+# step 2 (kt_prefill_plan.py reads it): the free memory a window starts with, from what each holder gives back
 # or takes at the start, checked at every start against the driver
 ERRS = {}  # device -> the last few errors at a window's start (measured free less the holders' sum)
 # device -> what the scratch mapped at the last window start, less what earlier windows kept. A scratch tensor maps

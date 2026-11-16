@@ -1,5 +1,4 @@
-"""KT_KV_VMM=1: the KV pool made inside kt_kv_vmm's region, on remappable memory, when torch_memory_saver is off
-(sglang-kt-kv-vmm.py)."""
+"""KT_KV_VMM=1: the KV pool made inside kt_kv_vmm's region, on remappable memory, when torch_memory_saver is off."""
 from contextlib import contextmanager
 
 from yuzuri._finder import after_import

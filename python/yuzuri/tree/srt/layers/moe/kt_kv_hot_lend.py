@@ -40,7 +40,9 @@ whatever gets their own hot experts without recording a placement (a writer
 placement's 21 a layer catch 3-6% of the routes of code, JSON or math, 10-21):
 - a device table, physical id -> slot or -1, replaces the [N, N + k) range in
   route, and route counts every routed physical id on the device;
-- every KT_KV_HOT_DYN_EVERY decode forwards (32), outside the graph, the counts
+- every few decode forwards, outside the graph (the period and the bar a swap must
+  clear come from what the rounds measure: "the period and the bar" below;
+  KT_KV_HOT_DYN_EVERY and KT_KV_HOT_DYN_HYST fix them by hand), the counts
   come to the host as decayed scores (half-life KT_KV_HOT_DYN_HALF_LIFE forwards,
   256), and each layer swaps up to KT_KV_HOT_DYN_SWAPS a forward (2) of its held
   experts for better-scored ones; a swapped-out expert leaves the table at once
@@ -80,7 +82,7 @@ GROW_HOLD = int(os.environ.get("KT_KV_HOT_GROW_HOLD", "0") or 0)
 MIN_MB = int(os.environ.get("KT_KV_HOT_MIN_MB", "256"))  # smallest lend worth a sync and a copy
 RETRY = int(os.environ.get("KT_KV_HOT_RETRY", "256"))  # forwards between tries when nothing was lent
 MARGIN_MB = int(os.environ.get("KT_KV_HOT_MARGIN_MB", "64"))  # of the unmapped bytes left unused
-# KT_KV_HOT_SPARE_FLOOR_MB=<n> (sglang-kt-kv-hot-spare.py): the slots also take what the
+# KT_KV_HOT_SPARE_FLOOR_MB=<n>: the slots also take what the
 # driver has free in decode beyond n MiB (the prefill's room, idle between windows)
 SPARE_FLOOR_MB = int(os.environ.get("KT_KV_HOT_SPARE_FLOOR_MB", "-1") or -1)
 # KT_KV_HOT_SLOTS_MAX=<n>: at most n slots a rank (0: no cap). Measurements set it below
@@ -98,14 +100,17 @@ _SLOT_REL = float(os.environ.get("KT_KV_HOT_CHECK_SLOT_REL", "0.05") or 0.05)
 _DUMP_REL = float(os.environ.get("KT_KV_HOT_CHECK_DUMP_REL", "0.2") or 0.2)  # a call dumped past this
 _CHECK_REPEAT = os.environ.get("KT_KV_HOT_CHECK_REPEAT", "0") == "1"
 DYNAMIC = os.environ.get("KT_KV_HOT_DYNAMIC_SLOTS", "0") == "1"
-# a round every 32 forwards: 8 cost Flash-Next NVFP4 1.5 tok/s in swap copies (65.2 -> 66.7, 11-04)
-DYN_EVERY = max(1, int(os.environ.get("KT_KV_HOT_DYN_EVERY", "32") or 32))
+# The period of the rounds and the bar a swap must clear are derived from what the rounds measure (_DRV below).
+# Until those measures stand, and where they never do, a round every 32 forwards and new > victim x 2.0.
+# KT_KV_HOT_DYN_EVERY / KT_KV_HOT_DYN_HYST set by hand fix the period / the bar as that multiple.
+_EVERY_ENV = os.environ.get("KT_KV_HOT_DYN_EVERY", "")
+_HYST_ENV = os.environ.get("KT_KV_HOT_DYN_HYST", "")
+DYN_EVERY = max(1, int(_EVERY_ENV or 32))
 DYN_SWAPS = int(os.environ.get("KT_KV_HOT_DYN_SWAPS", "2") or 2)
 DYN_HALF_LIFE = float(os.environ.get("KT_KV_HOT_DYN_HALF_LIFE", "256") or 256)
-# replace when new > victim x this: 2.0 on every model (at 1.0 near-equal experts trade places every round, and each
-# trade is a load that a prompt and the decode beside it pay for)
-DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "2.0") or 2.0)
-DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "512") or 512)  # rounds between log lines
+# (at 1.0 near-equal experts trade places every round, and each trade is a load the decode beside it pays for)
+DYN_HYST = float(_HYST_ENV or 2.0)
+DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "4096") or 4096)  # forwards between log lines
 # GGUF swaps loaded by a background pool into pinned staging
 DYN_ASYNC = os.environ.get("KT_KV_HOT_DYN_ASYNC", "1") == "1"
 DYN_ASYNC_CAP = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_CAP", "24") or 24))
@@ -366,7 +371,7 @@ def split(wrapper, layer) -> None:
         method.create_moe_runner(shadow, cfg)
     # the method's global-experts parameters (ModelOpt NVFP4's input scales) load no row
     # into the shadow and kept their 1.0 fill, which the method's max took: the layer's
-    # loaded rows instead (patches/sglang-kt-global-expert-params.py)
+    # loaded rows instead
     try:
         from sglang.srt.layers.moe.kt_ep_wrapper import kt_fill_global_expert_params
     except ImportError:  # a tree without that patch
@@ -452,7 +457,7 @@ def split(wrapper, layer) -> None:
                 rows = None
                 break
             rows[key] = t
-        # two bf16 tensors are the resident layout too (kt-hot-lend-formats-generic.py)
+        # two bf16 tensors are the resident layout too
         bf16 = bool(rows) and len(rows) == 2 and all(t.dtype == torch.bfloat16 for t in rows.values())
         L.res_t = rows if rows and (len(rows) == 4 or bf16 or (len(rows) == 2 and _is_gguf(L))) else None
         rtbl = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
@@ -847,7 +852,7 @@ def _roles(L: _Layer):
     r = {}
     for _, nm in L.names:
         key = ("w13" if nm.startswith("w13") else "w2" if nm.startswith("w2") else None, "scale" in nm)
-        # kt-hot-marlin-slots.py: Marlin's int32-packed weights beside e8m0 scales
+        # Marlin's int32-packed weights beside e8m0 scales
         marlin_w = L.slots[nm].dtype == torch.int32 and not key[1]
         if key[0] is None or key in r or (L.slots[nm].element_size() != 1 and not marlin_w):
             return None
@@ -1256,7 +1261,7 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
         return _arena_load_nvfp4(st, L, e, dst, order)
     if ("w13", True) not in dst:
         return _arena_load_bf16(st, L, e, dst, order)
-    if dst[("w13", False)].dtype == torch.int32:  # kt-hot-marlin-slots.py
+    if dst[("w13", False)].dtype == torch.int32:
         return _arena_load_marlin(st, L, e, dst, order)
     w13, s13, w2, s2 = (dst[k].view(torch.uint8) for k in (("w13", False), ("w13", True), ("w2", False), ("w2", True)))
     if getattr(st, "_mxc", None) is not None:
@@ -1323,7 +1328,7 @@ def _mxc_load(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> None:
 
 
 def _arena_load_marlin(st, L: _Layer, e: int, dst, order: int) -> None:
-    """kt-hot-marlin-slots.py: expert e into Marlin MXFP4 slots: the arena bytes in the byte-packed layout first
+    """expert e into Marlin MXFP4 slots: the arena bytes in the byte-packed layout first
     (w13 [2N, K/2], e8m0 [2N, K/32], w2 [K, N/2], e8m0 [K, N/32]), then SGLang's repack of one expert."""
     import types
 
@@ -1613,7 +1618,7 @@ def _dyn_setup(dev) -> None:
                 dst = {key: torch.empty_like(L.slots[nm][j]) for key, nm in roles.items()}
                 try:
                     _arena_load(L, L.n + j, dst, o)
-                except RuntimeError as exc:  # kt-hot-marlin-slots.py
+                except RuntimeError as exc:
                     good = False
                     diff[(o, "load")] = str(exc)[:200]
                     break
@@ -1640,8 +1645,9 @@ def _dyn_setup(dev) -> None:
         DYN["buf"] = torch.zeros(tuple(STATE["cnt"].shape), dtype=torch.float32, pin_memory=True)
         DYN["scores"] = np.zeros(tuple(STATE["cnt"].shape))
         _log(f"dynamic slots on: arena experts match the banks ({'gate' if order == 0 else 'up'} rows first), "
-             f"a round every {DYN_EVERY} forwards, up to {DYN_SWAPS * DYN_EVERY} swaps a layer, "
-             f"half-life {DYN_HALF_LIFE:g}")
+             + (f"a round every {DYN_EVERY} forwards" if _EVERY_ENV else
+                f"a round every {DYN_EVERY} forwards until the rounds' measures set the period")
+             + f", up to {DYN_SWAPS} swaps a forward and layer, half-life {DYN_HALF_LIFE:g}")
     dyn_why = why
     if DYN_RES:
         # the resident rows swap when experts 0, 1 from the arenas match what the rows hold
@@ -1767,6 +1773,132 @@ def res_guard() -> None:
         rtbl[L.idx, : L.n] = torch.arange(L.n, device=dev)
 
 
+# -- the period and the bar ---------------------------------------------------------
+# What a round costs and what a swap wins are measured where they happen, in seconds of the decode:
+#   r0  the host time of a round without its loads (counts, scores, the choice);
+#   b   the host time of one swap's load (the copy from the arena);
+#   g   what one route on the CPU adds to a forward: the slope of the forward time against the routes the tables
+#       did not hold, over consecutive windows' differences (a slow drift, the context growing, cancels). It
+#       stands once it is more than twice its standard error away from zero;
+#   q   per forward, the rate the swaps wait for: for each swap half the rate it wins (the wait for a round,
+#       P / 2 forwards on average) plus the new expert's rate (in no table until the next round, P forwards);
+#   T   how long a place keeps an expert: the places over the swaps a forward (their turnover).
+# A score is a rate x half-life / ln 2. A swap of a victim scored v for an expert scored e wins, over the T
+# forwards it lasts, g x ln 2 / half-life x (e x (T - P) - v x T) and costs b:
+#   swap when  e x (1 - P / T) - v > b x half-life / (g x ln 2 x T)    (the bar)
+# and a period P costs r0 / P + g x q x P a forward, least at
+#   P = sqrt(r0 / (g x q))                                             (between 1 and half the half-life)
+# Until g, b and r0 stand on every rank (and where the loads run in the background, GGUF: no b), the period and
+# new > victim x KT_KV_HOT_DYN_HYST stay as they start.
+_LN2 = float(np.log(2.0))
+_DRV = {"period": DYN_EVERY, "since": 0, "t_call": None, "gap_sum": 0.0, "gap_max": 0.0, "gaps": 0, "f": None,
+        "win": None, "last_xy": None, "masks": [], "counted": None,
+        "n": 0, "sxx": 0.0, "sxy": 0.0, "syy": 0.0, "g": None, "g_se": None,
+        "r0": None, "b": None, "q": None, "s": None, "T": None, "bar": None}
+
+
+def _drv_ema(key: str, v: float, period: int) -> None:
+    D = _DRV
+    D[key] = v if D[key] is None else D[key] + (v - D[key]) * (1.0 - 0.5 ** (period / DYN_HALF_LIFE))
+
+
+def _drv_mask(new):
+    """What the tables hold through the window that starts now: the held experts less the ones this round chose
+    (those enter the table a round later)."""
+    M = np.zeros(DYN["scores"].shape, dtype=bool)
+    res = bool(DYN.get("res"))
+    for L in LAYERS:
+        on = [e for e in L.held[: L.k] if e >= 0] + (L.res_now if res else [])
+        if on:
+            M[L.idx, on] = True
+    for i, e in new:
+        M[i, e] = False
+    return M
+
+
+def _drv_counted():
+    C = _DRV["counted"]
+    if C is None or C.shape != DYN["scores"].shape:
+        C = np.zeros(DYN["scores"].shape, dtype=bool)
+        res = bool(DYN.get("res"))
+        for L in LAYERS:
+            C[L.idx, 0 if res else L.n:] = True
+        _DRV["counted"] = C
+    return C
+
+
+def _drv_may(Ls, res, shape):
+    """The experts each of these layers may take into a place: past the resident ones unless the resident rows
+    swap too, and under EP this rank's."""
+    D = _DRV
+    key = (tuple(L.idx for L in Ls), tuple(res), shape)
+    if D.get("may_key") != key:
+        A = np.zeros(shape, dtype=bool)
+        for i, (L, r) in enumerate(zip(Ls, res)):
+            A[i, 0 if r else L.n:] = True
+            if _ep(L):
+                A[i, np.arange(shape[1]) % L.method.world != L.method.rank] = False
+        D["may_key"], D["may"] = key, A
+    return D["may"]
+
+
+def _drv_window(x: float, y: float) -> None:
+    """One window: x routes a forward the tables did not hold, y seconds a forward."""
+    D = _DRV
+    last, D["last_xy"] = D["last_xy"], (x, y)
+    if last is None:
+        return
+    dx, dy = x - last[0], y - last[1]
+    D["n"] += 1
+    D["sxx"] += dx * dx
+    D["sxy"] += dx * dy
+    D["syy"] += dy * dy
+    if D["n"] < 3 or D["sxx"] <= 0:
+        return
+    g = D["sxy"] / D["sxx"]
+    se = (max(D["syy"] - g * D["sxy"], 0.0) / (D["n"] - 1) / D["sxx"]) ** 0.5
+    D["g_se"] = se
+    D["g"] = g if g > 2.0 * se else None
+
+
+def _drv_settle(period: int) -> None:
+    """The bar and the next period from the measures, where they stand on every rank. The ranks' tables must
+    hold the same experts (a slot another rank lacked leaves its share of that route uncomputed) and their rounds
+    fall on the same forward, so the values are the ranks' mean, as whole numbers."""
+    D = _DRV
+    g = D["g"]
+    ok = bool(g) and D["r0"] is not None and D["b"] is not None
+    P, T, bar = D["period"], 0, 0
+    if ok:
+        if not _EVERY_ENV:
+            top = max(1, int(DYN_HALF_LIFE / 2))
+            P = top if not D["q"] else int(min(top, max(1, round((D["r0"] / (g * D["q"])) ** 0.5))))
+        places = sum(L.k + (L.n if DYN.get("res") and L.res_t is not None else 0) for L in LAYERS)
+        T = int(min(1 << 30, max(2 * P, places / D["s"]))) if D["s"] else 1 << 30
+        bar = int(D["b"] * DYN_HALF_LIFE / (g * _LN2 * T) * 1e6)
+    world = _world()
+    if world > 1:
+        v = _over_ranks([int(ok), P, T, bar], torch.distributed.ReduceOp.SUM)
+        ok, P, T, bar = v[0] == world, v[1] // world, v[2] // world, v[3] // world
+    if not ok:
+        D["bar"], D["T"] = None, None
+        return
+    D["period"], D["T"] = max(1, P), T
+    D["bar"] = None if _HYST_ENV else bar / 1e6
+
+
+def _drv_text() -> str:
+    D = _DRV
+    if D["g"] is None:
+        why = "no slope yet" if D["g_se"] is None else "the forward time does not follow the CPU routes"
+        return f"period {D['period']}, new > victim x {DYN_HYST:g} ({why}: {D['n']} windows)"
+    bar = (f"bar {D['bar']:.1f} over {D['T']} forwards" if D["bar"] is not None else f"new > victim x {DYN_HYST:g}"
+           + (" (set by hand)" if _HYST_ENV else " (not every rank's measures stand)"))
+    return (f"period {D['period']}" + (" (set by hand)" if _EVERY_ENV else "") + f", {bar}; a round "
+            f"{(D['r0'] or 0) * 1e3:.2f} ms, a swap {(D['b'] or 0) * 1e3:.2f} ms, a CPU route "
+            f"{D['g'] * 1e6:.0f} +- {D['g_se'] * 1e6:.0f} us a forward ({D['n']} windows)")
+
+
 # KT_KV_HOT_DYN_TIMING=1, the host time of the rounds
 _DYN_TIMING = os.environ.get("KT_KV_HOT_DYN_TIMING", "0") == "1"
 _DYN_T = {"n": 0, "swap_rounds": 0, "sum": 0.0, "max": 0.0, "swap_sum": 0.0, "load": 0.0, "loads": 0}
@@ -1777,7 +1909,7 @@ def _dyn_round(dev) -> None:
         return _dyn_round_impl(dev)
     t0 = time.perf_counter()
     swaps0 = DYN.get("swaps", 0)
-    if os.environ.get("KT_KV_HOT_DYN_PROFILE", "0") == "1" and DYN.get("calls", 0) % DYN_EVERY == DYN_EVERY - 1:
+    if os.environ.get("KT_KV_HOT_DYN_PROFILE", "0") == "1" and _DRV["since"] == _DRV["period"] - 1:
         import cProfile
 
         prof = _DYN_T.get("prof")
@@ -1788,7 +1920,7 @@ def _dyn_round(dev) -> None:
         prof.disable()
     else:
         _dyn_round_impl(dev)
-    if DYN.get("calls", 0) % DYN_EVERY:
+    if _DRV["since"]:
         return  # not a round
     dt = time.perf_counter() - t0
     T = _DYN_T
@@ -1798,7 +1930,7 @@ def _dyn_round(dev) -> None:
     if DYN.get("swaps", 0) > swaps0:
         T["swap_rounds"] += 1
         T["swap_sum"] += dt
-    if T["n"] % DYN_LOG == 0:
+    if T["n"] % 64 == 0:
         if _DYN_T.get("sec"):
             _log("dynamic round sections (ms in all): " + ", ".join(f"{k} {v * 1e3:.0f}" for k, v in _DYN_T["sec"].items()))
             _DYN_T["sec"] = {}
@@ -1828,12 +1960,32 @@ def _ck(name: str) -> None:
 
 
 def _dyn_round_impl(dev) -> None:
-    """Every DYN_EVERY decode forwards, outside the graph: last round's copies enter
+    """Every period of decode forwards, outside the graph: last round's copies enter
     the table, last round's counts become scores, and each layer swaps held experts
     for better-scored ones (out of the table now, copied in on the side stream)."""
     DYN["calls"] += 1
-    if DYN["calls"] % DYN_EVERY:
+    D = _DRV
+    t_in = time.perf_counter()
+    if D["t_call"] is not None:
+        gap = t_in - D["t_call"]
+        D["gap_sum"] += gap
+        D["gap_max"] = max(D["gap_max"], gap)
+        D["gaps"] += 1
+    D["t_call"] = t_in
+    D["since"] += 1
+    if D["since"] < D["period"]:
         return
+    period, D["since"] = D["since"], 0
+    # this window's forward time: none when a prompt or a pause sat in it (one gap far above the others, or the
+    # window far above the ones before)
+    y = D["gap_sum"] / D["gaps"] if D["gaps"] else None
+    if y is not None and (D["gap_max"] > 2.0 * y or (D["f"] is not None and y > 2.0 * D["f"])):
+        y = None
+    if y is not None:
+        _drv_ema("f", y, period)
+    D["gap_sum"], D["gap_max"], D["gaps"] = 0.0, 0.0, 0
+    win, D["win"] = D["win"], (y, period)  # (the counts of a window come a round after its time)
+    t_load = 0.0
     cur = torch.cuda.current_stream(dev)
     tbl = STATE["tbl"]
     rtbl = STATE.get("rtbl")
@@ -1870,68 +2022,83 @@ def _dyn_round_impl(dev) -> None:
     if DYN["ev_cnt"] is not None:
         DYN["ev_cnt"].synchronize()
         seen = DYN["buf"].numpy().astype(np.float64)
-        DYN["scores"] *= 0.5 ** (DYN_EVERY / DYN_HALF_LIFE)
+        DYN["scores"] *= 0.5 ** ((win[1] if win else period) / DYN_HALF_LIFE)
         DYN["scores"] += seen
         DYN["seen"] = seen if DYN["seen"] is None else DYN["seen"] + seen
         DYN["last"] = seen
     else:
+        seen = None
         DYN["ev_cnt"] = torch.cuda.Event()
     DYN["buf"].copy_(STATE["cnt"], non_blocking=True)
     STATE["cnt"].zero_()
     DYN["ev_cnt"].record(cur)
     DYN["rounds"] += 1
     _ck("counts and scores")
-    if DYN["ev_cnt"] is not None and DYN.get("last") is not None:
-        # this round's routes against what the tables held through it
-        seen, res = DYN["last"], bool(DYN.get("res"))
-        for L in LAYERS:
-            on = [e for e in L.held[: L.k] if e >= 0] + (L.res_now if res else [])
-            DYN["hit"] = DYN.get("hit", 0.0) + float(seen[L.idx, on].sum())
-            DYN["all"] = DYN.get("all", 0.0) + float(seen[L.idx, 0 if res else L.n:].sum())
+    # the window's routes against what the tables held through it (the mask made two rounds ago: one round for
+    # the window to run, one for its counts to come)
+    M = D["masks"].pop(0) if len(D["masks"]) >= 2 else None
+    if seen is not None and M is not None and M.shape == seen.shape:
+        C = _drv_counted()
+        hit, every = float(seen[M & C].sum()), float(seen[C].sum())
+        DYN["hit"] = DYN.get("hit", 0.0) + hit
+        DYN["all"] = DYN.get("all", 0.0) + every
+        if win is not None and win[0] is not None:
+            _drv_window((every - hit) / win[1], win[0])
+        else:
+            D["last_xy"] = None
+    else:
+        D["last_xy"] = None
     _ck("hit accounting")
-    budget = 0 if busy else DYN_SWAPS * DYN_EVERY  # none while a batch is out
+    _drv_settle(period)
+    bar, tilt = D["bar"], (1.0 - D["period"] / D["T"] if D["T"] else 1.0)
+    _ck("settle over the ranks")
+    budget = 0 if busy else DYN_SWAPS * period  # none while a batch is out
     swaps = []  # (layer, 0: slot / 1: resident row, its index, expert out, expert in)
-    for L in LAYERS:
-        k = L.k
-        if not k:
-            continue
-        sc, held = DYN["scores"][L.idx], L.held
-        # the places a layer's GPU experts sit in: its lent slots, and with the dynamic
-        # resident rows those rows too (one pool: the lowest score anywhere goes)
-        res = bool(DYN.get("res")) and L.res_t is not None
-        places = [(0, j) for j in range(k)] + ([(1, r) for r in range(L.n)] if res else [])
-
-        def has(p):
-            return held[p[1]] if p[0] == 0 else L.res_held[p[1]]
-
-        hs, changed, n = {has(p) for p in places}, set(), 0
-        for e in np.argsort(-sc, kind="stable").tolist():
-            if n >= budget or sc[e] <= 0 or (DYN_ASYNC and _is_gguf(L) and len(swaps) >= DYN_ASYNC_CAP):
-                break
-            if (e < L.n and not res) or e in hs:
-                continue
-            if _ep(L) and e % L.method.world != L.method.rank:
-                continue  # another rank's expert
-            opts = [p for p in places if p not in changed]
-            if not opts:
-                break
-            empty = [p for p in opts if has(p) < 0]
-            if empty:
-                p = empty[0]
-            else:
-                p = min(opts, key=lambda q: (sc[has(q)], q))
-                if not sc[e] > sc[has(p)] * DYN_HYST:
+    moved = 0.0  # the scores the swaps move, as in q
+    Ls = [L for L in LAYERS if L.k] if budget else []
+    if Ls:
+        # Every layer at once. A layer's places are its lent slots, and with the dynamic resident rows those rows
+        # too (one pool: the lowest score anywhere goes). The places are given up in order: the empty ones as they
+        # stand, then the lowest score first; the experts come in by score, the highest first; pair i swaps while
+        # every pair before it did.
+        S = DYN["scores"]
+        res = [bool(DYN.get("res")) and L.res_t is not None for L in Ls]
+        width = max(L.k + (L.n if r else 0) for L, r in zip(Ls, res))
+        place = np.full((len(Ls), width), -2, dtype=np.int64)  # the expert a place holds; -1 empty, -2 no place
+        for i, (L, r) in enumerate(zip(Ls, res)):
+            place[i, : L.k] = L.held[: L.k]
+            if r:
+                place[i, L.k: L.k + L.n] = L.res_held
+        Sl = S[[L.idx for L in Ls]]
+        free = _drv_may(Ls, res, Sl.shape).copy()  # the experts a layer may take: not held, this rank's
+        ii, jj = np.nonzero(place >= 0)
+        free[ii, place[ii, jj]] = False
+        cs = np.where(free, Sl, -np.inf)
+        ci = np.argsort(-cs, axis=1, kind="stable")[:, :width]
+        cv = np.take_along_axis(cs, ci, 1)
+        vs = np.where(place >= 0, np.take_along_axis(Sl, np.maximum(place, 0), 1),
+                      np.where(place == -1, -np.inf, np.inf))
+        vi = np.argsort(vs, axis=1, kind="stable")
+        vv = np.take_along_axis(vs, vi, 1)
+        with np.errstate(invalid="ignore"):
+            pays = cv > vv * DYN_HYST if bar is None else cv * tilt - vv > bar
+        ok = (cv > 0) & (vv < np.inf) & ((vv == -np.inf) | pays)
+        take = np.minimum(np.cumprod(ok, axis=1).sum(axis=1), budget)
+        for i, (L, r) in enumerate(zip(Ls, res)):
+            capped = DYN_ASYNC and _is_gguf(L)
+            for t in range(int(take[i])):
+                if capped and len(swaps) >= DYN_ASYNC_CAP:
                     break
-            old = has(p)
-            swaps.append((L, p[0], p[1], old, e))
-            hs.discard(old)
-            hs.add(e)
-            if p[0] == 0:
-                held[p[1]] = e
-            else:
-                L.res_held[p[1]] = e
-            changed.add(p)
-            n += 1
+                j, e = int(vi[i, t]), int(ci[i, t])
+                old = int(place[i, j])
+                se, so = float(cv[i, t]), (float(vv[i, t]) if old >= 0 else 0.0)
+                if j < L.k:
+                    swaps.append((L, 0, j, old, e))
+                    L.held[j] = e
+                else:
+                    swaps.append((L, 1, j - L.k, old, e))
+                    L.res_held[j - L.k] = e
+                moved += (se - so) / 2.0 + se
     _ck("decide")
     if swaps:
         for which, table in ((0, tbl), (1, rtbl)):
@@ -1949,6 +2116,7 @@ def _dyn_round_impl(dev) -> None:
         DYN["prep"] = (swaps, _AsyncGGUF.submit(swaps))
         DYN["swaps"] += len(swaps)
     elif swaps:
+        t_load = time.perf_counter()
         side = DYN["stream"]
         with torch.cuda.stream(side):
             side.wait_event(DYN["ev_unmap"])
@@ -1962,17 +2130,25 @@ def _dyn_round_impl(dev) -> None:
             DYN["ev_copy"].record(side)
         DYN["pending"] = _pending(swaps, dev)
         DYN["swaps"] += len(swaps)
-    if DYN["rounds"] % DYN_LOG == 0 and DYN["seen"] is not None:
+        t_load = time.perf_counter() - t_load
+        _drv_ema("b", t_load / len(swaps), period)
+    D["masks"].append(_drv_mask({(L.idx, e) for L, _, _, _, e in swaps}))
+    _drv_ema("q", moved * _LN2 / DYN_HALF_LIFE / period, period)
+    _drv_ema("s", len(swaps) / period, period)
+    if DYN["calls"] - DYN.get("calls_logged", 0) >= DYN_LOG and DYN["seen"] is not None:
         res = bool(DYN.get("res"))
         hit, cpu = DYN.pop("hit", 0.0), DYN.pop("all", 0.0)
         _log(f"dynamic round {DYN['rounds']}: the GPU took {hit / max(cpu, 1):.1%} of the routes"
              + (" (resident rows and slots)" if res else " past the resident experts")
-             + f" over the last {DYN_LOG} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
-             f"({(DYN['swaps'] - DYN['swaps_logged']) / (DYN_LOG * DYN_EVERY * max(len(LAYERS), 1)):.3f} "
-             f"a forward and layer)")
-        DYN["seen"], DYN["swaps_logged"] = None, DYN["swaps"]
+             + f" over the last {DYN['rounds'] - DYN.get('rounds_logged', 0)} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
+             f"({(DYN['swaps'] - DYN['swaps_logged']) / (max(DYN['calls'] - DYN.get('calls_logged', 0), 1) * max(len(LAYERS), 1)):.3f} "
+             f"a forward and layer); {_drv_text()}")
+        DYN["seen"], DYN["swaps_logged"], DYN["calls_logged"], DYN["rounds_logged"] = None, DYN["swaps"], DYN["calls"], DYN["rounds"]
     _union()
     _ck("unmap, submit, log")
+    t_out = time.perf_counter()
+    _drv_ema("r0", t_out - t_in - t_load, period)
+    D["t_call"] = t_out  # (the round is not a forward's time)
 
 
 def _hook() -> None:
@@ -2089,6 +2265,10 @@ def tick(runner) -> None:
     # the slots each layer has already (a lend that stands): they stay as they are
     base = [L.k if more else 0 for L in LAYERS]
     have = sum(_cost(L, k) for L, k in zip(LAYERS, base))
+    if regrow:
+        from sglang.srt.layers.moe import kt_ledger
+
+        kt_ledger.listing(dev.index if dev.index is not None else torch.cuda.current_device())
     if SPARE_FLOOR_MB >= 0 and (not more or regrow) and kt_kv_vmm.HOST is not None and kt_kv_vmm.HOST.get("go"):
         # the ledger's order: the pool's card rows no request holds (level 5) come after the hot slots. Once on the
         # card they stayed: a launch's calibration prompts left 4.44 GiB of them there after the cache was flushed,
@@ -2120,7 +2300,7 @@ def tick(runner) -> None:
             STATE["want"], STATE["since"] = False, 0
         return
     if got <= 0 and not regrow:
-        _host_fill(dev)  # kt-host-kv-in-flight.py: nothing to lend, the pool's rows take the room
+        _host_fill(dev)  # nothing to lend, the pool's rows take the room
         return
     # (after a window: the slots it took left their K/V chunks unmapped, and those are the budget again)
     budget = (max(have + got, int(m.STATE["bytes"])) if regrow else have + got) - (MARGIN_MB << 20)
@@ -2155,6 +2335,24 @@ def tick(runner) -> None:
                 for _, nm in M.names:
                     kt_kv_vmm.release(M.slots[nm], _span(M, nm, b), _span(M, nm, M.x) - _span(M, nm, b))
             ks = ks[:i] + base[i:]
+            # the card is full now: the fill's repack and the next forward allocate beside the slots. The slots
+            # mapped last go back until the floor is free again (V4.1 MXFP4 on a tree without the 1017 recipe's
+            # tier 1: 820 slots mapped, 4 MiB free, and the Marlin repack of the first batch asked for 20 MiB, 11-14)
+            floor = max(0, SPARE_FLOOR_MB) << 20
+            index = dev.index if dev.index is not None else torch.cuda.current_device()
+            back = 0
+            while kt_kv_vmm.card_free(index) < floor:
+                j = max(range(len(ks)), key=lambda q: (ks[q] - base[q], q))
+                if ks[j] <= base[j]:
+                    break
+                M = LAYERS[j]
+                for _, nm in M.names:
+                    kt_kv_vmm.release(M.slots[nm], _span(M, nm, ks[j] - 1), _span(M, nm, ks[j]) - _span(M, nm, ks[j] - 1))
+                ks[j] -= 1
+                back += 1
+            _log(f"the plan was {budget / 2**30:.2f} GiB ({got / 2**30:.2f} GiB of free pages, {spare / 2**30:.2f} GiB "
+                 f"the driver had free); {back} slots more given back for the floor of {floor >> 20} MiB: {sum(ks)} "
+                 f"slots, {kt_kv_vmm.card_free(index) >> 20} MiB free")
             break
     ph("slots mapped")
     # a rank that could not map them all: the others give back what it lacks
@@ -2205,9 +2403,9 @@ def tick(runner) -> None:
         ph.parts.append(("fill on the GPU", ev0.elapsed_time(ev1)))
     STATE["lent_slots"] = sum(ks)
     # what the slots hold beyond the KV pages: back at the window's start, so the
-    # prefill plan counts it as free (sglang-kt-kv-hot-spare-plan.py)
+    # prefill plan counts it as free
     STATE["spare_held"] = max(0, sum(_cost(L, k) for L, k in zip(LAYERS, ks)) - int(m.STATE["bytes"]))
-    _host_fill(dev)  # kt-host-kv-in-flight.py: the pool's rows past those in flight take what the slots left
+    _host_fill(dev)  # the pool's rows past those in flight take what the slots left
     ph("host rows")
     if regrow or not more:
         STATE["fill_s"] = time.perf_counter() - t0  # (a grow adds a few slots: not the measure of a fill)
@@ -2235,7 +2433,7 @@ def tick(runner) -> None:
 
 
 def _host_fill(dev) -> None:
-    """kt-host-kv-in-flight.py: level 5 after the hot slots, the hot lend's floor kept free."""
+    """level 5 after the hot slots, the hot lend's floor kept free."""
     from sglang.srt.layers.moe import kt_kv_vmm
 
     if kt_kv_vmm.HOST is not None and kt_kv_vmm.HOST.get("go"):

@@ -81,7 +81,7 @@ def safetensors_tensors(path):
         for d in info["shape"]:
             cnt *= d
         a, b = info["data_offsets"]
-        out.append((name, cnt, info["dtype"], b - a))
+        out.append((name, cnt, info["dtype"], b - a, info["shape"]))
     return out
 
 
@@ -190,6 +190,8 @@ def config_summary(cfg):
         ratios = [max(1, int(r)) for r in t["compress_ratios"]]
         lat = (t.get("head_dim") or head_dim or 0) + (t.get("qk_rope_head_dim") or 0)
         out["kv_layout"] = "dsv4-compressed"
+        # SGLang's pool for this layout stores FP8 bytes and nothing else (it asserts a uint8 store)
+        out["kv_store"] = "fp8"
         out["full_attention_layers"] = sum(1 for r in ratios if r == 1)
         out["kv_bytes_per_token_bf16"] = int(sum(lat * 2 / r for r in ratios))
         out["kv_window_bytes_bf16"] = len(ratios) * (t.get("sliding_window") or 0) * lat * 2
@@ -266,8 +268,12 @@ def probe(model_dir, gguf=None):
         if sts:
             fmt = "safetensors"
             for f in sts:
-                for name, n, dt, nb in safetensors_tensors(f):
+                for name, n, dt, nb, shape in safetensors_tensors(f):
                     b, l, part = classify_hf(name, L, summ["mtp_layers"])
+                    if b == "dense" and len(shape) == 2 and summ.get("vocab_size") and shape[0] > summ["vocab_size"]:
+                        # more rows than the vocabulary: no layer multiplies by it, it is read by row (a hashed
+                        # n-gram table and its scales). Host memory or storage in the serve, like the PLE table
+                        b = "table"
                     add(b, nb, dt)
                     if b == "experts":
                         d = per_layer_experts.setdefault(l, {})
@@ -286,6 +292,7 @@ def probe(model_dir, gguf=None):
     res["draft_bytes"] = buckets.get("draft", {}).get("bytes", 0)
     res["embed_bytes"] = buckets.get("embed", {}).get("bytes", 0)
     res["ple_bytes"] = buckets.get("ple", {}).get("bytes", 0)
+    res["table_bytes"] = buckets.get("table", {}).get("bytes", 0)
     return res
 
 
@@ -308,7 +315,7 @@ def table(r):
         e = r["experts"]
         parts = ", ".join(f"{p} {v['type']} {v['bytes_per_expert'] / 2**20:.2f} MiB" for p, v in e["parts"].items())
         lines.append(f"expert slot (one expert, one layer): max {e['bytes_per_expert_max'] / 2**20:.2f} MiB, mean {e['bytes_per_expert_mean'] / 2**20:.2f} MiB [largest layer: {parts}]; {e['moe_layers']} MoE layers, all experts {gb(e['bytes_total'])}")
-    lines.append(f"GPU-resident dense + hc + lm_head {gb(r['gpu_resident_bytes'])}; token table {gb(r['embed_bytes'])}; PLE {gb(r['ple_bytes'])}; draft {gb(r['draft_bytes'])}")
+    lines.append(f"GPU-resident dense + hc + lm_head {gb(r['gpu_resident_bytes'])}; token table {gb(r['embed_bytes'])}; PLE {gb(r['ple_bytes'])}; row tables {gb(r.get('table_bytes', 0))}; draft {gb(r['draft_bytes'])}")
     return "\n".join(lines)
 
 

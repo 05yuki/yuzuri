@@ -19,7 +19,7 @@ directory; torch serializes the build with a file lock).
 
 With table=True, W is not the slot tensor but an int64 table on the device with
 one weight address per slot (the build's KT_PTR_TABLE=1): the KV-lent hot
-experts (kt_hot_kv_lend.py) live in borrowed KV pages, not at base + slot *
+experts (kt_kv_hot_lend.py) live in borrowed KV pages, not at base + slot *
 stride. The table has a fixed address, so captured graphs stay valid while its
 entries change between steps; the sums are the same as the plain build's.
 
@@ -29,7 +29,7 @@ all of them (sgl-kernel's MMVQ runs one block per row and token). It uses its
 own build with KT_GGUF_DENSE_MMV_Y=4 warps per block and KT_GGUF_DENSE_RPW=1
 row per warp: on the Flash-Next GGUF's dense shards at 2 tokens, Q6_K 5120x2560
 22.8 -> 16.1 us, IQ4_XS 6144x2560 23.2 -> 16.0 us, Q6_K 2560x3072 14.3 -> 10.4 us,
-IQ4_NL 2560x320 5.1 -> 3.5 us, bit-identical (tools/bench_gguf_dense_multi.py);
+IQ4_NL 2560x320 5.1 -> 3.5 us, bit-identical;
 matrices of 512 rows or fewer stay on MMVQ (320-row ones were faster there).
 """
 import os

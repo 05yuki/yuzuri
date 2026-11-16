@@ -326,7 +326,7 @@ static int range(alloc_t* a, uintptr_t p, size_t off, size_t len, int* i0, int* 
   return *i1 > *i0;
 }
 
-// every chunk that [p + off, p + off + len) touches (kt-kv-vmm-restore-outward.py): what a restore must map
+// every chunk that [p + off, p + off + len) touches: what a restore must map
 static int range_touched(alloc_t* a, uintptr_t p, size_t off, size_t len, int* i0, int* i1) {
   uintptr_t lo = p + off, hi = p + off + len;
   if (hi > a->va + a->size) hi = a->va + a->size;
@@ -514,7 +514,7 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
   alloc_t* a = find((uintptr_t)ptr);
   long long n = 0;
   int i0, i1;
-  // to the card: every chunk the range touches; to host memory: whole chunks only (kt-kv-vmm-place-touched.py)
+  // to the card: every chunk the range touches; to host memory: whole chunks only
   if (!a || !(to_device ? range_touched(a, (uintptr_t)ptr, off, len, &i0, &i1)
                         : range(a, (uintptr_t)ptr, off, len, &i0, &i1))) {
     pthread_mutex_unlock(&mu);
@@ -584,10 +584,10 @@ size_t kv_vmm_chunk_bytes(int device) {
   return c;
 }
 
-// kt-kv-vmm-restore-outward.py: this library's kv_vmm_restore maps every chunk a range touches
+// this library's kv_vmm_restore maps every chunk a range touches
 int kv_vmm_restore_touches(void) { return 1; }
 
-// kt-ledger.py: device memory mapped under every range of a device (host chunks apart), the zero chunk included
+// device memory mapped under every range of a device (host chunks apart), the zero chunk included
 size_t kv_vmm_mapped_bytes(int device) {
   size_t n = 0;
   if (device < 0 || device >= MAX_DEV) return 0;
@@ -603,7 +603,7 @@ size_t kv_vmm_mapped_bytes(int device) {
   return n;
 }
 
-// kt-ledger.py: virtual bytes reserved by the ranges of a device
+// virtual bytes reserved by the ranges of a device
 size_t kv_vmm_virtual_bytes(int device) {
   size_t n = 0;
   if (device < 0 || device >= MAX_DEV) return 0;
@@ -614,5 +614,5 @@ size_t kv_vmm_virtual_bytes(int device) {
   return n;
 }
 
-// kt-kv-vmm-place-touched.py: this library's kv_vmm_place_range brings every touched chunk to the card
+// this library's kv_vmm_place_range brings every touched chunk to the card
 int kv_vmm_place_touches(void) { return 1; }

@@ -33,7 +33,7 @@ import time
 import traceback
 
 # KT_STREAM_GRAPH_KEEP: CUDA graphs kept for row counts other than the
-# largest (a prompt's last chunk has its own; sglang-kt-stream-graph-keep.py)
+# largest (a prompt's last chunk has its own)
 GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
 from typing import Dict, List, Optional
 
@@ -96,7 +96,7 @@ class KTStreamPrefill:
             raise RuntimeError(
                 f"KT_GPU_STREAM_PREFILL (bf16): w13 {tuple(layer.w13_weight.shape)} {layer.w13_weight.dtype} "
                 f"vs N={self.N} K={self.K}")
-        # patches/sglang-qwen35-kt-prefill-lend.py: prefill-only buffers in
+        # prefill-only buffers in
         # the lend scratch (plain allocations when lending is off)
         from sglang.srt.layers.moe import kt_lend
 
@@ -106,7 +106,7 @@ class KTStreamPrefill:
         self._ep_size, self._ep_rank = layer.moe_ep_size, layer.moe_ep_rank
         self.transfer_stream = torch.cuda.Stream(device=self.device)
         self._cutlass_fused_moe = cutlass_fused_moe
-        # SGLang's own CUTLASS mapping of the layer's activation (kt-activation-generic.py)
+        # SGLang's own CUTLASS mapping of the layer's activation
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import _activation_type as _sgl_activation
 
         self._activation_type = _sgl_activation(layer.moe_runner_config)
@@ -378,7 +378,7 @@ class KTStreamPrefill:
         """Persistent graph inputs for this token count."""
         g = self._gin.get(T)
         if g is None:
-            # views of one base per buffer (patches/sglang-qwen35-kt-prefill-lend.py)
+            # views of one base per buffer
             k = physical_ids.shape[1]
             g = {
                 "x": self._gin_view("x", T, (T, self.K), torch.bfloat16, x.device),

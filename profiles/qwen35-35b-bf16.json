@@ -1,6 +1,6 @@
 {
  "name": "qwen35-35b-bf16",
- "description": "Qwen3.5-35B-A3B bf16: bf16 CPU experts in kt-kernel, the bf16 streamed prefill (built at load), the hot lend with dynamic slots; captured 2026-11-05 from tools/start-qwen35-35b-bf16.sh",
+ "description": "Qwen3.5-35B-A3B bf16: bf16 CPU experts in kt-kernel, the bf16 streamed prefill (built at load), the hot lend with dynamic slots; captured 2026-11-05 from a measured launch",
  "weights": {
   "gguf": false,
   "experts_from": false,
@@ -28,7 +28,7 @@
   "--served-model-name",
   "{served_model_name}",
   "--host",
-  "0.0.0.0",
+  "{host}",
   "--port",
   "{port}",
   "--tensor-parallel-size",

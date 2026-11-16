@@ -14,7 +14,9 @@ the server has no /tokenize), each with 16 random ids first so no prefix is cach
 import argparse
 import json
 import random
+import os
 import re
+import statistics
 import sys
 import time
 import urllib.request
@@ -69,11 +71,55 @@ def prompt_ids(base, rng, n):
     return (head + base * (n // len(base) + 2))[:n]
 
 
-def decode_rate(url, ids, timeout, new=256):
-    """Tokens a second of `new` tokens after `ids`: the time of new+1 tokens less the time of 1."""
-    t1, _ = generate(url, ids, 1, timeout)
-    t2, got = generate(url, ids, new + 1, timeout)
-    return (got - 1) / max(t2 - t1, 1e-6)
+def stream_rate(url, ids, new, timeout, sample=False):
+    """Tokens a second of one streamed request, from its first token to its last: the prompt's read, the queue and
+    the first step are outside the time.  None when the stream gave fewer than 16 tokens."""
+    sp = {"max_new_tokens": new, "ignore_eos": True}
+    sp.update({"temperature": 1.0, "top_p": 0.95} if sample else {"temperature": 0})
+    req = urllib.request.Request(url + "/generate", json.dumps({"input_ids": ids, "sampling_params": sp,
+                                                                "stream": True}).encode(),
+                                 {"Content-Type": "application/json"})
+    first = last = None
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for line in r:
+            if not line.startswith(b"data:") or b"[DONE]" in line:
+                continue
+            try:
+                n = int(json.loads(line[5:])["meta_info"]["completion_tokens"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            last = (time.time(), n)
+            first = first or last
+    if not first or last[1] - first[1] < 16 or last[0] <= first[0]:
+        return None
+    return (last[1] - first[1]) / (last[0] - first[0])
+
+
+def prose_prompts(url, n=384):
+    """Four prompts of the public-domain texts beside this file (two Japanese, two English); [] without them."""
+    out = []
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("nll-text/ja-kokoro.txt", "nll-text/en-holmes.txt"):
+        try:
+            text = open(os.path.join(here, name), encoding="utf-8").read()
+        except OSError:
+            return []
+        for at in (len(text) // 5, 3 * len(text) // 5):
+            try:
+                r = post(url + "/tokenize", {"prompt": text[at:at + 8 * n], "add_special_tokens": True}, 30)
+            except Exception:  # noqa: BLE001
+                return []
+            ids = r.get("tokens") or r.get("token_ids")
+            if not ids or not isinstance(ids[0], int) or len(ids) < n:
+                return []
+            out.append(ids[:n])
+    return out
+
+
+def decode_rate(url, prompts, new, timeout):
+    """The median over the prompts of a streamed, sampled decode of `new` tokens."""
+    rates = [r for r in (stream_rate(url, ids, new, timeout, sample=True) for ids in prompts) if r]
+    return statistics.median(rates) if rates else None
 
 
 def scan(log, start):
@@ -100,6 +146,8 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--prompt", type=int, default=35000, help="the long prompt's tokens (sent twice)")
     ap.add_argument("--long", type=int, default=0, help="one more prompt of this many tokens, and decode after it")
+    ap.add_argument("--decode-tokens", type=int, default=1024, help="the tokens of each decode")
+    ap.add_argument("--decode-only", action="store_true", help="the decode row only")
     ap.add_argument("--log", help="the server log: error lines written during the check are counted")
     ap.add_argument("--json", help="write the rows here, for --compare")
     ap.add_argument("--timeout", type=int, default=7200)
@@ -138,23 +186,29 @@ def main():
     rows = {}
 
     def row(name, value, unit="tok/s"):
+        if value is None:
+            print(f"  {name}: not measured (the stream gave too few tokens)")
+            return
         rows[name] = round(value, 2)
         print(f"  {name:26} {value:10.1f} {unit}")
 
-    row("decode", decode_rate(url, prompt_ids(base, rng, 256), a.timeout))
-    for i in (1, 2) if fits(a.prompt) else ():
+    prose = prose_prompts(url) or [prompt_ids(base, rng, 384) for _ in range(4)]
+    print(f"decode: {a.decode_tokens} sampled tokens after each of {len(prose)} prompts, first token to last, the median")
+    row("decode", decode_rate(url, prose, a.decode_tokens, a.timeout))
+    if a.decode_only:
+        a.prompt = a.long = 0
+    for i in (1, 2) if a.prompt and fits(a.prompt) else ():
         ids = prompt_ids(base, rng, a.prompt)
         dt, _ = generate(url, ids, 1, a.timeout)
         row(f"prefill {a.prompt} #{i}", a.prompt / dt)
-    row("decode after the prompts", decode_rate(url, prompt_ids(base, rng, 256), a.timeout))
+    if a.prompt:
+        row("decode after the prompts", decode_rate(url, prose, a.decode_tokens, a.timeout))
     if a.long and fits(a.long):
         ids = prompt_ids(base, rng, a.long)
         dt, _ = generate(url, ids, 1, a.timeout)
         row(f"prefill {a.long}", a.long / dt)
-        # the same prompt again: its prefix is cached, so the difference of the two times is decode at that length
-        t1, _ = generate(url, ids, 1, a.timeout)
-        t2, got = generate(url, ids, 257, a.timeout)
-        row(f"decode at {a.long}", (got - 1) / max(t2 - t1, 1e-6))
+        # the same prompt again: its prefix is cached, and the stream is timed from its first token.
+        row(f"decode at {a.long}", stream_rate(url, ids, a.decode_tokens, a.timeout))
     out = {"model": info.get("model_path"), "rows": rows}
     if a.log:
         n = scan(a.log, start)

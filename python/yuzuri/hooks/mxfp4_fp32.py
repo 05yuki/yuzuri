@@ -1,5 +1,5 @@
 """SGLANG_MXFP4_MOE_FP32=1: an MXFP4 expert checkpoint under Fp8Config runs its GPU experts in Mxfp4Fp32MoEMethod (the
-checkpoint's layout, one rounding) where SGLang picks Marlin (sglang-mxfp4-fp32-moe.py)."""
+checkpoint's layout, one rounding) where SGLang picks Marlin."""
 import os
 
 from yuzuri._finder import after_import

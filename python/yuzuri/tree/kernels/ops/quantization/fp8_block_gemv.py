@@ -7,7 +7,7 @@ weight tile per iteration and ran at 2.5-3x the bandwidth bound (wq_b 59.7 us fo
 a program holds BLOCK_N weight rows over BLOCK_K = several groups, sums each group with tl.sum, and splits K across
 programs when N alone gives too few of them; the split partials are summed by a second kernel in a fixed order.
 Only the fp32 summation order differs from the block kernel.
-(patches/sglang-fp8-block-gemv.py installs it; SGLANG_FP8_GEMV=0 turns it off.)"""
+(hooks/fp8_decode_gemm.py installs it; SGLANG_FP8_GEMV=0 turns it off.)"""
 
 import torch
 import triton

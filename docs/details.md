@@ -12,10 +12,22 @@ It does nothing unless `YUZURI_PACKAGE=1`, which `serve.py --package` sets.
 - `tree/` holds Yuzuri's own modules, by the path they take inside the `sglang` package; `manifest.json` lists them.
 - No SGLang module is replaced. `hooks/` wraps SGLang's functions once their module has loaded.
 - Each hook checks what it attaches to: the function's parameters, and the calls inside it the hook relies on.
-  A function that is gone or changed stops the launch with its name.
-- A function that already uses what the hook brings stops the launch too: that SGLang carries the same mechanism
-  as a patch (the DeepSeek-V4.1 recipe's tree does), and both would run.
+- A function that gained or moved parameters still takes the hook.
+  The hook is bound to the names it works with and the others pass through.
+- A function that is gone, or lost a name the hook works with, is handled by what the hook is for
+  (`python/yuzuri/_features.py`).
+  A hook that only makes the server faster or lighter stays off: it takes back what it had put in and the launch goes on.
+  A hook the output depends on stops the launch with the function's name.
+- A function that already uses what the hook brings keeps its own: that SGLang carries the same mechanism as a
+  patch (the DeepSeek-V4.1 recipe's tree does).
+  The hook stays off there and the log names it once.
+  The same holds for a module the tree already has under one of Yuzuri's names.
 - Your own patches elsewhere in SGLang are left as they are.
+- Once the model has loaded, the server log lists every hook under `[yuzuri-features]`.
+  `on` is Yuzuri's hook, `tree` is the tree's own mechanism, `off` names the reason, `gone` is a needed hook whose
+  SGLang module is not in the tree.
+  Each line carries the patch name the DeepSeek-V4.1 recipe's `docs/tier1.md` uses, so the two can be read side by side.
+  `PYTHONPATH=python python3 -m yuzuri._features` prints the whole table.
 - `manifest.json` records the SGLang commit the hooks were checked on (`sglang_checked`). Nothing compares it.
 - `csrc/kv_vmm.c` is the KV library; `setup.sh --package` builds it next to `kt_kv_vmm.py`.
 
@@ -38,7 +50,9 @@ It decides the resident hot count and the threads, and nothing else.
 ## The mechanisms
 
 **Prefill lend** (`kt_lend.py`).
-During a streamed prefill the GPU-resident weights give their memory to the prefill's scratch.
+During a streamed prefill the decoder layers' dense weights give their memory to the prefill's scratch.
+That scratch is the streamer's slots and inputs and the kernel workspace.
+Outside prefill the scratch holds no memory: its addresses stay and its pages are released.
 They come back layer by layer, at the same addresses, just before each layer runs.
 The addresses stay, so the decode CUDA graphs stay valid
 ([torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver)).

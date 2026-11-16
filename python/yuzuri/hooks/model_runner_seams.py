@@ -25,18 +25,28 @@ def _install(m):
             got = orig(self)
             from sglang.srt.layers import mm_on_demand
             from sglang.srt.layers.moe import kt_kv_vmm
-            from sglang.srt.layers.moe.kt_handoff_pack import bind_shared_streams
+            from sglang.srt.layers.moe import kt_handoff_pack
 
             b = mm_on_demand.install(self.model)
             if b:
                 logger.info(f"multimodal encoder on demand: {b / MIB:.1f} MiB in pinned host memory")
-            b = bind_shared_streams(self.model)
+            # a tree with its own kt_handoff_pack may be an earlier one, without the late start: it is speed only
+            bind = getattr(kt_handoff_pack, "bind_shared_streams", None)
+            if bind is None:
+                print(f"[yuzuri] {kt_handoff_pack.__name__} is the tree's own and has no bind_shared_streams: the "
+                      f"shared experts' late start is off", flush=True)
+            b = bind(self.model) if bind else 0
             if b:
                 logger.info(f"shared experts start after the CPU request in {b} MoE blocks")
             if os.environ.get("SGLANG_EMBED_ON_HOST", "0") == "1":
-                from sglang.srt.layers.host_embedding import move_all_to_host
+                from sglang.srt.layers import host_embedding
 
-                for n, b in move_all_to_host(self.model):
+                # a tree with its own host_embedding moves the table from its model file: nothing left to do here
+                move = getattr(host_embedding, "move_all_to_host", None)
+                if move is None:
+                    print(f"[yuzuri] {host_embedding.__name__} is the tree's own and has no move_all_to_host: the "
+                          f"tree moves its token embedding itself, the model-independent sweep is off", flush=True)
+                for n, b in move(self.model) if move else ():
                     logger.info(f"token embedding {n} on host: {b / MIB:.1f} MiB moved to pinned host memory")
             if os.environ.get("SGLANG_ROPE_LAZY", "0") == "1" and kt_kv_vmm.ENABLED:
                 from sglang.srt.layers import lazy_rope_table

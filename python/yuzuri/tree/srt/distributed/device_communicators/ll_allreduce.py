@@ -1,5 +1,5 @@
 """Decode-sized all-reduce for two GPUs without peer access, through pinned
-host memory in NCCL's LL form. See patches/sglang-ll-allreduce.py."""
+host memory in NCCL's LL form."""
 import ctypes
 import logging
 import mmap

@@ -142,8 +142,8 @@ class HostStagedAllReduce:
                     self._wait(self.h2d, p, base + i + 1)
                     self.tmp[a:a + m].copy_(theirs[a:a + m], non_blocking=True)
                 # Our own pieces must have left src before the add overwrites
-                # it; otherwise the peer can DMA a half-summed src (09-26,
-                # patches/sglang-host-staged-allreduce-race.py).
+                # it; otherwise the peer can DMA a half-summed src (the
+                # race fixed 2026-09-26).
                 self.h2d.wait_stream(self.d2h)
                 src.view(t.dtype).add_(self.tmp[:n].view(t.dtype))
                 self._write(self.h2d, 2 + r, seq)

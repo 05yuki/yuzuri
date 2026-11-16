@@ -1,7 +1,7 @@
 {
   "name": "glm53-flash",
-  "description": "GLM-5.3-Flash: fp8 dense (--config-dir), NVFP4 experts beside it (--experts): NVFP4 CPU experts in kt-kernel, ModelOpt NVFP4 GPU experts through CUTLASS, the NVFP4 streamed prefill and the lends as Flash-Next's profile; on the recipe's tree 2026-11-05",
-  "tree": "kvcache-ai/sglang 541ddc3 + trees/glm53",
+  "description": "GLM-5.3-Flash: fp8 dense (--config-dir), NVFP4 experts beside it (--experts): NVFP4 CPU experts in kt-kernel, ModelOpt NVFP4 GPU experts through CUTLASS, the NVFP4 streamed prefill and the lends as Flash-Next's profile; measured 2026-11-05",
+  "tree": "measured on kvcache-ai/sglang 541ddc3 with the lend modules of 2026-11-05",
   "weights": {
     "gguf": false,
     "experts_from": true,
@@ -25,7 +25,7 @@
     "--served-model-name",
     "{served_model_name}",
     "--host",
-    "0.0.0.0",
+    "{host}",
     "--port",
     "{port}",
     "--tp",

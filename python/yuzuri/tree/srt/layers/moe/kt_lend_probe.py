@@ -17,7 +17,7 @@ same steps in the same order, so the forward's collectives line up.
 
 Runs only where the allocator has alloc_extend_swa_tail (DeepSeek V4's SWA
 pool), or with P = 0 anywhere. Called from dispatch_event_loop
-(patches/sglang-kt-lend-probe.py); the lend must be on.
+(hooks/scheduler_seams.py); the lend must be on.
 """
 
 import logging

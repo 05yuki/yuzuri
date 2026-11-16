@@ -17,6 +17,13 @@ from yuzuri.hooks._seam import wrap
 
 REPLACES = ["srt/mem_cache/kv_cache_configurator.py"]
 _IN = threading.local()
+_SAID = set()
+
+
+def _once(text: str) -> None:
+    if text not in _SAID:
+        _SAID.add(text)
+        print(f"[yuzuri] {text}", flush=True)
 
 
 def _cover_context(m, self, config):
@@ -28,6 +35,10 @@ def _cover_context(m, self, config):
     page = m.get_schedule().page_size
     tokens = -(-ctx // page) * page
     if os.environ.get("KT_HOST_KV", "1") == "0" or not kt_kv_vmm.ENABLED:
+        return config
+    if not hasattr(kt_kv_vmm, "host_place_now"):
+        _once(f"{kt_kv_vmm.__name__} is the tree's own and has no host_place_now: the pool keeps the size the "
+              f"tree gave it, host KV is off")
         return config
     # a pool that splits itself between the card and host memory (compressed sub-pools) is left to it; any other is
     # made in host memory even when the budget covers the context, so the buffers made after it are measured before
@@ -67,7 +78,12 @@ def _install(m):
         def _resolve_memory_pool_config(self, pre_model_load_memory):
             from sglang.srt.layers.moe import kt_kv_prefill_lend
 
-            kt_kv_prefill_lend.swa_auto(self.is_hybrid_swa)
+            auto = getattr(kt_kv_prefill_lend, "swa_auto", None)
+            if auto is None:
+                _once(f"{kt_kv_prefill_lend.__name__} is the tree's own and has no swa_auto: the window pool's "
+                      f"share is the tree's, Yuzuri's reading of it is off")
+            else:
+                auto(self.is_hybrid_swa)
             _IN.depth = getattr(_IN, "depth", 0) + 1
             try:
                 with kt_kv_prefill_lend.swa_sizing():

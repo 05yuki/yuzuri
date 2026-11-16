@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Serve a model with its patched tree: probe the host, size the launch, set the profile's knobs, start SGLang.
+"""Serve a model with Yuzuri: probe the host, size the launch, set the profile's knobs, start SGLang.
 
-usage: serve.py [--profile auto|NAME] --recipe RECIPE_CHECKOUT --config-dir DIR [--experts DIR | --gguf DIR]
-                [--draft-dir DIR] [--tp 1|2] [--context T] [--port 8080] [--hot N] [--chunk C]
+usage: serve.py --package --venv SERVER_VENV [--profile auto|NAME] --config-dir DIR [--experts DIR | --gguf DIR]
+                [--draft-dir DIR] [--tp 1|2] [--context T] [--host 127.0.0.1] [--port 8080] [--hot N] [--chunk C]
                 [--kv-dtype bf16|fp8] [--mamba-slots N] [--threads N] [--placement FILE] [--hot-seed JSON]
                 [--draft-hot FILE] [--log-dir DIR] [--cache-dir DIR] [--env KEY=VALUE ...] [--background] [--dry-run]
                 [--no-plan]
 
-  --recipe       a deepseek-v4.1-flash-1017-ktransformers checkout built by its setup.sh and patched by ./setup.sh:
-                 its .venv, third_party/sglang, prebuilt/lib and build/cuda-home are the server's
+  --package --venv   the server's venv, with Yuzuri installed into it by ./setup.sh (yuzuri.pth): the SGLang and
+                 kt-kernel installed there serve, with Yuzuri's hooks on
+  --recipe       instead of --package: a deepseek-v4.1-flash-1017-ktransformers checkout whose tree carries the
+                 same changes as patches: its .venv, third_party/sglang, prebuilt/lib and build/cuda-home serve
+  --host         the address the server listens on (default 127.0.0.1, this machine only; SGLang asks for no key
+                 unless --server-arg="--api-key KEY")
   --profile      auto (the default): the command line and environment built from the checkpoint (auto_profile.py);
                  or profiles/<NAME>.json, a measured launch's command line, env defaults (per TP) and weights layout
   --config-dir   the model directory SGLang loads (config + tokenizer; for a GGUF serve, tools/make-config-dir.py)
@@ -115,9 +119,11 @@ def list_features():
     t = feature_table()
     for f in t["features"]:
         need = f", needs {', '.join(f['requires'])}" if f["requires"] else ""
-        print(f"{f['name']:<16} {f['for']}{need}")
+        rec = f", recipe tier 1 {f['recipe']}" if f.get("recipe") else ""
+        print(f"{f['name']:<20} {f['for']}{need}{rec}{' (in base)' if f.get('base') else ''}")
     for f in t["always"]:
-        print(f"{f['name']:<16} {f['for']} (always on: a fix, no switch)")
+        rec = f", recipe {f['recipe']}" if f.get("recipe", "-") != "-" else ""
+        print(f"{f['name']:<20} {f['for']} (always on: no switch{rec})")
 
 
 def pick_features(on_arg, without_arg):
@@ -126,8 +132,12 @@ def pick_features(on_arg, without_arg):
     t = feature_table()
     by = {f["name"]: f for f in t["features"]}
 
+    alias = {f["recipe"]: f["name"] for f in t["features"] if f.get("recipe")}
+
     def names(arg):
-        got = {n.strip() for n in (arg or "").split(",") if n.strip()}
+        got = {alias.get(n.strip(), n.strip()) for n in (arg or "").split(",") if n.strip()}
+        if "base" in got:
+            got = got - {"base"} | {f["name"] for f in t["features"] if f.get("base")}
         bad = got - set(by) - {"all", "none"}
         if bad:
             raise SystemExit(f"unknown feature {', '.join(sorted(bad))} (serve.py --list-features)")
@@ -230,9 +240,15 @@ def main():
     ap.add_argument("--tp", type=int)
     ap.add_argument("--context", type=int)
     ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="address the server listens on (default 127.0.0.1: this machine only). SGLang has no "
+                         "authentication unless --server-arg=\"--api-key KEY\" sets one: give 0.0.0.0 only on a "
+                         "network where every machine may use the model")
     ap.add_argument("--max-running-requests", type=int, default=1,
                     help="requests SGLang runs at once (default 1); a long prompt holds the others while it prefills")
     ap.add_argument("--hot", type=int)
+    ap.add_argument("--free-min-gb", type=float,
+                    help="GiB of each card the plan keeps free of weights and pool (default: the profile's, 1)")
     ap.add_argument("--chunk", type=int)
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8"])
     ap.add_argument("--mamba-slots", type=int)
@@ -244,6 +260,8 @@ def main():
     ap.add_argument("--log-dir", default=os.path.join(os.getcwd(), "logs"))
     ap.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/kt-serve"))
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, overrides any default")
+    ap.add_argument("--server-arg", action="append", default=[], metavar="ARGS",
+                    help="arguments passed on to sglang.launch_server as they are, e.g. --server-arg='--enable-hierarchical-cache --hicache-write-policy write_back --hicache-ratio 2'")
     ap.add_argument("--no-calibrate", action="store_true",
                     help="a setup's first launch measures the prefill plan on the first requests, not on prompts of "
                          "its own before it reports ready")
@@ -256,7 +274,7 @@ def main():
                     help="Yuzuri as a package an unchanged SGLang loads at startup (yuzuri.pth in the venv: "
                          "tools/install-pth.py), not patches in the recipe's tree")
     ap.add_argument("--sglang", help="the SGLang checkout to serve (default: the recipe's third_party/sglang)")
-    ap.add_argument("--features", help="the features on, comma-separated, or all / none (default: all; "
+    ap.add_argument("--features", help="the features on, comma-separated, or all / base / none (default: all; "
                                        "--list-features)")
     ap.add_argument("--without", help="features off, comma-separated")
     if "--list-features" in sys.argv[1:]:
@@ -352,7 +370,7 @@ def main():
     ranks = gpus[:tp]
     plan_cmd = [sys.executable, os.path.join(HERE, "plan-launch.py"), a.config_dir, "--tp", str(tp),
                 "--kv-dtype", kv_dtype, "--mamba-slots", str(mamba_slots), "--embed-host", str(w.get("embed_host", 0)),
-                "--min-hot", str(prof.get("min_hot", 1)), "--free-min-gb", str(d.get("free_min_gb", 1.0)), "--json"]
+                "--min-hot", str(prof.get("min_hot", 1)), "--free-min-gb", str(a.free_min_gb if a.free_min_gb is not None else d.get("free_min_gb", 1.0)), "--json"]
     if a.context:
         plan_cmd += ["--context", str(a.context)]
     if prof.get("max_context"):
@@ -365,7 +383,7 @@ def main():
         plan_cmd += ["--draft-bytes", "0"]
     elif w.get("draft_bytes_assumed"):
         plan_cmd += ["--draft-bytes", str(int(w["draft_bytes_assumed"] * 2**30 / tp))]  # the draft dir's share per rank
-    # the profile's measured constants (tools/plan-calibrate.py from a launch log) when they are for this TP:
+    # the profile's measured constants when they are for this TP:
     # they only make the plan's printed arithmetic closer; nothing sized by it moves with them
     cal_tp = str((prof.get("constants") or {}).get("from", {}).get("tp") or (list(prof["defaults"])[0] if len(prof["defaults"]) == 1 else ""))
     if prof.get("constants") and cal_tp == str(tp):
@@ -378,7 +396,9 @@ def main():
         # the pool at the context needs both: without them it is what the card holds, sized the way SGLang does
         context = context_length = plan["card_context"]
         if "kv-vmm" in names_off:
-            mem_fraction = None  # SGLang's own share of the card: the flag is not passed
+            # the pool is allocated whole, the way SGLang does it: the share is the plan's static budget of the card
+            # (what a user of SGLang passes by hand), and what the pool leaves goes to fixed hot experts below
+            mem_fraction = plan["card_fraction"]
     kv_lend = prof.get("env_by_tp", {}).get(str(tp), {}).get("KT_HOT_KV_LEND") == "1"
     # the KV hot lend (kv-vmm/kt_kv_hot_lend.py): the empty pool's pages hold KT_KV_HOT_EXTRA={lent} more
     # experts a layer outside prefill; it needs the plan's KV pool and at least one resident hot expert
@@ -389,6 +409,11 @@ def main():
     else:
         hot = plan["hot_fixed_with_kv_lend"] if kv_lend else plan["hot_experts_per_layer"]
         hot = max(hot, prof.get("min_hot", 1))
+        per_layer = plan.get("expert_slot_per_rank", 0) * plan.get("moe_layers", 0)
+        if "kv-vmm" in names_off and per_layer:
+            # no lend: the fixed count is what the card holds beside the pool at this context, as a user sizes it
+            room = plan["left_for_hot"] + (plan["context"] - context) * plan["kv_bytes_per_token"]
+            hot = max(hot, int(room // per_layer))
     # the first window's chunk: small enough to fit any model, measured by the plan for the windows after it
     chunk = a.chunk or d.get("chunk") or 4096
     threads = a.threads or d.get("threads") or plan["threads"]
@@ -396,7 +421,7 @@ def main():
     # --no-plan keeps the lend alone. The plan's cost before this setup has measured its own: the profile's prior
     # (the recipe's V4.1 values when a profile has none: conservative on a model with a lighter row)
     # the plan (kt_prefill_plan.py): every request's chunk from the free memory, up to the cap; its cost a row is
-    # measured from the first window this server runs (kt-plan-online-cost.py), or taken from the profile when one
+    # measured from the first window this server runs, or taken from the profile when one
     # gives plan_cost_prior. A hybrid sliding-window pool is sized for the cap and lent outside prefill. --no-plan
     # keeps the lend alone at the launch chunk.
     vmm = os.path.join("srt", "layers", "moe", "kt_kv_vmm.py")
@@ -413,7 +438,7 @@ def main():
         if prof.get("plan_cost_prior"):
             plan_env["KT_PREFILL_PLAN_COST"] = prof["plan_cost_prior"]
         # a hybrid sliding-window pool (as SGLang's KV cache configurator finds it) holds the cap and is lent
-        # outside prefill (kt-swa-lend-auto.py)
+        # outside prefill
         plan_env["KT_PREFILL_SWA_LEND"] = "auto"
         tree_srt = os.path.join(PACKAGE_TREE if a.package else os.path.join(a.tree, "python", "sglang"), "srt")
         carried = not prof.get("plan_cost_prior") and plan_carried(
@@ -430,6 +455,9 @@ def main():
             except OSError:
                 pass
         calibrate = not carried and not prof.get("plan_cost_prior") and not a.no_calibrate and has_warmup
+        # a carried plan measures nothing at launch, and the first long prompt then pays the kernel loads and the
+        # staging of a first window (V4.1 on two cards: the first 35,000-token prompt 21.7 s, the second 19.0 s)
+        warm = bool(carried) and has_warmup and not a.no_calibrate
         plan_note = ((f"prefill plan: the first window from the forwards an earlier launch measured" if carried else
                       f"prefill plan: the first window at {chunk}, the cost measured from it"
                       + (", on the launch's own prompts before it reports ready" if calibrate else ""))
@@ -441,7 +469,8 @@ def main():
     else:
         plan_note = f"prefill lend at chunk {chunk}, no plan"
         calibrate = False
-    vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "tp": tp,
+        warm = False
+    vals = {"config_dir": a.config_dir, "experts_dir": experts_dir, "draft_dir": a.draft_dir or "", "port": a.port, "host": a.host, "tp": tp,
             "numa_nodes": " ".join(str(g["numa_node"]) for g in ranks), "context": context, "context_length": context_length,
             "mem_fraction": mem_fraction,
             "kv_cache_dtype": "fp8_e4m3" if kv_dtype == "fp8" else "bfloat16", "mamba_slots": mamba_slots, "hot": hot,
@@ -470,15 +499,15 @@ def main():
                 "TORCH_EXTENSIONS_DIR": os.path.join(cache_root, "torch_extensions"),
                 "SGLANG_CACHE_DIR": os.path.join(cache_root, "sglang"),
                 # a multimodal model's image processor on the CPU: on the GPU the tokenizer process holds a CUDA
-                # context of its own, outside every budget (kt-mm-processor-device.py)
+                # context of its own, outside every budget
                 "SGLANG_MM_PROCESSOR_DEVICE": "cpu",
                 # tier-1 25 and 24 for any model: the token embedding read from pinned host memory, the RoPE tables
-                # mapped as the context grows (kt-generic-offloads.py)
+                # mapped as the context grows
                 "SGLANG_EMBED_ON_HOST": "1", "SGLANG_ROPE_LAZY": "1",
-                # tier-1 06 for any multimodal model (kt-mm-on-demand.py)
+                # tier-1 06 for any multimodal model
                 "SGLANG_MM_ON_DEMAND": "1"})
     # JIT builds at serve time (sgl-kernel / flashinfer modules compiled on first use) need the same glibc
-    # compat header as the install on a glibc 2.41+ host with CUDA 13 (install.sh sets it for the build)
+    # compat header as the install on a glibc 2.41+ host with CUDA 13 (the kt-kernel build sets it the same way)
     compat = os.path.join(HERE, "cuda13-glibc-compat.h")
     if os.path.exists(compat) and "cuda13-glibc-compat" not in env.get("NVCC_PREPEND_FLAGS", ""):
         env["NVCC_PREPEND_FLAGS"] = (env.get("NVCC_PREPEND_FLAGS", "") + f" -U_GNU_SOURCE -D_DEFAULT_SOURCE -include {compat}").strip()
@@ -523,6 +552,11 @@ def main():
     # a feature off: its switches at their off values, over the profile's and the plan's, under --env
     for f in feat_off:
         env.update(f["off"])
+    if feat_off:  # the workers' report names them: a hook stays attached while its switch is at the off value
+        env["YUZURI_FEATURES_OFF"] = ",".join(f["name"] for f in feat_off)
+    hooks_off = [h for f in feat_off for h in f.get("hooks_off", [])]
+    if hooks_off:
+        env["YUZURI_HOOKS_OFF"] = ",".join(hooks_off)
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
@@ -535,6 +569,17 @@ def main():
         cmd += fill(prof["command_with_placement"], vals)
     if a.draft_dir and "command_with_draft" in prof:
         cmd += fill(prof["command_with_draft"], vals)
+    if warm and "--warmups" not in cmd:
+        # two fresh prompts before ready: one of the plan's first chunk, and one of three chunks and eight rows (a row
+        # count 16 does not divide selects other kernel variants than one it divides, and a longer one other tiles).
+        # SGLANG_WARMUP_PREFILL_LENGTHS given by hand stands, and given empty there is no warmup
+        given = "SGLANG_WARMUP_PREFILL_LENGTHS" in os.environ or any(
+            kv.startswith("SGLANG_WARMUP_PREFILL_LENGTHS=") for kv in a.env)
+        first = int(env.get("KT_PREFILL_PLAN_SAFE", "0") or 0)
+        if not given and first > 0:
+            env["SGLANG_WARMUP_PREFILL_LENGTHS"] = f"{first},{3 * first + 8}"
+        if env.get("SGLANG_WARMUP_PREFILL_LENGTHS"):
+            cmd += ["--warmups", "prefill_lengths"]
     if calibrate:
         if "--warmups" in cmd:
             cmd[cmd.index("--warmups") + 1] += ",prefill_plan"
@@ -549,10 +594,12 @@ def main():
         cmd[cmd.index("--max-running-requests") + 1] = str(a.max_running_requests)
     else:
         cmd += ["--max-running-requests", str(a.max_running_requests)]
+    for more in a.server_arg:
+        cmd += shlex.split(more)
     if a.wrap:
         cmd = shlex.split(a.wrap) + cmd
     # a model with linear-attention state keeps the plan's requests' worth of state slots, as SGLang counts a
-    # request's (kt-mamba-requests.py), not the share of the budget SGLang gives them otherwise (GLM-5.3: 44 slots,
+    # request's, not the share of the budget SGLang gives them otherwise (GLM-5.3: 44 slots,
     # 3 GB a card)
     if ("--max-mamba-cache-size" not in cmd and "KT_MAMBA_REQUESTS" not in env
             and (plan.get("terms") or {}).get("linear_states", 0) > 0):
@@ -560,6 +607,7 @@ def main():
 
     run = os.path.join(a.log_dir, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(run, exist_ok=True)
+    env["YUZURI_RUN_DIR"] = run  # each worker writes hooks-<pid>.json there: what every hook became
     manifest = {"profile": prof["name"], "command": cmd, "features": feat_on,
                 "env": {k: v for k, v in env.items() if k.startswith(("KT_", "SGLANG_", "CUDA_", "OMP_", "NCCL_", "TORCH"))},
                 "plan": plan, "host": {k: host[k] for k in ("hostname", "kernel", "driver", "cuda_toolkit")}, "packages": {}}

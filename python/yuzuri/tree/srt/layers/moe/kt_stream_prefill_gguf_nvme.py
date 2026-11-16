@@ -360,7 +360,7 @@ class KTStreamPrefillGGUFBank(_SglDequant, P.KTStreamPrefillGGUF):
 
     def __init__(self, method, layer):
         super().__init__(method, layer)
-        # the experts this rank streams, the NVMe edition's groups (kt-gguf-bank-ep.py)
+        # the experts this rank streams, the NVMe edition's groups
         g = self._groups(method)
         self._bank_range = (g[0][0], g[-1][0] + g[-1][1]) if g else (0, 0)
 
@@ -734,7 +734,7 @@ class KTStreamPrefillGGUFNVMe(_MmqGroup, _SglDequant, P.KTStreamPrefillGGUF):
         return acc
 
 
-# the bank edition streams the same share of the experts as the NVMe edition (kt-gguf-bank-ep.py)
+# the bank edition streams the same share of the experts as the NVMe edition
 KTStreamPrefillGGUFBank._groups = KTStreamPrefillGGUFNVMe._groups
 EDITION = os.environ.get("KT_GGUF_STREAM_SOURCE", "nvme")
 _CLASS = KTStreamPrefillGGUFBank if EDITION == "bank" else KTStreamPrefillGGUFNVMe

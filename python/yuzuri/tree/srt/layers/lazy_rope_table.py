@@ -26,12 +26,12 @@ INITIAL_ROWS = int(os.environ.get("SGLANG_DSV4_ROPE_LAZY_INITIAL", "65536"))
 _TABLES = []
 
 
-_LEAD = [0]  # kt-generic-offloads.py: largest position minus sequence length seen in a prefill (M-RoPE)
+_LEAD = [0]  # largest position minus sequence length seen in a prefill (M-RoPE)
 
 
 def enabled() -> bool:
     return (os.environ.get("SGLANG_DSV4_ROPE_LAZY", "0") == "1"
-            or os.environ.get("SGLANG_ROPE_LAZY", "0") == "1")  # kt-generic-offloads.py
+            or os.environ.get("SGLANG_ROPE_LAZY", "0") == "1")
 
 
 def _map(ent, rows: int) -> None:
@@ -48,7 +48,7 @@ def _map(ent, rows: int) -> None:
             f"RoPE table: mapping rows {have}..{rows} on {dev.device}"
         )
     dev[have:rows].copy_(ent["host"][have:rows])
-    # kt-generic-offloads.py: the activation-dtype copies grow with their table
+    # the activation-dtype copies grow with their table
     for d in ent.get("derived", {}).values():
         drb = d["row_bytes"]
         if kt_kv_vmm.restore(d["dev"], have * drb, (rows - have) * drb) < 0:
@@ -75,7 +75,7 @@ def make_lazy(table: torch.Tensor) -> torch.Tensor:
 
 
 def _derived(ent, dtype):
-    """kt-generic-offloads.py: a lazily mapped copy of ent's table in dtype, mapped as far as the table."""
+    """a lazily mapped copy of ent's table in dtype, mapped as far as the table."""
     from sglang.srt.layers.moe import kt_kv_vmm
 
     ds = ent.setdefault("derived", {})
@@ -93,7 +93,7 @@ def _derived(ent, dtype):
 
 
 def _lazy_cast(mod, ent) -> None:
-    """kt-generic-offloads.py: mod.cos_sin_cache_as(dtype) answers with the lazy copy while its cache is the lazy
+    """mod.cos_sin_cache_as(dtype) answers with the lazy copy while its cache is the lazy
     table; a module that rebuilds its cache gets the stock behaviour back."""
     import types
 
@@ -122,7 +122,7 @@ def ensure(forward_batch) -> None:
         if lens is None or not lens.numel():
             return
         need = int(lens.max().item())
-    # kt-generic-offloads.py: M-RoPE positions can run ahead of the sequence length (a prefill shows by how much)
+    # M-RoPE positions can run ahead of the sequence length (a prefill shows by how much)
     mp = getattr(forward_batch, "mrope_positions", None)
     fm = getattr(forward_batch, "forward_mode", None)
     if mp is not None and fm is not None and fm.is_extend() and mp.numel():
@@ -147,13 +147,13 @@ def install(model) -> int:
     if not enabled() or not torch.cuda.is_available():
         return 0
     found = {}
-    lazy = {ent["dev"].data_ptr() for ent in _TABLES}  # kt-generic-offloads.py: not twice
+    lazy = {ent["dev"].data_ptr() for ent in _TABLES}  # not twice
     owners = {}
     for mod in model.modules():
         for name, buf in list(mod._buffers.items()):
             if name == "freqs_cis" and torch.is_tensor(buf) and buf.is_cuda and buf.data_ptr() not in lazy:
                 found.setdefault(buf.data_ptr(), buf)
-            # kt-generic-offloads.py: SGLang's RoPE cache, when it is worth a range of its own
+            # SGLang's RoPE cache, when it is worth a range of its own
             if (name == "cos_sin_cache" and torch.is_tensor(buf) and buf.is_cuda and buf.dim() == 2
                     and buf.shape[0] >= 2 * INITIAL_ROWS and buf.data_ptr() not in lazy):
                 found.setdefault(buf.data_ptr(), buf)
@@ -174,7 +174,7 @@ def install(model) -> int:
             if torch.is_tensor(v) and v.is_cuda and v.data_ptr() in new and v.shape == new[v.data_ptr()].shape:
                 setattr(mod, k, new[v.data_ptr()])
     freed = sum(t.numel() * t.element_size() for t in found.values())
-    # kt-generic-offloads.py: cos_sin_cache_as hands out the lazy copy in the asked dtype, made at install for the
+    # cos_sin_cache_as hands out the lazy copy in the asked dtype, made at install for the
     # activation dtypes so that no range is made during a graph capture
     ents = {ent["dev"].data_ptr(): ent for ent in _TABLES}
     for ptr, mods in owners.items():

@@ -1,6 +1,6 @@
 """KT_LAUNCH_TIMING=1: a per-step timeline of the weight load (launch-time
 instrument, no behaviour change). Installed from ModelRunner.load_model
-(patches/sglang-kt-launch-timing.py); wraps the load's functions in place and
+(hooks/model_runner_seams.py); wraps the load's functions in place and
 prints, per rank process:
 
   [kt-launch HH:MM:SS.mmm r<rank>] <step> <seconds> s | disk <GB> (<GB/s>) | <extra>

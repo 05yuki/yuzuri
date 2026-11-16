@@ -1,6 +1,6 @@
 {
  "name": "flash-next-nvfp4",
- "description": "Qwen3.8-Flash-Next ModelOpt NVFP4 (our abliterated export): NVFP4 CPU experts in kt-kernel, ModelOpt FP4 GPU experts, the NVFP4 streamed prefill, the hot lend with dynamic slots, the token embedding on host; captured 2026-11-05 from tools/start-flashnext-nvfp4-pin.sh on the recipe's tree (58484246 + Yuzuri)",
+ "description": "Qwen3.8-Flash-Next ModelOpt NVFP4 (an NVFP4 export): NVFP4 CPU experts in kt-kernel, ModelOpt FP4 GPU experts, the NVFP4 streamed prefill, the hot lend with dynamic slots, the token embedding on host; captured 2026-11-05 from a measured launch (SGLang 58484246)",
  "weights": {
   "gguf": false,
   "experts_from": false,
@@ -31,7 +31,7 @@
   "--dtype",
   "bfloat16",
   "--host",
-  "0.0.0.0",
+  "{host}",
   "--port",
   "{port}",
   "--tp",

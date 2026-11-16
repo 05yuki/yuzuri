@@ -1,7 +1,7 @@
 """Fast pinned host memory for launch-time buffers (KT_FAST_PINNED=1).
 
 torch.empty(..., pin_memory=True) goes through cudaHostAlloc, which pins 4K
-pages at ~1.3 GB/s on this host (tools/bench_pinned_alloc.py, 10-11: 8.6 GB in
+pages at ~1.3 GB/s on the development host (8.6 GB in
 6.6 s). An anonymous mapping advised for transparent huge pages, touched by
 a few threads and then cudaHostRegister'ed is pinned at ~17 GB/s (8.6 GB:
 touch 0.16 s, register 0.33 s), with the same H2D rate (27.9 GB/s). The PLE

@@ -4,7 +4,7 @@ Every tensor made inside region() is one virtual range backed by physical
 chunks that can be unmapped (release) and mapped again, zeroed (restore),
 while the range, the tensors on it and the CUDA graphs that read it stay put.
 sglang makes the KV pool inside memory_saver_adapter.region("kv_cache")
-(sglang-kt-kv-vmm.py routes that region here), so the free pages of the pool
+(hooks/kv_vmm_region.py routes that region here), so the free pages of the pool
 can lend their physical memory to a streamed prefill and take it back before
 decode (kt_lend's prefill window, M2).
 
@@ -16,6 +16,18 @@ import ctypes
 import os
 
 import torch
+
+_SAID = set()
+
+
+def _say_once(where, exc):
+    """One line the first time a guarded step fails for a reason other than its module being off, so an SGLang that
+    changed under it shows in the log."""
+    if isinstance(exc, ImportError) or where in _SAID:
+        return
+    _SAID.add(where)
+    print(f"[yuzuri] {where}: {type(exc).__name__}: {exc} (said once)", flush=True)
+
 
 def _torch_ok() -> bool:
     """torch 2.13 runs the KV pool on this allocator through a MemPool; torch 2.9.1
@@ -125,7 +137,7 @@ def _lazy_tensor(shape, dtype, index: int, lead: int) -> torch.Tensor:
     with torch.cuda.device(index):
         t = torch.as_tensor(_Block(max(1, size_b), index, lazy=True), device=f"cuda:{index}")
     c = int(_lib.kv_vmm_chunk_at(ctypes.c_void_p(t.data_ptr())))
-    # kt-swa-lend-fused-kv.py: a lead is the first bytes, or (offset, bytes) spans (a fused K/V buffer's two halves)
+    # a lead is the first bytes, or (offset, bytes) spans (a fused K/V buffer's two halves)
     ok = True
     for off, n in ([(0, lead)] if isinstance(lead, int) else lead):
         n = min(size_b - off, -(-max(0, n) // c) * c)
@@ -142,7 +154,7 @@ def _lazy_tensor(shape, dtype, index: int, lead: int) -> torch.Tensor:
     return t
 
 
-# Host KV for any pool (kt-host-kv-generic.py). HOST: the pool's row counts (tokens, pages) set by the pool
+# Host KV for any pool. HOST: the pool's row counts (tokens, pages) set by the pool
 # configurator when the pool covers more than the card holds; a tensor made in region() whose leading dimension
 # is one of them is made in host memory and listed in HOST_MADE, and host_place() moves the first rows of each
 # to the card once the server is up.
@@ -167,7 +179,7 @@ def _host_tensor(shape, dtype, index: int) -> torch.Tensor:
 
 
 def host_place(device: int, free_bytes: int) -> dict:
-    """kt-host-kv-generic.py: place in tokens. Move the first rows of the host-made pool tensors to the card,
+    """place in tokens. Move the first rows of the host-made pool tensors to the card,
     within free_bytes. Tensors grouped by bytes a token (a row is one token or one page of the pool), fewest
     first: a group that fits goes whole; the first that does not, and every later one, share one token count.
     Returns {"rows": the shared token count or None, "whole": bytes placed whole, "split": bytes placed}."""
@@ -265,7 +277,7 @@ def keep_lowest_first(allocator) -> int:
 
 
 def _pool_allocator():
-    """kt-host-kv-generic.py: rows in use v3. The allocator the KV lend works on (the pool's full tokens), else
+    """rows in use v3. The allocator the KV lend works on (the pool's full tokens), else
     the largest-sized one reachable from the pool's allocator."""
     try:
         from sglang.srt.layers.moe import kt_kv_prefill_lend
@@ -289,7 +301,7 @@ def _pool_allocator():
 
 
 def _rows_in_use(t) -> int:
-    """kt-host-kv-generic.py: rows in use v2. How many leading rows of a host-made pool tensor some request may
+    """rows in use v2. How many leading rows of a host-made pool tensor some request may
     hold: above the highest page that is not free in the pool's allocator (the tensor's rows count tokens or
     pages)."""
     a = _pool_allocator()
@@ -307,16 +319,16 @@ def _rows_in_use(t) -> int:
         lent = kt_kv_prefill_lend.STATE.get("lent")
         if kt_kv_prefill_lend.STATE.get("alloc") is a and lent is not None and len(lent):
             free = torch.cat((free, lent.to(free.dtype).to(free.device)))
-    except Exception:
-        pass
-    used = torch.ones(pages + 1, dtype=torch.bool, device=free.device)  # kt-host-kv-generic.py: rows range
+    except Exception as e:
+        _say_once("kv-vmm: the lent pages were not counted as free rows", e)
+    used = torch.ones(pages + 1, dtype=torch.bool, device=free.device)  # rows range
     free = free.long()
     used[free[free <= pages]] = False
     used[0] = False
     idx = used.nonzero()
     top = int(idx.max()) + 1 if len(idx) else 1
     by_tokens = t.shape[0] > pages + 1
-    if os.environ.get("KT_HOST_KV_DEBUG") == "1":  # kt-host-kv-generic.py: rows debug
+    if os.environ.get("KT_HOST_KV_DEBUG") == "1":  # rows debug
         print(f"[kt-host-kv] rows in use: {type(a).__name__} size {int(a.size)} page {p}, {len(a.free_pages)} free, "
               f"{0 if rel is None else len(rel)} released, {int(free.numel())} counted free, {int(used.sum())} used, "
               f"top {top}, rows {t.shape[0]} by {'tokens' if by_tokens else 'pages'}", flush=True)
@@ -331,7 +343,7 @@ def host_place_now(device, allocator=None) -> None:
         if HOST is not None:
             HOST["allocator"] = allocator
     if os.environ.get("KT_HOST_KV_PLACE", "after-extend") != "start" and HOST is not None and not HOST.get("go"):
-        # kt-host-kv-generic.py: placement waits for the first decode step after an extend (maybe_place)
+        # placement waits for the first decode step after an extend (maybe_place)
         HOST["pending"] = device
         print("[kt-host-kv] the pool's rows stay in host memory until the first decode step after an extend",
               flush=True)
@@ -342,8 +354,8 @@ def host_place_now(device, allocator=None) -> None:
         return
     torch.cuda.synchronize(index)
     torch.cuda.empty_cache()
-    # kt-host-kv-generic.py: logits headroom (margin, inside host_fill's room)
-    # kt-host-kv-swa-reserve.py: the SWA pages a prefill window maps back stay free
+    # logits headroom (margin, inside host_fill's room)
+    # the SWA pages a prefill window maps back stay free
     from sglang.srt.layers.moe import kt_kv_prefill_lend
 
     swa = kt_kv_prefill_lend.swa_window_bytes()
@@ -351,7 +363,7 @@ def host_place_now(device, allocator=None) -> None:
         print(f"[kt-host-kv] cuda:{index}: {swa / (1 << 30):.2f} GiB kept free for the SWA pages of a prefill window",
               flush=True)
     total = sum(t.nbytes for t in HOST_MADE if t.device.index == index)
-    # kt-host-kv-in-flight.py: every row the room holds (a later prompt's prefill reads them); the rows in flight
+    # every row the room holds (a later prompt's prefill reads them); the rows in flight
     # come first at later decodes (host_in_flight)
     moved = host_fill(index)
     got = {"rows": _card_tokens(index), "whole": 0, "split": moved}
@@ -542,7 +554,7 @@ def extend_room(device, rows=None, logprobs: bool = True, forward_batch=None) ->
 
 def maybe_place(forward_batch) -> None:
     """kt_lend.before_forward, every forward: notes an extend, and at the first decode step after one moves the
-    pool's rows to the card (host_place_now, what is free then). kt-host-kv-in-flight.py: at every later first
+    pool's rows to the card (host_place_now, what is free then). At every later first
     decode after an extend, the rows in flight (host_in_flight)."""
     if HOST is None or (HOST.get("pending") is None and not HOST.get("go")):
         return
@@ -617,9 +629,9 @@ def _direct(orig, zero: bool):
         size_b = n * dtype.itemsize
         if (HOST is not None and shape and _token_dim(shape) is not None and size_b >= HOST.get("min_bytes", 1 << 20)
                 and not kw.get("requires_grad")):
-            return _host_tensor(shape, dtype, index)  # kt-host-kv-generic.py: zeroed, in host memory
+            return _host_tensor(shape, dtype, index)  # zeroed, in host memory
         if HOST is not None and os.environ.get("KT_HOST_KV_DEBUG") == "1" and size_b >= (64 << 20):
-            # kt-host-kv-generic.py: region debug
+            # region debug
             print(f"[kt-host-kv] on the card: {shape} {dtype} {size_b / (1 << 20):.0f} MiB", flush=True)
         lead = LAZY(shape, size_b) if LAZY is not None and not kw.get("requires_grad") else None
         if lead is not None:
@@ -689,7 +701,7 @@ def split_tensor(shape, dtype, device: int, device_bytes: int, numa: int) -> tor
 def _place_sig():
     lib = _load()
     if not hasattr(lib, "kv_vmm_place"):
-        raise RuntimeError(f"{_LIB_PATH} has no kv_vmm_place: rebuild it from kv_vmm.c (kt-host-kv-generic.py)")
+        raise RuntimeError(f"{_LIB_PATH} has no kv_vmm_place: rebuild it from kv_vmm.c")
     lib.kv_vmm_place.restype = ctypes.c_longlong
     lib.kv_vmm_place.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
@@ -728,7 +740,7 @@ def restore(t: torch.Tensor, off: int, length: int) -> int:
     return int(_load().kv_vmm_restore(ctypes.c_void_p(t.data_ptr()), off, length))
 
 
-# kt-host-kv-generic.py: token dim. A pool tensor's token rows are the first dimension of the pool's row count with
+# token dim. A pool tensor's token rows are the first dimension of the pool's row count with
 # at most a few blocks before it (K and V stacked: (2, tokens + page, ...)); each block's first rows go to the card,
 # through kv_vmm_place_range. These definitions replace the prefix-only ones above.
 HOST_INFO = {}
@@ -957,7 +969,7 @@ def host_place(device: int, free_bytes: int) -> dict:
     left, whole, tokens = free_bytes, 0, None
     order = sorted(groups)
 
-    def edge(tensors):  # kt-kv-vmm-place-touched.py: a block's rows ending mid-chunk bring that whole chunk along
+    def edge(tensors):  # a block's rows ending mid-chunk bring that whole chunk along
         return sum(2 * chunk_of(t) * _info(t)["outer"] for t in tensors)
 
     for k, bt in enumerate(order):
@@ -1000,8 +1012,8 @@ def _rows_in_use(t) -> int:
         lent = kt_kv_prefill_lend.STATE.get("lent")
         if kt_kv_prefill_lend.STATE.get("alloc") is a and lent is not None and len(lent):
             free = torch.cat((free, lent.to(free.dtype).to(free.device)))
-    except Exception:
-        pass
+    except Exception as e:
+        _say_once("kv-vmm: the lent pages were not counted as free rows (map)", e)
     used = torch.ones(pages + 1, dtype=torch.bool, device=free.device)
     free = free.long()
     used[free[free <= pages]] = False
@@ -1108,7 +1120,7 @@ def host_yield(device: int, need: int, why: str = "the weights", held_too: bool 
     return got
 
 
-# kt-host-kv-in-flight.py: the ledger's order for the pool's card rows: those the requests in flight read come
+# the ledger's order for the pool's card rows: those the requests in flight read come
 # before the hot slots (level 2), the others after them (level 5); level 1 stays free at the next window's start
 HEADROOM = int(os.environ.get("KT_HOST_KV_HEADROOM_TOKENS", "8192"))
 
@@ -1216,8 +1228,8 @@ def _reach(t, tokens: int) -> int:
                 lent = lent[lent <= pages]
                 if len(lent):
                     page = max(page, int(torch.kthvalue(lent, min(k - len(free), len(lent))).values))
-        except Exception:
-            pass
+        except Exception as e:
+            _say_once("kv-vmm: the lent pages were left out of the highest row a prefill writes", e)
     if not page:
         return 0
     return min(i["rows"], (page + 1) * p if i["rows"] > pages + 1 else page + 1)
@@ -1513,7 +1525,7 @@ def host_fill(index: int, floor: int = 0) -> int:
         i = _info(t)
         return min(i["rows"], max(i["dev"], tokens // _tokens_a_row(t)))
 
-    # kt-kv-vmm-place-touched.py: whole chunks move, a block's rows ending mid-chunk bring that chunk along. Counted
+    # whole chunks move, a block's rows ending mid-chunk bring that chunk along. Counted
     # chunk by chunk: those from the one holding the block's first new row (already on the card unless the tensor
     # has no card rows yet, when its earlier rows brought it) to the one holding its last. Rows alone fell short
     # and the fill ran the card out (a 1M pool, 11-08: 5.62 GiB placed, 0.01 GiB left); two chunks a block

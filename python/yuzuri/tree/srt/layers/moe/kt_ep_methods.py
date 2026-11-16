@@ -34,7 +34,7 @@ _DROPPED_ONCE = []  # the layers that called _drop_checkpoint_cache
 def _drop_checkpoint_cache(layer_idx: int, num_layers: int = 0) -> None:
     """KT_GPU_STREAM_DROP_CACHE=<dir>: posix_fadvise(DONTNEED) every file
     under it, so the arenas kt-kernel is about to create find free 2 MB
-    blocks (patches/sglang-kt-drop-cache-per-layer.py)."""
+    blocks."""
     import os
     import time
 
@@ -72,7 +72,7 @@ def _drop_checkpoint_cache(layer_idx: int, num_layers: int = 0) -> None:
 
 
 class _gpu_local_experts:
-    """patches/sglang-kt-nvfp4-local-experts.py: around the GPU method's weight steps, the
+    """around the GPU method's weight steps, the
     layer's num_local_experts is the GPU experts' count for methods that size by it."""
 
     _SIZED_BY_LAYER = ("ModelOptNvFp4FusedMoEMethod",)
@@ -151,7 +151,7 @@ def _routing_count(device, layer_idx, topk_ids, rank):
 
 
 def _kt_activation(layer: torch.nn.Module) -> dict:
-    """The routed experts' activation for kt-kernel (kt-activation-generic.py): {} for SiLU (any kt-kernel build),
+    """The routed experts' activation for kt-kernel: {} for SiLU (any kt-kernel build),
     gelu_pytorch_tanh for SGLang's gelu (Gemma 4); an activation kt-kernel does not compute stops the launch."""
     act = str(getattr(getattr(layer, "moe_runner_config", None), "activation", None) or "silu").lower()
     if act == "silu":
@@ -283,9 +283,9 @@ def create_weights(
             chunked_prefill_size=self.kt_config.chunked_prefill_size,
             method=self.kt_config.method,
             max_deferred_experts_per_token=layer_max_deferred,
-            # patches/sglang-kt-swiglu-clamp.py (KT_SWIGLU_CLAMP)
+            # KT_SWIGLU_CLAMP
             **_kt_swiglu_kwargs(layer),
-            **_kt_activation(layer),  # kt-activation-generic.py
+            **_kt_activation(layer),
             # KT_NUMA_NODES="1" pins a single pool to node 1, the node
             # that does not host the TP0 scheduler, for the prefill-decay
             # isolation; unset keeps kt-kernel's sequential default.
@@ -321,7 +321,7 @@ def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
             get_global_expert_location_metadata,
         )
 
-        # kt-gpu-experts-load.py: without the expert-location metadata the physical order is the logical one
+        # without the expert-location metadata the physical order is the logical one
         _meta = get_global_expert_location_metadata()
         physical_to_logical_map_cpu = (
             _meta.physical_to_logical_map_cpu[self.kt_config.layer_idx].contiguous()
@@ -358,7 +358,7 @@ def submit(
         layer: The MoE layer module
         dispatch_output: Dispatched tokens and routing information
     """
-    # the activation went to kt-kernel when the wrapper was made (kt-activation-generic.py)
+    # the activation went to kt-kernel when the wrapper was made
 
     if self.tp_rank != 0 or self.wrapper is None or _CALIBRATING:
         return
@@ -430,7 +430,7 @@ def apply(
     # KT_ROUTING_DUMP=<prefix>: a [layers, experts] histogram of the routed physical ids
     # (a captured index_add_, so it keeps counting under CUDA graph replay), saved as
     # <prefix>-rank<r>.pt every 30 s. Counted here, before the hot lend and the
-    # streamer split the routes (sglang-kt-routing-count-before-split.py); SGLang's
+    # streamer split the routes; SGLang's
     # expert distribution recorder never sees the V4 router's ids (09-13).
     if _routing_dump_prefix and self.tp_rank == 0:
         _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)

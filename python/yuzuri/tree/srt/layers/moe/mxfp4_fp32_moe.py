@@ -1,6 +1,5 @@
 """MXFP4 MoE on the GPU with one rounding, in the checkpoint's layout
-(SGLANG_MXFP4_MOE_FP32=1, patches/sglang-mxfp4-fp32-moe.py installs this as
-sglang/srt/layers/moe/mxfp4_fp32_moe.py).
+(SGLANG_MXFP4_MOE_FP32=1; hooks/mxfp4_fp32.py puts it in the forward).
 
 Weights stay as loaded: w13 [E, 2I, H/2] and w2 [E, H, I/2] (two E2M1 values a byte, the
 low nibble first along K), scales [E, 2I, H/32] and [E, H, I/32] (E8M0). An E2M1 value

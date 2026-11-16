@@ -21,8 +21,11 @@ None of them is assumed.
 ## What it does
 
 - **Prefill lend.**
-  During a long prompt the GPU-resident weights give their VRAM to the prefill.
+  The dense weights and the prefill's buffers take turns on the card.
+  During a long prompt the decoder layers' dense weights give their VRAM to the prefill.
   They come back layer by layer, at the same addresses.
+  During decode the prefill's buffers give their VRAM back: the streamed experts' slots, their inputs and the kernel workspace.
+  The hot lend fills that memory with experts.
 
 - **KV loan and plan.**
   The KV pool's free pages go to the prefill too.
@@ -53,12 +56,17 @@ Nothing is sized by hand:
 
 - A server already built on KTransformers + SGLang: SGLang with kt-kernel's CPU experts, in one Python venv.
 
+- A checkpoint with MoE experts.
+  - Yuzuri moves experts and KV pages between the CPU and the cards.
+  - A dense model has no experts on the CPU, and the launch stops saying so.
+
 - SGLang as upstream ships it, or with your own patches.
   - Yuzuri replaces no SGLang file. It attaches to the functions its features live in when the server starts.
-  - A function that has moved or changed shape stops the launch and names it.
-  - So does an SGLang that already carries one of Yuzuri's mechanisms.
-  - Checked on commits `58484246d26523eaf1a7f16ab524deee288d2120` and
-    `d193c34ae4b138aae4b8c0479ff395b0138a0156` (702 commits later).
+  - The launch prints one line for every hook: on, the tree's own, off, gone or idle.
+  - An SGLang that already carries one of Yuzuri's mechanisms keeps its own.
+  - A function that has moved or changed shape switches off a hook that only adds speed.
+  - It stops the launch when the output would be wrong without the hook, and names what is gone.
+  - The commits it was run on are under [Checked against](#checked-against).
 
 - Linux and NVIDIA GPUs (CUDA), one or more, of any memory size. AMD GPUs are not supported.
   - What a card cannot hold stays in host memory: experts, and the KV rows past the card.
@@ -108,7 +116,10 @@ To undo it:
 - The `.pth` file does nothing unless the server is started through `tools/serve.py --package`.
 
 - `tools/install-pth.py <venv> --remove` gives the server back.
-  Nothing else of Yuzuri is in the venv.
+  - `yuzuri.pth` is the only file of Yuzuri in the venv.
+  - The `nvidia-cuda-tileiras` package stays; `pip uninstall nvidia-cuda-tileiras` removes it.
+  - The edited copies are under `~/.cache/yuzuri`; delete that directory.
+  - A venv whose Yuzuri checkout was moved or deleted starts as if Yuzuri were not there.
 
 ## Serve
 
@@ -123,13 +134,16 @@ yuzuri/tools/serve.py --package --venv <the server's venv> --config-dir <checkpo
 - The profile is built from the checkpoint.
   - The experts' format comes from the safetensors headers.
   - The model's layers and context come from its config.
-  - No model is listed anywhere.
+  - The launch reads no list of models: an unknown checkpoint is sized the same way.
+  - A GGUF pack's dense weights are the exception: their tensor names follow the converter, and two layouts are known (`kt_gguf_dense_*.py`).
 
 - `--dry-run` prints the arithmetic and stops: weights, KV a token, threads, the resident hot experts.
 
 - `--profile <name>` takes a measured command line from `profiles/` instead.
 
-- The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`.
+- The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, this machine only.
+  - `--host 0.0.0.0` opens it to the network.
+  - SGLang asks for no key unless one is set: `--server-arg="--api-key <key>"`.
 
 - The first launch of an NVFP4 model compiles FlashInfer's cuTile kernels.
 
@@ -191,59 +205,78 @@ TP=1 is one card and the socket next to it.
 - **on** is `serve.py` with its defaults.
   Every pool is the model's context.
 
-- **off** is `serve.py --features none`.
+- **off** is `serve.py --features base`.
   It is the same SGLang, kt-kernel and checkpoint.
-  It has a 4,096-token prefill chunk and SGLang's own share of the card for the pool.
+  Nothing is lent, streamed or moved to host memory; the kernels, the loader and the fixes stay.
+  It has a 4,096-token prefill chunk.
+  The memory settings are the ones a user of SGLang and kt-kernel sets by hand.
+  `--mem-fraction-static` leaves 2.5 GiB of each card free for prefill (`serve.py --free-min-gb 2.5`).
+  The hot experts are a fixed count a layer (`--hot`), the largest that kept the pool at the context and survived the check.
+  Where the weights leave less than the context, the count is 1 and the pool is what fits.
 
-- Decode: Japanese prose, 1,024 tokens, the median of four prompts.
+- Hot slots: on, the experts on the cards, all layers and all cards together, lent from free pool pages, and the count a layer.
+  Two numbers are the count at the first decode and the count after the 131K prompt.
+  Off lends none: it keeps its fixed count a layer.
 
-- 35K prefill: the first 35,000-token prompt after the launch, in tokens a second.
+- Decode: 1,024 tokens after a 384-token prompt, timed from the first token to the last.
+  It is the median of four prompts: two passages of Japanese prose and two of English (`tools/nll-text/`).
+  Sampling is temperature 1.0 and top-p 0.95, and the end-of-sequence token is ignored.
+
+- 35K prefill: the second of two different 35,000-token prompts, in tokens a second.
 
 - 131K prefill: a 131,072-token prompt, in tokens a second.
 
-- Long decode: 256 tokens after the 131K prompt.
+- Long decode: 1,024 greedy tokens after the 131K prompt, in one request, timed from the first token to the last.
+
+- NLL: the mean over 24 public-domain pieces (`tools/nll.py`), in nats a token.
+  On and off differ by the launch-to-launch spread of one configuration.
+  Gemma answers in a chat template, so its number on bare text only compares on with off.
+
+Each row is two launches on 2026-11-16.
+The pool, hot slots, prefill and NLL are `tools/check.py --prompt 35000 --long 131072`.
+The decode and long decode are a second launch, `tools/check.py --prompt 0 --long 131072`.
 
 TP=2:
 
-| model | experts | | pool | decode | 35K prefill | 131K prefill | long decode |
-|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 131.7 tok/s | 7,256 tok/s | 6,633 tok/s | 50.4 tok/s |
-| | | off | 262,144 | 46.6 tok/s | 343 tok/s | 353 tok/s | 42.5 tok/s |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 104.2 tok/s | 4,113 tok/s | 2,387 tok/s | 33.6 tok/s |
-| | | off | 37,474 | 36.4 tok/s | 220 tok/s | does not fit the pool | |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 67.0 tok/s | 4,149 tok/s | 4,201 tok/s (150K) | 47.6 tok/s |
-| | | off | 82,368 | 45.6 tok/s | 270 tok/s | does not fit the pool | |
-| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 67.9 tok/s | 4,024 tok/s | 4,659 tok/s | 61.5 tok/s |
-| | | off | 262,144 | 53.9 tok/s | 419 tok/s | 422 tok/s | 53.2 tok/s |
-| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 44.2 tok/s | 1,675 tok/s | 1,463 tok/s | 33.4 tok/s |
-| | | off | 115,480 | 25.7 tok/s | 94 tok/s | does not fit the pool | |
-| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | 24.6 tok/s | 1,871 tok/s | 2,178 tok/s | 24.7 tok/s |
-| | | off | does not start | | | | |
+| model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 3,445 (86 a layer) | 117.5 tok/s | 8,990 tok/s | 6,481 tok/s | 73.3 tok/s | 1.7751 |
+| | | off | 262,144 | 54 a layer | 54.5 tok/s | 440 tok/s | 435 tok/s | 49.6 tok/s | 1.7766 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 1,433 (47 a layer) | 94.5 tok/s | 5,185 tok/s | 2,375 tok/s | 40.1 tok/s | 10.1739 |
+| | | off | 88,859 | 1 a layer | 36.5 tok/s | 223 tok/s | does not fit the pool | | 10.1520 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 4,550 (94 a layer) | 64.7 tok/s | 4,579 tok/s | 4,234 tok/s | 52.0 tok/s | 1.5909 |
+| | | off | 262,144 | 27 a layer | 46.6 tok/s | 287 tok/s | 283 tok/s | 46.0 tok/s | 1.5882 |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 3,620 → 3,592 (75 a layer) | 67.2 tok/s | 4,734 tok/s | 4,509 tok/s | 58.2 tok/s | 1.5970 |
+| | | off | 262,144 | 28 a layer | 54.3 tok/s | 437 tok/s | 438 tok/s | 53.7 tok/s | 1.5959 |
+| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 1,162 → 1,020 (24 a layer) | 45.8 tok/s | 1,985 tok/s | 1,498 tok/s | 37.0 tok/s | 1.2328 |
+| | | off | 637,143 | 1 a layer | 27.3 tok/s | 95 tok/s | 94 tok/s | 22.0 tok/s | 1.2334 |
+| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | none | 24.4 tok/s | 1,999 tok/s | 2,233 tok/s | 24.2 tok/s | 1.0697 |
+| | | off | 610,560 | none | 24.3 tok/s | 94 tok/s | 94 tok/s | 23.7 tok/s | 1.0751 |
 
 TP=1:
 
-| model | experts | | pool | decode | 35K prefill | 131K prefill | long decode |
-|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 77.8 tok/s | 4,961 tok/s | 3,891 tok/s | 35.5 tok/s |
-| | | off | 87,048 | 36.2 tok/s | 218 tok/s | does not fit the pool | |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 69.0 tok/s | 3,009 tok/s | 1,343 tok/s | 25.9 tok/s |
-| | | off | 6,366 | 28.5 tok/s | does not fit the pool | does not fit the pool | |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 43.2 tok/s | 2,741 tok/s | 1,879 tok/s | 31.5 tok/s |
-| | | off | does not start | | | | |
+| model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 1,305 → 825 (32 a layer) | 58.4 tok/s | 5,549 tok/s | 4,075 tok/s | 40.0 tok/s | 1.7770 |
+| | | off | 262,144 | 3 a layer | 36.1 tok/s | 227 tok/s | 223 tok/s | 32.2 tok/s | 1.7755 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 466 (15 a layer) | 47.3 tok/s | 2,895 tok/s | 1,224 tok/s | 28.5 tok/s | 10.1854 |
+| | | off | 31,762 | 1 a layer | 28.0 tok/s | 132 tok/s (30,762 tokens) | does not fit the pool | | 10.1983 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 598 → 623 (12 a layer) | 38.8 tok/s | 2,999 tok/s | 2,238 tok/s | 33.3 tok/s | 1.5873 |
+| | | off | 18,240 | 1 a layer | 33.3 tok/s | 166 tok/s (17,240 tokens) | does not fit the pool | | 1.5902 |
 
-- "Does not start": the weights leave no room for a pool under SGLang's default share of the card, and the
-  launch stops asking for a larger `--mem-fraction-static`.
+- The long decode is below the decode in every row, on and off.
+  Attention reads 131K tokens of KV at each step.
+  On falls further than off, and the cause is not isolated yet.
+
+- GLM runs without hot slots in both: its profile turns the hot lend off.
 
 - These are one host's numbers.
   On another server, compare the same prompts with and without Yuzuri:
   - `tools/check.py --json after.json` against the server
-  - the same with `serve.py --features none`, for `before.json`
+  - the same with `serve.py --features base`, for `before.json`
   - `tools/check.py --compare before.json after.json`
 
 - The launches measured had an earlier launch's record of the prefill's memory cost (see Limits).
-
-- The Flash-Next TP=1 row is the mean of two launches.
-  Its 131K prefill was 2,054 and 1,703 tok/s in the two.
 
 ## Limits
 
@@ -302,6 +335,51 @@ TP=1:
   They need a kt-kernel build with their weight types' CPU kernels.
   `setup.sh --package` says when it lacks them.
 
+## Checked against
+
+Yuzuri pins no SGLang version.
+
+These are the SGLang commits it has been launched on, on two RTX 5070 Ti (SM120):
+
+| SGLang commit | Tree | Date |
+|---|---|---|
+| `58484246d2` | the DeepSeek-V4.1 recipe's patched tree | 2026-11-04 |
+| `d193c34ae4` | upstream main, no patches | 2026-11-13 |
+| `8c7ec05287` | upstream main with the recipe's tier 0 patches | 2026-11-15 |
+
+On another commit, the startup report says which hooks went in.
+
+`[yuzuri-features]` lines name every hook as on, the tree's own, off, gone or idle.
+
+The same table is written to `hooks-<pid>.json` beside `manifest.json` in the run directory.
+
+A hook that is idle attaches to an SGLang module this model never loaded: it does nothing in that launch.
+
+## Environment variables
+
+- A first run sets none: the launcher sets what a run needs.
+
+- [docs/env.md](docs/env.md) lists every variable the package reads, with its default and the file that reads it.
+  It is generated from the code by `python3 tools/list-env.py`.
+  The tests fail when the list and the code differ.
+
+## Tests
+
+```sh
+python -m unittest discover -s tests
+```
+
+- These run without SGLang and without a GPU.
+  - The hook helper is run against a stand-in module: a matching function, one that gained a parameter, one that
+    lost one, a tree that already carries the change, a line a rewrite looks for that is gone.
+  - The tables are checked against the tree: hooks, features, manifest, profiles, licenses, file names in the text.
+
+- `tests/gpu/test_kv_vmm.py` and `tools/test_gpu_parts.py` need a CUDA card.
+  They check the KV library and Yuzuri's own GPU parts against plain torch.
+
+- `setup.sh` imports the venv's SGLang with every hook on before it changes anything.
+  That is the check against a new SGLang commit.
+
 ## Related work
 
 [Strata](https://github.com/Niko1221/Strata) lends slots of its GPU expert cache to the prompt path, inside its own engine.
@@ -312,5 +390,8 @@ Yuzuri lends the dense weights and the KV pool's pages as well, inside SGLang.
 
 Apache-2.0, like KTransformers and SGLang.
 
-`python/yuzuri/tree/` holds Yuzuri's versions of SGLang modules (see `python/yuzuri/NOTICE`).
+No SGLang file is carried: `python/yuzuri/tree/` holds Yuzuri's own modules (see `python/yuzuri/NOTICE`).
+
+The GGUF matmul kernels under `kt_gguf_moe_mmq/llama_mmq/` are derived from llama.cpp, MIT.
+Its license text is `LICENSES/MIT-llama.cpp.txt`.
 

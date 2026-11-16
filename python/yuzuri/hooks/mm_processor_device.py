@@ -1,5 +1,5 @@
 """SGLANG_MM_PROCESSOR_DEVICE: the device of a multimodal model's fast image processor. serve.py sets cpu: on the GPU
-the tokenizer process holds a CUDA context of its own, outside every budget (kt-mm-processor-device.py)."""
+the tokenizer process holds a CUDA context of its own, outside every budget."""
 import os
 
 from yuzuri._finder import after_import

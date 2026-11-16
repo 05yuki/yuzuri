@@ -1,5 +1,5 @@
 """KT serves the routed experts on the CPU, which holds no fused shared expert: shared experts fusion off whenever
---kt-weight-path is set (kt-shared-experts-unfused.py)."""
+--kt-weight-path is set."""
 from yuzuri._finder import after_import
 from yuzuri.hooks._seam import wrap
 

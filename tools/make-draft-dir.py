@@ -8,7 +8,7 @@ in BF16 / F32 under their checkpoint names, the routed experts in Q2_0
 [512, 2560, 640]). Here the dense tensors go into model.safetensors as they
 are, next to the source checkpoint's configs with the quantization config
 dropped (the draft is built unquantized); the experts stay in the GGUF and are
-read by kt_mtp_gguf.py (KT_MTP_GGUF, set by the launcher from kt_mtp_gguf.json).
+read by the GGUF MTP loader (KT_MTP_GGUF, set by the launcher from kt_mtp_gguf.json).
 
 Usage: python tools/make-draft-dir.py <mtp-q2_0.gguf> <config source dir> <out dir>
 """

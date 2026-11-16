@@ -30,7 +30,7 @@ import time
 import traceback
 
 # KT_STREAM_GRAPH_KEEP: CUDA graphs kept for row counts other than the
-# largest (a prompt's last chunk has its own; sglang-kt-stream-graph-keep.py)
+# largest (a prompt's last chunk has its own)
 GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
 # KT_STREAM_GIN_STEP: under the prefill lend the graphs' shared input and output
 # buffers grow in steps of this many rows (0: sized for the launch chunk at once)
@@ -83,7 +83,7 @@ W16 = os.environ.get("KT_GPU_STREAM_W16", "0") == "1"
 MMQ = os.environ.get("KT_GPU_STREAM_MMQ", "0") == "1"
 MMQ_ROUTES = int(os.environ.get("KT_GPU_STREAM_MMQ_ROUTES", "8192") or 0)
 GGML_TYPE_MXFP4 = 39
-# sglang-kt-stream-row-block-dsv41.py: rows per CUTLASS MoE call (0 = the chunk);
+# rows per CUTLASS MoE call (0 = the chunk);
 # the W16 group body and the resident experts' call during a streamed prefill
 ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
 
@@ -91,7 +91,7 @@ ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
 def _block_rows(T: int) -> int:
     return min(T, ROW_BLOCK) if ROW_BLOCK > 0 else T
 # KT_SWIGLU_CLAMP=0: the streamed experts' clamp lookup and W16 call as they
-# were before 10-12 (patches/sglang-kt-swiglu-clamp.py), for an A/B.
+# were before 10-12, for an A/B.
 SWIGLU_CLAMP = os.environ.get("KT_SWIGLU_CLAMP", "1") != "0"
 # KT_SWIGLU_COUNT=1: count gate/up values beyond the limit per layer (W16).
 SWIGLU_COUNT = os.environ.get("KT_SWIGLU_COUNT", "0") == "1"
@@ -141,14 +141,14 @@ def cpu_groups_for(tokens: int) -> int:
             return k
     return CPU_GROUPS
 # KT_GPU_STREAM_COLLAPSE=1: rank 0 rebuilds every arena on 2 MB pages
-# (MADV_COLLAPSE) before the ranks pin them; patches/sglang-kt-stream-collapse.py.
+# (MADV_COLLAPSE) before the ranks pin them.
 COLLAPSE = os.environ.get("KT_GPU_STREAM_COLLAPSE", "0") == "1"
 # KT_GPU_STREAM_COLLAPSE_THREADS: the MADV_COLLAPSE threads (kt_cpus: this rank's share of the cores when unset)
 # KT_GPU_STREAM_DROP_CACHE=<model dir>: before collapsing, drop the page cache
 # of the checkpoint's files (already copied into the arenas and the GPUs).
 DROP_CACHE = os.environ.get("KT_GPU_STREAM_DROP_CACHE", "")
 # KT_GPU_STREAM_PIN_SERIAL=1: the ranks take turns at cudaHostRegister, one
-# layer at a time (patches/sglang-kt-stream-pin-serial.py for the numbers).
+# layer at a time.
 PIN_SERIAL = os.environ.get("KT_GPU_STREAM_PIN_SERIAL", "0") == "1"
 
 # kt-kernel writer order per expert: [gate; up] rows for w13, both bf16 scales.
@@ -459,7 +459,7 @@ class KTStreamPrefill:
             )
         if self.K % 32 or self.N % 32:
             raise RuntimeError("KT_GPU_STREAM_PREFILL needs N and K multiples of 32")
-        # patches/sglang-dsv41-kt-prefill-lend.py: prefill-only buffers in
+        # prefill-only buffers in
         # the lend scratch (plain allocations when lending is off)
         from sglang.srt.layers.moe import kt_lend
 
@@ -1200,7 +1200,7 @@ class KTStreamPrefill:
         stats["moe_enq"] += t2 - t1
 
     def _cutlass_rows(self, **kw):
-        """sglang-kt-stream-row-block-dsv41.py: the CUTLASS MoE over blocks of
+        """the CUTLASS MoE over blocks of
         KT_GPU_STREAM_ROW_BLOCK rows (input, ids, weights and output cut alike)."""
         rows = kw["input"].shape[0]
         step = _block_rows(rows)
@@ -2101,7 +2101,7 @@ def stream_prefill_for(method, layer, num_tokens: int):
     if method.kt_config.method == "LLAMAFILE":
         return _gguf_edition().stream_prefill_for(method, layer, num_tokens)
     if method.kt_config.method == "NVFP4":
-        # ModelOpt NVFP4 experts (kt-stream-formats-generic.py)
+        # ModelOpt NVFP4 experts
         from sglang.srt.layers.moe import kt_stream_prefill_nvfp4
 
         st = kt_stream_prefill_nvfp4.stream_prefill_for(method, layer, num_tokens)
@@ -2109,7 +2109,7 @@ def stream_prefill_for(method, layer, num_tokens: int):
             _instance = st  # where kt_kv_hot_lend looks for the arenas
         return st
     if method.kt_config.method == "BF16":
-        # the bf16 checkpoints' experts (kt-stream-formats-generic.py)
+        # the bf16 checkpoints' experts
         from sglang.srt.layers.moe import kt_stream_prefill_bf16
 
         st = kt_stream_prefill_bf16.stream_prefill_for(method, layer, num_tokens)

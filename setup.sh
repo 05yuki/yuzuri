@@ -53,10 +53,13 @@ for name in sorted(_patched.MODULES):
   lib="$here/python/yuzuri/tree/srt/layers/moe/libkv_vmm.so"
   if [[ ! -f "$lib" || "$src" -nt "$lib" ]]; then
     inc=""
-    for d in "${CUDA_HOME:-/usr/local/cuda}/include" "$site"/nvidia/cu13/include; do
+    # cuda.h: CUDA_HOME, the system toolkit, else the venv's toolkit wheels (nvidia/cu13 for CUDA 13,
+    # nvidia/cuda_runtime for CUDA 12); kv_vmm.c uses the driver API only, so either header serves
+    for d in ${CUDA_HOME:+"$CUDA_HOME/include"} /usr/local/cuda/include "$site"/nvidia/*/include; do
       [[ -f "$d/cuda.h" ]] && { inc="$d"; break; }
     done
-    [[ -n "$inc" ]] || { echo "cuda.h not found (CUDA_HOME, or the venv's nvidia/cu13 wheels)" >&2; exit 2; }
+    [[ -n "$inc" ]] || { echo "cuda.h not found. Looked in: ${CUDA_HOME:+$CUDA_HOME/include, }/usr/local/cuda/include, $site/nvidia/*/include." >&2
+                         echo "Set CUDA_HOME to a CUDA toolkit, or install the toolkit wheel the venv's torch was built for (nvidia-cuda-runtime)." >&2; exit 2; }
     gcc -O2 -Wall -shared -fPIC "$src" -I"$inc" -l:libcuda.so.1 -o "$lib.new"
     mv "$lib.new" "$lib"
     echo "built $lib"

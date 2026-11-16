@@ -49,7 +49,7 @@ ENABLED = os.environ.get("KT_PREFILL_KV_LEND", "0") == "1" and kt_kv_vmm.ENABLED
 HOT = os.environ.get("KT_KV_HOT_LEND", "0") == "1" and kt_kv_vmm.ENABLED
 PRE_RESTORE = []  # fn(why), run before lent pages are mapped back (the hot lend's slots out)
 # fn(why), run when a window opens before the weights are paused (the hot lend's resident
-# rows back to experts 0..N-1: kv-hot-lend-rows-home.py)
+# rows back to experts 0..N-1)
 WINDOW_START = []
 RESERVE = int(os.environ.get("KT_PREFILL_KV_LEND_RESERVE", "4096"))  # tokens kept free beyond the prompt
 CHECK = os.environ.get("KT_PREFILL_KV_LEND_CHECK", "0") == "1"
@@ -114,7 +114,7 @@ def _pool_tensors(kvp) -> list:
 
 
 def _in_pages(t, n: int, ps: int):
-    """kt-kv-lend-reserve-rows.py: (rows a page) when the buffer is laid out by the allocator's pages, else 0:
+    """(rows a page) when the buffer is laid out by the allocator's pages, else 0:
     k rows a page for the n + 1 pages and up to k + 1 rows of padding, or k rows a page for the n pages and a
     reserve page counted in the buffer's own smaller pages (a power of two of rows up to the page size, k rows a
     page: DeepSeek V4's c4 holds n + 4, its c128 n + 128)."""
@@ -144,17 +144,17 @@ def _kv_tensors(kvp, n: int, ps: int = 1, what: str = "K/V", extra=()):
     tensors, other = [(t.view(-1).view(torch.uint8), pb) for t, pb in extra], 0
     for t in _pool_tensors(kvp):
         rows = t.shape[0] if t.dim() >= 1 else 0
-        k = _in_pages(t, n, ps)  # kt-kv-lend-reserve-rows.py
+        k = _in_pages(t, n, ps)
         if k:
             tensors.append((t.view(-1).view(torch.uint8), t.nbytes // rows * k))
         else:
             other += 1
     if other:
         _log(f"{other} buffers of {kvp.__class__.__name__} not in the allocator's pages: left out")
-        # kt-kv-lend-debug.py: what they look like
+        # what they look like
         shapes = {}
         for t in _pool_tensors(kvp):
-            if not _in_pages(t, n, ps):  # kt-kv-lend-reserve-rows.py
+            if not _in_pages(t, n, ps):
                 key = (tuple(t.shape), str(t.dtype), t.is_cuda, t.is_contiguous())
                 shapes[key] = shapes.get(key, 0) + 1
         _log(f"  pages n + 1 = {n + 1}, page size {ps}; left out: "
@@ -524,13 +524,13 @@ def _decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
             free = min(free, dp)  # only device pages lend
     est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
     if est < min_bytes and not (split and min_bytes <= 1):
-        return 0
+        # the pages past the reserve make no whole chunk (kept prefixes hold the rest): the driver's spare alone
+        # when it covers the floor
+        return _spare_only() if min_bytes <= 1 else 0
     got = _release_free(keep)
     if got is None:
-        if split and min_bytes <= 1:
-            # a split pool with no free device page to lend: the driver's spare alone
-            return _spare_only()
-        return 0
+        # no free page to lend (a split pool with no free device page among them): the driver's spare alone
+        return _spare_only() if min_bytes <= 1 else 0
     cand, _, ranges, total = got
     if not ranges:
         # free pages with no whole chunk among them (a long prompt holds the rest): they stay in the free list and
@@ -901,7 +901,9 @@ def _wrap_allocator(a) -> None:
             _settle_held(why=f"{why} reached them ({pages} pages needed)")
         # the allocator merges what it freed when its free list runs short: those
         # pages count (the paged allocator stages every freed page until then)
-        if STATE["lent"] is not None and pages > _free_count(a):
+        # a lend of the driver's spare alone has no page to give: taking it back for an allocation would hand the
+        # slots back and load them again for nothing (a window or a pool clear still releases them)
+        if _lent() > 0 and pages > _free_count(a):
             STATE["take_backs"] += 1
             if not _take_back(pages - _free_count(a), why) or pages > _free_count(a):
                 restore(f"take back for {why} ({pages} pages needed, {_free_count(a)} kept)")
@@ -939,7 +941,7 @@ SWA_ENABLED = os.environ.get("KT_PREFILL_SWA_LEND", "0") == "1" and kt_kv_vmm.EN
 
 
 def swa_auto(is_hybrid_swa: bool) -> None:
-    """kt-swa-lend-auto.py: KT_PREFILL_SWA_LEND=auto, decided by the KV cache configurator (its is_hybrid_swa)
+    """KT_PREFILL_SWA_LEND=auto, decided by the KV cache configurator (its is_hybrid_swa)
     before the pools are budgeted; the pool holds the plan's cap (KT_PREFILL_LEND_MAX_CHUNK) unless
     KT_PREFILL_SWA_TOKENS says otherwise."""
     global SWA_ENABLED, SWA_TOKENS
@@ -955,7 +957,7 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
 SWA_KEEP = int(os.environ.get("KT_PREFILL_SWA_LEND_KEEP", "4096"))  # tokens kept mapped outside prefill
 SWA_MIN = int(os.environ.get("KT_PREFILL_SWA_LEND_MIN_MB", "64")) << 20  # smallest lend worth a sync
 SWA_SLACK = 1024  # tokens mapped beyond an allocation's shortfall
-# with HiCache, the trim keeps SWA_KEEP tokens outside prefill (kv-lend-hicache-swa-trim.py)
+# with HiCache, the trim keeps SWA_KEEP tokens outside prefill
 SWA_HOST_TRIM = os.environ.get("KT_PREFILL_SWA_HOST_TRIM", "1") == "1"
 SWA = {"alloc": None, "tensors": None, "lent": None, "bytes": 0, "lends": 0, "maps": 0, "ticks": 0}
 
@@ -1025,7 +1027,7 @@ def swa_size(size: int, page: int, follow):
     page = max(1, int(page))
     want = -(-want // page) * page
     if want <= size:
-        # kt-swa-lend-auto.py: budget-sized: its buffers made with only the kept pages mapped all the same
+        # budget-sized: its buffers made with only the kept pages mapped all the same
         _log(f"SWA pool {size} tokens (the budget's, at least the {want} the lend needs): made with its kept pages "
              "mapped, its free pages lent outside prefill")
         _lazy_claim(size, page, follow)
@@ -1060,7 +1062,7 @@ def _lazy_claim(tokens: int, page: int, follow):
         d = int(shape[0])
         if d in dims or lo <= d <= hi:
             return int(nbytes * keep) + 1
-        # kt-swa-lend-fused-kv.py: K and V as the two halves of one allocation; each half keeps its lead
+        # K and V as the two halves of one allocation; each half keeps its lead
         if d == 2 and len(shape) > 1 and int(shape[1]) in dims:
             half = nbytes // 2
             return [(0, int(half * keep) + 1), (half, int(half * keep) + 1)]
@@ -1153,7 +1155,7 @@ def _swa_init(allocator, pool) -> None:
          f"{SWA['row'] / 1024:.1f} KiB a token, chunks {min(t[2] for t in tensors) >> 10}-"
          f"{max(t[2] for t in tensors) >> 10} KiB, {SWA_KEEP} tokens kept mapped")
     swa_lend("pool setup", force=True)
-    # kt-swa-ledger-room.py: what is unmapped now, the lent pages (a lazily made buffer never mapped them). The
+    # what is unmapped now, the lent pages (a lazily made buffer never mapped them). The
     # device's released count holds every lazily made range: 81 GiB on MiMo against a 6.4 GiB SWA pool
     lent = 0 if SWA["lent"] is None else int(SWA["lent"].numel())
     SWA["bytes"] = int(lent * a.page_size * SWA["row"])
@@ -1243,7 +1245,7 @@ def _swa_in_use(a) -> int:
 
 
 def _swa_evict_for(a, short_pages: int) -> None:
-    """kt-swa-evict-before-map.py: the prefix cache's least recently used SWA tokens, as many as an allocation is
+    """the prefix cache's least recently used SWA tokens, as many as an allocation is
     short of, before lent pages are mapped for it."""
     tree = SWA.get("tree")
     if tree is None or SWA.get("trim_off"):
@@ -1395,7 +1397,7 @@ def swa_restore_all(why: str) -> None:
 
 
 def swa_window_bytes() -> int:
-    """kt-host-kv-swa-reserve.py: what a prefill window at the plan's cap maps back of the lent SWA pages (host KV
+    """what a prefill window at the plan's cap maps back of the lent SWA pages (host KV
     placement keeps it free)."""
     if SWA["alloc"] is None or SWA["lent"] is None or SWA.get("off"):
         return 0
@@ -1446,7 +1448,7 @@ def _wrap_swa(a) -> None:
 
     def ensure(pages: int, why: str) -> None:
         if SWA["lent"] is not None and pages > _swa_free(a):
-            _swa_evict_for(a, pages - _swa_free(a))  # kt-swa-evict-before-map.py
+            _swa_evict_for(a, pages - _swa_free(a))
         if SWA["lent"] is not None and pages > _swa_free(a):
             swa_map(pages - _swa_free(a), why, defer=_defer_ok())
 
@@ -1484,10 +1486,10 @@ def _wrap_swa(a) -> None:
                   ("available_size", available_size), ("clear", clear)):
         if k in orig:
             setattr(a, k, fn)
-    _wrap_budget()  # kt-swa-ledger-room.py
+    _wrap_budget()
 
 
-# kt-swa-ledger-room.py: the lent pages the ledger can map, for the scheduler's SWA budget
+# the lent pages the ledger can map, for the scheduler's SWA budget
 ROOM = {"lent": None, "lent_at": 0, "notes": 0}
 
 

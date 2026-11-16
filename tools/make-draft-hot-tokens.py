@@ -1,4 +1,4 @@
-"""Token list for the MTP draft's reduced head (KT_DRAFT_HOT, patches/kt_draft_hot.py).
+"""Token list for the MTP draft's reduced head (KT_DRAFT_HOT).
 
 Every token that occurs in the training corpus (the Japanese prose the serve
 writes: ~10.6K distinct tokens cover 99.96% of the validation set), every

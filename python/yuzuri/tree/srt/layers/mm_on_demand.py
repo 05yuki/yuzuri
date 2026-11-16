@@ -1,4 +1,4 @@
-"""kt-mm-on-demand.py: the parts of a multimodal model the text path does not reach live in pinned host memory
+"""the parts of a multimodal model the text path does not reach live in pinned host memory
 and come to the card only while the model's encoder runs (tier-1 06 for any model)."""
 import contextlib
 import logging

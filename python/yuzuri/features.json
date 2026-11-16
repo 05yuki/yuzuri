@@ -1,38 +1,280 @@
 {
- "about": "Yuzuri's features, each with the switches serve.py sets to turn it off and the features it needs. serve.py --features / --without pick them; every feature is on by default. Names follow the recipe's tier-1 patches where they are the same feature.",
+ "about": "Yuzuri's features, each with the switches serve.py sets to turn it off (off), the optional hooks it leaves out (hooks_off), the features it needs and the recipe's tier-1 patch it stands for (recipe: a name serve.py also takes). serve.py --features / --without pick them; every feature is on by default. --features base keeps on only the ones marked base: kernels, loading and fixes that lend and move no memory.",
  "features": [
-  {"name": "kv-vmm", "for": "the KV pool on remappable memory, pages mapped as used",
-   "requires": [], "off": {"KT_KV_VMM": "0"}},
-  {"name": "stream-prefill", "for": "a prompt's experts streamed to the GPU from kt-kernel's arenas",
-   "requires": [], "off": {"KT_GPU_STREAM_PREFILL": "0"}},
-  {"name": "prefill-lend", "for": "the GPU-resident weights' VRAM lent to a streamed prefill",
-   "requires": ["stream-prefill"], "off": {"KT_PREFILL_LEND": "0"}},
-  {"name": "kv-lend-plan", "for": "the KV pool's free pages lent to the prefill, each request's chunk planned",
-   "requires": ["kv-vmm", "prefill-lend"], "off": {"KT_PREFILL_KV_LEND": "0", "KT_PREFILL_PLAN": "0"}},
-  {"name": "swa-lend", "for": "a hybrid sliding-window pool sized for the plan and lent outside prefill",
-   "requires": ["kv-lend-plan"], "off": {"KT_PREFILL_SWA_LEND": "0"}},
-  {"name": "hot-lend", "for": "the pool's free pages hold more experts on the GPU, following the routing",
-   "requires": ["kv-vmm", "prefill-lend", "stream-prefill", "kv-lend-plan"], "off": {"KT_KV_HOT_LEND": "0"}},
-  {"name": "host-kv", "for": "the pool at the model's context, the rows past the card in host memory",
-   "requires": ["kv-vmm", "kv-lend-plan"], "off": {"KT_HOST_KV": "0"}},
-  {"name": "cutile-nvfp4", "for": "NVFP4 GPU experts on FlashInfer's cuTile MoE from the checkpoint's bytes",
-   "requires": [], "off": {"KT_CUTILE_NVFP4": "0"}},
-  {"name": "cpu-gpu-overlap", "for": "the CPU hand-off packed by one kernel, the shared expert after the CPU request",
-   "requires": [], "off": {"KT_HANDOFF_PACK": "0", "KT_SHARED_AFTER_SUBMIT": "0"}},
-  {"name": "host-allreduce", "for": "all-reduce through host memory (two cards without peer access)",
-   "requires": [], "off": {"SGLANG_HOST_STAGED_ALLREDUCE": "0", "SGLANG_LL_ALLREDUCE": "0"}},
-  {"name": "live-topk", "for": "the sparse-attention indexer's top-k selected while the scores are made",
-   "requires": [], "off": {"KT_IDX_LIVE_TOPK": "0"}},
-  {"name": "rope-tables", "for": "the RoPE tables mapped as the context grows",
-   "requires": ["kv-vmm"], "off": {"SGLANG_ROPE_LAZY": "0"}},
-  {"name": "embed-on-host", "for": "the token embedding read from pinned host memory",
-   "requires": [], "off": {"SGLANG_EMBED_ON_HOST": "0"}},
-  {"name": "mm-on-demand", "for": "a multimodal model's encoder in host memory, on the card while it runs",
-   "requires": [], "off": {"SGLANG_MM_ON_DEMAND": "0", "SGLANG_MM_PROCESSOR_DEVICE": ""}}
+  {
+   "name": "kv-vmm",
+   "for": "the KV pool on remappable memory, pages mapped as used",
+   "requires": [],
+   "off": {
+    "KT_KV_VMM": "0"
+   },
+   "recipe": "kv-vmm"
+  },
+  {
+   "name": "stream-prefill",
+   "for": "a prompt's experts streamed to the GPU from kt-kernel's arenas",
+   "requires": [],
+   "off": {
+    "KT_GPU_STREAM_PREFILL": "0"
+   },
+   "recipe": "stream-prefill"
+  },
+  {
+   "name": "prefill-lend",
+   "for": "the GPU-resident weights' VRAM lent to a streamed prefill",
+   "requires": [
+    "stream-prefill"
+   ],
+   "off": {
+    "KT_PREFILL_LEND": "0"
+   },
+   "recipe": "prefill-lend"
+  },
+  {
+   "name": "kv-lend-plan",
+   "for": "the KV pool's free pages lent to the prefill, each request's chunk planned",
+   "requires": [
+    "kv-vmm",
+    "prefill-lend"
+   ],
+   "off": {
+    "KT_PREFILL_KV_LEND": "0",
+    "KT_PREFILL_PLAN": "0"
+   },
+   "recipe": "kv-lend-plan"
+  },
+  {
+   "name": "swa-lend",
+   "for": "a hybrid sliding-window pool sized for the plan and lent outside prefill",
+   "requires": [
+    "kv-lend-plan"
+   ],
+   "off": {
+    "KT_PREFILL_SWA_LEND": "0"
+   }
+  },
+  {
+   "name": "hot-lend",
+   "for": "the pool's free pages hold more experts on the GPU, following the routing",
+   "requires": [
+    "kv-vmm",
+    "prefill-lend",
+    "stream-prefill",
+    "kv-lend-plan"
+   ],
+   "off": {
+    "KT_KV_HOT_LEND": "0"
+   },
+   "recipe": "hot-lend"
+  },
+  {
+   "name": "host-kv",
+   "for": "the pool at the model's context, the rows past the card in host memory",
+   "requires": [
+    "kv-vmm",
+    "kv-lend-plan"
+   ],
+   "off": {
+    "KT_HOST_KV": "0"
+   },
+   "recipe": "host-kv"
+  },
+  {
+   "name": "cutile-nvfp4",
+   "for": "NVFP4 GPU experts on FlashInfer's cuTile MoE from the checkpoint's bytes",
+   "requires": [],
+   "off": {
+    "KT_CUTILE_NVFP4": "0"
+   }
+  },
+  {
+   "name": "cpu-gpu-overlap",
+   "for": "the CPU hand-off packed by one kernel, the shared expert after the CPU request",
+   "requires": [],
+   "off": {
+    "KT_HANDOFF_PACK": "0",
+    "KT_SHARED_AFTER_SUBMIT": "0"
+   },
+   "recipe": "cpu-gpu-overlap"
+  },
+  {
+   "name": "host-allreduce",
+   "for": "all-reduce through host memory (two cards without peer access)",
+   "requires": [],
+   "off": {
+    "SGLANG_HOST_STAGED_ALLREDUCE": "0",
+    "SGLANG_LL_ALLREDUCE": "0"
+   }
+  },
+  {
+   "name": "live-topk",
+   "for": "the sparse-attention indexer's top-k selected while the scores are made",
+   "requires": [],
+   "off": {
+    "KT_IDX_LIVE_TOPK": "0"
+   },
+   "recipe": "live-topk"
+  },
+  {
+   "name": "rope-tables",
+   "for": "the RoPE tables mapped as the context grows",
+   "requires": [
+    "kv-vmm"
+   ],
+   "off": {
+    "SGLANG_ROPE_LAZY": "0"
+   },
+   "recipe": "rope-tables"
+  },
+  {
+   "name": "embed-on-host",
+   "for": "the token embedding read from pinned host memory",
+   "requires": [],
+   "off": {
+    "SGLANG_EMBED_ON_HOST": "0"
+   },
+   "recipe": "embed-on-host"
+  },
+  {
+   "name": "mm-on-demand",
+   "for": "a multimodal model's encoder in host memory, on the card while it runs",
+   "requires": [],
+   "off": {
+    "SGLANG_MM_ON_DEMAND": "0",
+    "SGLANG_MM_PROCESSOR_DEVICE": ""
+   },
+   "recipe": "vision-on-demand"
+  },
+  {
+   "name": "fp8-decode",
+   "for": "decode-sized block-FP8 GEMMs on their own kernels",
+   "requires": [],
+   "off": {
+    "SGLANG_FP8_GEMV": "0",
+    "SGLANG_FP8_SKINNY": "0"
+   },
+   "recipe": "fp8-decode",
+   "base": true
+  },
+  {
+   "name": "gpu-moe-fp32",
+   "for": "MXFP4 and Marlin GPU experts in fp32 between the GEMMs",
+   "requires": [],
+   "off": {
+    "SGLANG_MXFP4_MOE_FP32": "0",
+    "SGLANG_MARLIN_MOE_FP32_GLUE": "0"
+   },
+   "recipe": "gpu-moe-fp32",
+   "base": true
+  },
+  {
+   "name": "loading",
+   "for": "the loader skips what the CPU experts hold and reads ahead",
+   "requires": [],
+   "off": {
+    "KT_LOAD_SKIP_CPU_EXPERTS": "0",
+    "KT_LOAD_PREFETCH": "0"
+   },
+   "recipe": "loading",
+   "base": true
+  },
+  {
+   "name": "stream-mmq",
+   "for": "streamed groups through llama.cpp's int8 kernels",
+   "requires": [
+    "stream-prefill"
+   ],
+   "off": {
+    "KT_GPU_STREAM_MMQ": "0",
+    "KT_GGUF_STREAM_MMQ": "0"
+   },
+   "recipe": "stream-mmq"
+  },
+  {
+   "name": "expert-cache",
+   "for": "CPU experts cached in the node's free memory",
+   "requires": [
+    "stream-prefill"
+   ],
+   "off": {
+    "KT_MXFP4_EXPERT_CACHE_GIB": "0"
+   },
+   "recipe": "expert-cache"
+  },
+  {
+   "name": "hicache",
+   "for": "HiCache's write-back staging buffer capped (HiCache itself is --server-arg)",
+   "requires": [],
+   "off": {},
+   "hooks_off": [
+    "hicache_staging_cap"
+   ],
+   "recipe": "hicache",
+   "base": true
+  },
+  {
+   "name": "prefill-warmup",
+   "for": "prefill warmups before the server reports ready",
+   "requires": [],
+   "off": {},
+   "hooks_off": [
+    "warmup_prefill"
+   ],
+   "recipe": "prefill-warmup",
+   "base": true
+  },
+  {
+   "name": "swa-checkpoint-tail",
+   "for": "prefix cache hits past a chunk boundary",
+   "requires": [],
+   "off": {},
+   "hooks_off": [
+    "prefix_cache_replay_window"
+   ],
+   "recipe": "swa-checkpoint-tail",
+   "base": true
+  }
  ],
  "always": [
-  {"name": "thinking-default", "for": "a request without the thinking toggle takes SGLANG_DEFAULT_THINKING"},
-  {"name": "shared-experts-unfused", "for": "no shared expert fused into a routed MoE that KT serves on the CPU"},
-  {"name": "load-timeout", "for": "the barrier after an unbalanced load from SGLANG_UNBALANCED_LOAD_TIMEOUT_S"}
+  {
+   "name": "thinking-default",
+   "for": "a request without the thinking toggle takes SGLANG_DEFAULT_THINKING",
+   "recipe": "thinking-default-parser"
+  },
+  {
+   "name": "shared-experts-unfused",
+   "for": "no shared expert fused into a routed MoE that KT serves on the CPU",
+   "recipe": "-"
+  },
+  {
+   "name": "load-timeout",
+   "for": "the barrier after an unbalanced load from SGLANG_UNBALANCED_LOAD_TIMEOUT_S",
+   "recipe": "tier 0 06 load-timeout"
+  },
+  {
+   "name": "cutlass-kt-expert-count",
+   "for": "the MXFP4 CUTLASS method under kt-kernel",
+   "recipe": "cutlass-kt-expert-count"
+  },
+  {
+   "name": "pool-swa-guard",
+   "for": "a sliding-window pool that seats no request stops the launch",
+   "recipe": "pool-swa-guard"
+  },
+  {
+   "name": "placement",
+   "for": "expert placement from --placement, KT_ROUTING_DUMP records routes",
+   "recipe": "placement"
+  },
+  {
+   "name": "launch-timing",
+   "for": "load timing when KT_LAUNCH_TIMING is set",
+   "recipe": "launch-timing"
+  },
+  {
+   "name": "gguf-lend",
+   "for": "the lends on a GGUF pack, by the checkpoint's format",
+   "recipe": "gguf-lend"
+  }
  ]
 }

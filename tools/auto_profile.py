@@ -7,7 +7,8 @@ from what the checkpoint holds, not from a list of models.
   * the GPU MoE runner for that format (SGLang's own choice for any other);
   * reasoning and tool-call parsers: SGLang's "auto" (from the chat template);
   * linear-attention state slots when the model has linear layers (modelprobe);
-  * the streamed prefill's group: as many experts as make about one packed slot of KT_AUTO_GROUP_MB (400) a rank;
+  * the streamed prefill's group: as many experts as keep about KT_AUTO_GROUP_MB (400) on a rank
+    (the packed slot; with the bf16 streamer, everything a group keeps on the card);
   * the environment every measured profile shares, and the format's own streamer switches.
 
 Usage: auto_profile.py <config dir> [--experts DIR | --gguf DIR] [--tp N] [--recipe DIR]   (prints the profile JSON)
@@ -47,7 +48,11 @@ FORMAT_ENV = {
     # beside the FP32 arena the streamer reads; an extension without the codes reads no such variable
     "MXFP4": {"KT_GPU_STREAM_W16": "1", "KT_GPU_STREAM_ZEROCOPY": "1", "KT_GPU_STREAM_GRAPH": "1",
               "KT_GPU_STREAM_MMQ": "1", "KT_GPU_STREAM_HOST_BUFS": "3", "KT_WRITE_UP_FIRST": "1", "KT_GPU_MASK_ZERO": "1",
-              "KT_MXFP4_SCALE_CODES": "1"},
+              "KT_MXFP4_SCALE_CODES": "1",
+              # kt-kernel's CPU decode: the activation row converted with PSHUFB, the weights prefetched 1 KB ahead
+              # (bit-identical; V4.1 MXFP4 decode 51.7 -> 55.6 tok/s on two EPYC 7452, 11-14). As above: an
+              # extension without them reads no such variable
+              "KT_MXFP4_DEC_VCONV": "1", "KT_MXFP4_DEC_PFS": "1024"},
     "NVFP4": {"KT_GPU_STREAM_EARLY_INIT": "1", "KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1"},
     "BF16": {"KT_GPU_STREAM_EARLY_INIT": "1", "KT_GPU_STREAM_GRAPH": "1"},
     "LLAMAFILE": {"KT_GGUF_NOCOPY": "1", "KT_GGUF_ZEROCOPY": "1", "KT_GGUF_STREAM_MMQ": "1",
@@ -110,7 +115,9 @@ def expert_format(d):
             if m and len(shape) == 3:
                 layers.setdefault(m.group(2), {}).setdefault("weight", dt)
     if not layers:
-        raise SystemExit(f"no experts found under {d}")
+        raise SystemExit(f"no MoE experts under {d}: no tensor named ...layers.<n>...experts... in its safetensors "
+                         f"headers. Yuzuri moves a KTransformers server's experts and KV pages between the CPU and the "
+                         f"cards; a dense model has none on the CPU. Experts kept elsewhere: --experts DIR or --gguf DIR.")
     votes = {}
     for suffix in layers.values():
         f = _format_of(suffix)
@@ -144,12 +151,20 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
     c = p.get("config", {})
     e = (probe(src) if src != config_dir and not gguf else p).get("experts") or {}
     per_rank = (e.get("bytes_per_expert_mean") or 0) / max(1, tp)
+    fmt_env = FORMAT_ENV.get(method, {})
+    if per_rank and fmt_env.get("KT_GPU_STREAM_W16") == "1":
+        # the W16 streamer keeps, for every expert of a group, two packed DMA slots and the bf16 copy the kernel
+        # reads (three matrices of hidden x intermediate), plus the MMQ buffers: count what stays on the card,
+        # not the packed file (V4.1 MXFP4: 8.8 MB packed, 62 MB kept an expert a rank)
+        H, I = c.get("hidden_size") or 0, c.get("moe_intermediate_size") or 0
+        bf16 = (3 * H * I * 2) / max(1, tp) if H and I else 4 * per_rank
+        per_rank = 2 * per_rank + bf16 + (per_rank if fmt_env.get("KT_GPU_STREAM_MMQ") == "1" else 0)
     group = 16
     if per_rank:
         budget = int(os.environ.get("KT_AUTO_GROUP_MB", "400")) << 20
         group = max(4, min(64, 1 << max(0, int(budget // per_rank).bit_length() - 1)))
     cmd = ["-m", "sglang.launch_server", "--model-path", "{config_dir}", "--served-model-name", "{served_model_name}",
-           "--host", "0.0.0.0", "--port", "{port}", "--tp", "{tp}", "--numa-node", "{numa_nodes}",
+           "--host", "{host}", "--port", "{port}", "--tp", "{tp}", "--numa-node", "{numa_nodes}",
            "--disable-custom-all-reduce", "--trust-remote-code", "--kv-cache-dtype", "{kv_cache_dtype}",
            "--context-length", "{context_length}", "--max-total-tokens", "{context}",
            "--mem-fraction-static", "{mem_fraction}", "--max-running-requests", "1",
@@ -174,7 +189,7 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
         "env": env, "env_by_tp": {str(tp): {}},
         "weights": {"gguf": bool(gguf), "experts_from": bool(experts_dir and experts_dir != config_dir) or bool(gguf),
                     "embed_host": 0, "draft": "none"},
-        "defaults": {str(tp): {"kv_dtype": "bf16", "mamba_slots": 8 if linear else 1, "pools": tp, "chunk": None,
+        "defaults": {str(tp): {"kv_dtype": c.get("kv_store") or "bf16", "mamba_slots": 8 if linear else 1, "pools": tp, "chunk": None,
                                "threads": None, "free_min_gb": 1.0}},
         "min_hot": 1,
     }

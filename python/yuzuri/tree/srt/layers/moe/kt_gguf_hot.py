@@ -8,7 +8,7 @@ longer windows (an extend below the streamer threshold) run that kernel's
 per-route build (moe_a8_vec_routes: ggml's IQ3_S vec_dot, which sgl-kernel's
 lacks; KT_GGUF_MOE_ROUTES=0 goes back to ggml_moe_a8_vec and the Q2_0 window loop).
 Prefill above the streamer threshold never gets here.
-With KV-lent hot experts (KT_HOT_KV_LEND=1, kt_hot_kv_lend.py) the layer carries
+With KV-lent hot experts (KT_HOT_KV_LEND=1, kt_kv_hot_lend.py) the layer carries
 per-slot pointer tables (layer.kt_kv_ptr13 / kt_kv_ptr2, slots 0..E_gpu-1 point
 into w13_qweight / w2_qweight, the lent ones into free KV pages) and the window
 kernel and its per-route build read the weights through them; the hot cache

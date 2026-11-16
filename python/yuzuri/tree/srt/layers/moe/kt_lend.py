@@ -3,8 +3,8 @@
 GPU-resident weights hand their physical memory to the prefill and come back,
 at the same addresses, before decode.
 
-Model-agnostic; a tree wires it in at five points (see
-patches/sglang-kt-prefill-lend.py for SGLang):
+Model-agnostic; a tree wires it in at five points (for SGLang, the
+hooks in yuzuri/hooks do):
 
   bind_model(model)        right after the model is built, before any weight
                            loads (model_loader._initialize_model)
@@ -75,6 +75,18 @@ import time
 
 import torch
 
+_SAID = set()
+
+
+def _say_once(where, exc):
+    """One line the first time a guarded step fails for a reason other than its module being off, so an SGLang that
+    changed under it shows in the log."""
+    if isinstance(exc, ImportError) or where in _SAID:
+        return
+    _SAID.add(where)
+    print(f"[yuzuri] {where}: {type(exc).__name__}: {exc} (said once)", flush=True)
+
+
 ENABLED = os.environ.get("KT_PREFILL_LEND", "0") == "1"
 MIN_BYTES = int(os.environ.get("KT_PREFILL_LEND_MIN_BYTES", str(1 << 20)))
 TAG_WEIGHTS = "kt_lend_weights"
@@ -98,7 +110,7 @@ IDLE = [w for w in os.environ.get("KT_PREFILL_LEND_IDLE", "").split(",") if w]
 # KT_PREFILL_LEND_PFONLY: lent weights only the prefill reads (Flash-Next's bf16
 # hyper-connection mix; decode runs int8 copies): in the mirror and the slot
 # copy, laid out at the end of the layer, but not in the decode span; outside a
-# layer's prefill turn they point at an empty tensor (kt-lend-prefill-only.py)
+# layer's prefill turn they point at an empty tensor
 PFONLY = [w for w in os.environ.get("KT_PREFILL_LEND_PFONLY", "").split(",") if w]
 if PFONLY and IDLE:
     raise RuntimeError("KT_PREFILL_LEND_PFONLY and KT_PREFILL_LEND_IDLE do not combine")
@@ -109,15 +121,16 @@ if PFONLY and IDLE:
 # its weights and KV pool back does not have room for (10-06). Not with IDLE:
 # its weights are not brought back for a forward the streamer does not take.
 LONG_SEQ = int(os.environ.get("KT_PREFILL_LEND_LONG_SEQ", "65536"))
-# kt-plan-reserved-per-forward.py: torch's cache handed back before every chunk of a window, so no chunk's cached
+# torch's cache handed back before every chunk of a window, so no chunk's cached
 # blocks split the next one's tensors
 EMPTY_EACH_CHUNK = os.environ.get("KT_PREFILL_LEND_EMPTY_EACH_CHUNK", "1") == "1"
 # KT_PREFILL_LEND_SNAPSHOT=<prefix>: torch's allocation history of the first
 # window of at least KT_PREFILL_LEND_SNAPSHOT_ROWS rows (16384), dumped to
-# <prefix>-<device>.pickle at its end (tools/mem-peak-breakdown.py reads it)
+# <prefix>-<device>.pickle at its end
 SNAPSHOT = os.environ.get("KT_PREFILL_LEND_SNAPSHOT", "")
 SNAPSHOT_ROWS = int(os.environ.get("KT_PREFILL_LEND_SNAPSHOT_ROWS", "16384"))
 
+WINDOW_END = []  # callables run as a prefill window ends, before the allocator's cache is returned
 STATE = {
     "phase": "load",
     "scratch_bytes": 0,
@@ -128,7 +141,7 @@ STATE = {
 _saver = None
 
 
-if os.environ.get("KT_FAULTHANDLER", "0") == "1":  # kt-faulthandler.py: every thread's stack on SIGUSR1
+if os.environ.get("KT_FAULTHANDLER", "0") == "1":  # every thread's stack on SIGUSR1
     import faulthandler as _faulthandler
     import signal as _signal
 
@@ -570,6 +583,7 @@ def bind_model(model) -> None:
     if not ENABLED or "layers" in STATE or STATE["phase"] != "load":
         return
     layers = _decoder_layers(model)
+    _say_named_out(layers)
     _pack_resident(layers)
     entries = []
     for layer in layers:
@@ -636,6 +650,28 @@ def bind_model(model) -> None:
         f"{len(entries)} decoder layers, {sum(STATE['spans']) / 1e9:.3f} GB of weights in per-layer "
         f"spans on {device} (min parameter {MIN_BYTES / 1e6:.1f} MB)"
     )
+
+
+def _say_named_out(layers) -> None:
+    """One line for what the name filters keep out of the lend: a model whose parameter names happen to contain
+    one of the words serves right and lends less, and this is where that shows."""
+    for var, words, why in (
+        ("KT_PREFILL_LEND_SKIP", SKIP, "not lent, left where they are"),
+        ("KT_PREFILL_LEND_RESIDENT", RESIDENT, "not lent, packed into one resident buffer"),
+    ):
+        for w in words:
+            hit = [
+                p
+                for layer in layers
+                for name, p in layer.named_parameters()
+                if w in name and _ready(p) and p.device.type == "cuda"
+            ]
+            if hit:
+                print(
+                    f"[kt-lend] {len(hit)} parameters ({sum(_nbytes(p) for p in hit) / 2**20:.0f} MiB) whose name "
+                    f"contains '{w}' are {why} (the words are {var}={','.join(words)})",
+                    flush=True,
+                )
 
 
 def _pack_resident(layers) -> None:
@@ -1080,7 +1116,7 @@ def _threshold() -> int:
             )
         except ImportError:
             _exl3_t = 0
-        if _exl3_t > 0:  # the EXL3 streamed prefill (kt_exl3_stream_prefill.py)
+        if _exl3_t > 0:  # the EXL3 streamed prefill
             STATE["threshold"] = _exl3_t
             return _exl3_t
         try:
@@ -1139,7 +1175,7 @@ def _seq_len(forward_batch) -> int:
 # Every forward of a prefill window: rows, sequence end, the window's free memory
 # at its start and the KV pages lent to it, and the peaks above the window's
 # start (allocated, and reserved: what has to fit in free + loan). Appended to
-# <KT_PREFILL_LEND_HINT>-rank<r>.windows.jsonl; tools/kt-prefill-plan-constants.py
+# <KT_PREFILL_LEND_HINT>-rank<r>.windows.jsonl
 # fits reserved = fixed + a * rows + b * sequence over them.
 
 
@@ -1169,7 +1205,7 @@ def _logprob_rows(forward_batch) -> int:
 def _fw_open(rows: int, seq: int, lp: int = 0) -> None:
     dev = STATE["device"]
     torch.cuda.reset_peak_memory_stats(dev)
-    # kt-plan-reserved-per-forward.py: where this forward starts
+    # where this forward starts
     STATE["fw"] = {"rows": int(rows), "seq": int(seq), "lp": int(lp), "r0": torch.cuda.memory_reserved(dev),
                    "a0": torch.cuda.memory_allocated(dev)}
 
@@ -1184,22 +1220,22 @@ def _fw_close() -> None:
     STATE["win_resv_peak"] = max(STATE.get("win_resv_peak", 0), resv)
     STATE["win_alloc_peak"] = max(STATE.get("win_alloc_peak", 0), alloc)
     try:
-        # the plan's cost from this forward (kt-plan-online-cost.py)
+        # the plan's cost from this forward
         from sglang.srt.layers.moe import kt_prefill_plan
 
-        # kt-plan-reserved-cost.py: what the driver gave torch counts too (a split cache holds bytes a large
+        # what the driver gave torch counts too (a split cache holds bytes a large
         # tensor cannot use)
-        # kt-plan-reserved-per-forward.py: what this forward reserved itself, on top of what it carried in
+        # what this forward reserved itself, on top of what it carried in
         a0 = fw.get("a0", STATE.get("pf_abase", 0))
         grown = max(alloc - STATE.get("pf_abase", 0),
                     resv - fw.get("r0", resv) + a0 - STATE.get("pf_abase", 0))
-        # kt-plan-seq-evidence.py: with the allocated bytes and the window (the fit chooses its terms on them)
+        # with the allocated bytes and the window (the fit chooses its terms on them)
         STATE["fw_grown"] = int(grown + STATE.get("kept_at_start", 0))
         kt_prefill_plan.observe_window(fw["rows"], fw["seq"], STATE["fw_grown"],
                                        int(alloc - STATE.get("pf_abase", 0) + STATE.get("kept_at_start", 0)),
                                        int(STATE.get("to_prefill", 0)), fw.get("lp", 0))
-    except Exception:
-        pass
+    except Exception as e:
+        _say_once("lend: a window's reserved bytes were not observed, the plan keeps its last fit", e)
     if not HINT:
         return
     loan = 0
@@ -1216,7 +1252,7 @@ def _fw_close() -> None:
         loan=loan,
         resv=int(resv - STATE["pf_base"]),
         alloc=int(alloc - STATE.get("pf_abase", 0) + kept),
-        grown=int(STATE.get("fw_grown", 0)),  # kt-plan-seq-evidence.py: the cost the plan fitted
+        grown=int(STATE.get("fw_grown", 0)),  # the cost the plan fitted
         chunk=_chunk(),
         window=STATE.get("to_prefill", 0),
     )
@@ -1380,7 +1416,7 @@ def _write_hint(rank: int) -> None:
 
 def table_chunk(prefix: int, table: Optional[dict] = None) -> Optional[int]:
     """The chunk for a request whose prompt has reached prefix tokens, from
-    KT_PREFILL_LEND_TABLE (built at launch by tools/kt-lend-auto.sh from the
+    KT_PREFILL_LEND_TABLE (built at launch from the
     points of every rank, so all ranks answer the same): the largest c with
     c * cost(prefix + c) <= free - margin, cost per row interpolated between
     the measured sequence lengths and, past the last one, taken to grow with
@@ -1427,7 +1463,7 @@ def table_chunk(prefix: int, table: Optional[dict] = None) -> Optional[int]:
 
 def before_forward(forward_batch) -> None:
     """Model runner, before every forward, outside any graph."""
-    # kt-host-kv-generic.py: the host KV pool's rows move to the card once a forward's buffers are cached
+    # the host KV pool's rows move to the card once a forward's buffers are cached
     from sglang.srt.layers.moe import kt_kv_vmm
 
     if kt_kv_vmm.FLIGHT["pool"] is None and kt_kv_vmm.HOST is not None:
@@ -1466,7 +1502,7 @@ def before_forward(forward_batch) -> None:
         STATE["pf_rows"] = max(STATE.get("pf_rows", 0), rows)
         seq = _seq_len(forward_batch)
         STATE["pf_seq"] = max(STATE.get("pf_seq", 0), seq)
-        if EMPTY_EACH_CHUNK or (LONG_SEQ > 0 and seq >= LONG_SEQ):  # kt-plan-reserved-per-forward.py
+        if EMPTY_EACH_CHUNK or (LONG_SEQ > 0 and seq >= LONG_SEQ):
             # Past a long prefix every chunk's prefix-sized buffers (page tables,
             # the indexer's gathered K) are a little larger than the last one's,
             # so the freed ones do not fit them and torch's cache fills with
@@ -1507,8 +1543,8 @@ def before_forward(forward_batch) -> None:
         # Overlap scheduling may leave decode readers on these spans.
         # TMS pause unmaps them without waiting for outstanding GPU work.
         torch.cuda.synchronize(dev)
-        _ledger("D", "window start", dev)  # kt-ledger.py
-        # kt-plan-ledger-free.py: the ledger's prediction of this start, and what the pause frees
+        _ledger("D", "window start", dev)
+        # the ledger's prediction of this start, and what the pause frees
         from sglang.srt.layers.moe import kt_ledger
 
         kt_ledger.predict_start(dev, held, hot_stays=STATE["hot_stays"])
@@ -1542,8 +1578,8 @@ def before_forward(forward_batch) -> None:
         # counts as used: hand it back so the free memory measured is real
         torch.cuda.empty_cache()
         STATE["pf_free"] = torch.cuda.mem_get_info(dev)[0] - held
-        _ledger("W", "window start", dev)  # kt-ledger.py
-        kt_ledger.check_start(dev, STATE["pf_free"], {  # kt-plan-ledger-free.py: the prediction checked
+        _ledger("W", "window start", dev)
+        kt_ledger.check_start(dev, STATE["pf_free"], {  # the prediction checked
             "weights out": STATE["pause_freed"],
             "scratch in": -STATE["scratch_at_start"],
             "torch cache": STATE["pf_free"] - free_a + STATE["scratch_at_start"],
@@ -1767,7 +1803,9 @@ def end_window() -> None:
         # Prefill compute/copy streams may still read scratch mappings.
         # Finish those reads before rebinding weights and unmapping scratch.
         torch.cuda.synchronize(dev)
-        _ledger("W", "window end", dev)  # kt-ledger.py
+        _ledger("W", "window end", dev)
+        for fn in WINDOW_END:  # what a window's forwards cached on the card goes before torch returns its segments
+            fn()
         _leave()
         torch.cuda.empty_cache()
         free_c = torch.cuda.mem_get_info(dev)[0]
@@ -1839,7 +1877,7 @@ def end_window() -> None:
             kt_hot_cache.after_restore()
         STATE["phase"] = "decode"
         STATE["to_decode"] += 1
-        _ledger("D", "window end", dev)  # kt-ledger.py
+        _ledger("D", "window end", dev)
         if STATE["to_decode"] in (1, 10, 100, 1000):
             _log(
                 f"to decode in {(time.perf_counter() - t) * 1e3:.1f} ms, copy queued "
@@ -1848,7 +1886,7 @@ def end_window() -> None:
 
 
 def _ledger(state: str, why: str, dev) -> None:
-    """kt-ledger.py: the ledger's account at a change of state (read only)."""
+    """the ledger's account at a change of state (read only)."""
     from sglang.srt.layers.moe import kt_ledger
 
     kt_ledger.snapshot(dev, state, why)
@@ -1886,7 +1924,7 @@ def _check_room(dev) -> None:
         )
     from sglang.srt.layers.moe import kt_kv_vmm
 
-    # the card's share of a host KV pool yields its rows for the weights (kt-host-kv-generic.py); the margin a short
+    # the card's share of a host KV pool yields its rows for the weights; the margin a short
     # extend needs is made when one comes (before_forward), so decode keeps the rows on the card meanwhile
     if STATE.get("hot_stays"):
         # the hot slots that stood through the window give what the weights lack (a prompt's rows came to the card

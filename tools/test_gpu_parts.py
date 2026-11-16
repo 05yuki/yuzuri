@@ -3,8 +3,9 @@
 with the lazily mapped RoPE tables and their dtype copies, and the host embedding's Triton gather. Each part is checked
 against plain torch on the same values; a few hundred MiB of VRAM, seconds. Run it with no server up.
 
-usage: KT_KV_VMM=1 KT_KV_VMM_LIB=<recipe>/build/libkv_vmm.so PYTHONPATH=<recipe>/third_party/sglang/python \
-           <recipe>/.venv/bin/python tools/test_gpu_parts.py
+usage (after ./setup.sh <venv>, which builds libkv_vmm.so beside kt_kv_vmm.py and writes yuzuri.pth):
+    YUZURI_PACKAGE=1 KT_KV_VMM=1 KT_KV_VMM_LIB=<yuzuri>/python/yuzuri/tree/srt/layers/moe/libkv_vmm.so \
+        <venv>/bin/python tools/test_gpu_parts.py
 """
 import os
 import sys

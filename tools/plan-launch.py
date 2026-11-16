@@ -74,7 +74,7 @@ def plan(host, model, a):
     lin = (c.get("linear_state_bytes_per_seq_bf16") or 0) / tp * a.mamba_slots
     cal = a.constants_dict
     if cal:
-        # constants calibrated from a launch log of this profile (tools/plan-calibrate.py): the measured fixed
+        # constants calibrated from a launch log of this profile: the measured fixed
         # weights (dense, hc, lm_head, token table, draft as that launch had them), the real bytes a token takes
         # (index pools included), the states, and what the server keeps beside the pool
         kv_scale = 1.0 if cal.get("kv_dtype", "bf16") == a.kv_dtype else (0.5 if a.kv_dtype == "fp8" else 2.0)
@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--host-json")
     ap.add_argument("--model-json")
     ap.add_argument("--env", action="store_true")
-    ap.add_argument("--constants", help="a profile JSON with \"constants\" from plan-calibrate.py, or a JSON of the constants")
+    ap.add_argument("--constants", help="a profile JSON with \"constants\", or a JSON of the constants")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
     a.constants_dict = None

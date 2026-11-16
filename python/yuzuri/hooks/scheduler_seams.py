@@ -39,7 +39,7 @@ def _install(m):
             got = orig(self)
             from sglang.srt.layers.moe import kt_kv_vmm
 
-            if kt_kv_vmm.HOST is not None:
+            if getattr(kt_kv_vmm, "HOST", None) is not None:
                 r = self.tp_worker.model_runner
                 kt_kv_vmm.host_place_now(r.device, r.token_to_kv_pool_allocator)
             return got

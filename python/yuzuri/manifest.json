@@ -1,5 +1,9 @@
 {
- "sglang_checked": "58484246d26523eaf1a7f16ab524deee288d2120",
+ "sglang_checked": [
+  {"commit": "58484246d26523eaf1a7f16ab524deee288d2120", "tree": "the DeepSeek-V4.1 recipe's patched tree", "date": "2026-11-04"},
+  {"commit": "d193c34ae4b138aae4b8c0479ff395b0138a0156", "tree": "upstream main, no patches", "date": "2026-11-13"},
+  {"commit": "8c7ec05287904d88854d9fb5bcbe1a5181282b5e", "tree": "upstream main with the recipe's tier 0 patches", "date": "2026-11-15"}
+ ],
  "fetched": [
   "srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml/"
  ],

@@ -59,7 +59,7 @@ def _host_embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
 
 
 def move_all_to_host(model) -> list:
-    """kt-generic-offloads.py: every token embedding of model to pinned host memory: [(name, bytes)]. Skipped:
+    """every token embedding of model to pinned host memory: [(name, bytes)]. Skipped:
     an LM head (ParallelLMHead), a module reached under two names (an embedding that is also the LM head), a table
     that shares its storage with another parameter, a table with added vocabulary (the gather reads the original
     rows only), anything not a bf16 CUDA tensor."""

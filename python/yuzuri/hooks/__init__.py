@@ -1,11 +1,12 @@
 """The startup hooks: each wraps an SGLang function at a boundary through _finder.after_import, after checking that
 the function still has the name and parameters it was written against (_seam.wrap). A hook module's REPLACES names
-the SGLang files it stands in for: tools/package-from-tree.py leaves them out of the overlays."""
+the SGLang files an earlier, file-replacing version of that hook stood in for; no SGLang file is replaced now."""
 from yuzuri.hooks import (  # noqa: F401
     cutlass_shared_workspace,
     fp8_decode_gemm,
     gguf_dense,
     gguf_grouped,
+    hicache_staging_cap,
     host_allreduce,
     indexer_live_topk,
     indexer_no_deepgemm_sm12x,
@@ -35,8 +36,12 @@ from yuzuri.hooks import (  # noqa: F401
     pre_sm90_sparse_attention,
     scheduler_seams,
     sparse_mla_by_layout,
+    sparse_mla_window_calls,
     swa_chunk_in_flight,
     swa_pool_guard,
     thinking_default,
     warmup_prefill,
 )
+from yuzuri import _features
+
+_features.arm()  # registered last: the report wraps what the hooks left on the runner

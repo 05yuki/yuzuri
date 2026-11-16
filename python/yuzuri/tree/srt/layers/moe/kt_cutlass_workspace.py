@@ -75,7 +75,7 @@ def _workspace_max_tokens(num_tokens: int) -> int:
         chunk = get_schedule().chunked_prefill_size or 0
     except Exception:
         chunk = 0
-    # sglang-kt-stream-row-block-dsv41.py: a streamed prefill's calls see a block at most
+    # a streamed prefill's calls see a block at most
     from sglang.srt.layers.moe.kt_stream_prefill import _block_rows
 
     return max(num_tokens, _block_rows(chunk))
