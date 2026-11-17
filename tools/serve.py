@@ -423,6 +423,8 @@ def main():
     # the first window's chunk: small enough to fit any model, measured by the plan for the windows after it
     chunk = a.chunk or d.get("chunk") or 4096
     threads = a.threads or d.get("threads") or plan["threads"]
+    # the plan adds a pool on every node the experts need beyond the ranks' own (plan-launch.py)
+    pools = max(pools, len(plan.get("cpu_pools") or ()))
     # the lends, the KV loan and the plan come with the profile's environment (captured from the recipe's stack);
     # --no-plan keeps the lend alone. The plan's cost before this setup has measured its own: the profile's prior
     # (the recipe's V4.1 values when a profile has none: conservative on a model with a lighter row)
@@ -629,7 +631,7 @@ def main():
     lent_note = (f", lent ~{plan['lent_from_empty_pool']}" if kv_lend else
                  f", up to {vals['lent']} more on the empty pool" if vals["lent"] else "")
     print(f"{prof['name']} tp {tp}: hot {hot} per layer (plan {plan['hot_experts_per_layer']}{lent_note}), "
-          f"chunk {chunk}, threads {threads} on nodes {[g['numa_node'] for g in ranks]}, context {context}"
+          f"chunk {chunk}, threads {threads} on nodes {[q["node"] for q in plan["cpu_pools"]]}, context {context}"
           + (f" of the model's {plan['model_context']}" if context != plan["model_context"] else "")
           + f" (pool = context), KV {kv_dtype}, static "
           + (f"{mem_fraction} of the card" if mem_fraction is not None else "share of the card left to SGLang"))

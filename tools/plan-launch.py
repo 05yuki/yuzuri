@@ -117,8 +117,19 @@ def plan(host, model, a):
         n = [x for x in host["numa"] if x["node"] == g["numa_node"]]
         pools.append({"node": g["numa_node"], "threads": max(4, n[0]["physical_cores"] - 2) if n else 0,
                       "ram_free": n[0]["mem_free"] if n else 0, "page_cache": n[0]["file_pages"] if n else 0})
-    threads = sum(p["threads"] for p in pools)
     ram_need = e["bytes_total"] + model["ple_bytes"] if e else model["ple_bytes"]
+    # the experts' arenas are bound to their pools' nodes: when the ranks' nodes hold less RAM than the experts take
+    # (one card on a two-socket machine, 269 GiB of experts against a 251 GiB node: the kernel killed the rank at
+    # 230 GiB, 11-17), the other nodes carry pools as well, in node order, until the experts fit
+    held = lambda: sum(x["mem_total"] for x in host["numa"] if x["node"] in {q["node"] for q in pools}) * 0.9
+    for x in sorted(host["numa"], key=lambda x: x["node"]):
+        if not e or ram_need <= held():
+            break
+        if x["node"] not in {q["node"] for q in pools}:
+            pools.append({"node": x["node"], "threads": max(4, x["physical_cores"] - 2),
+                          "ram_free": x["mem_free"], "page_cache": x["file_pages"]})
+            notes.append(f"the experts take {ram_need / GiB:.0f} GiB of RAM, more than the ranks' nodes hold: node {x['node']} carries a CPU pool as well")
+    threads = sum(p["threads"] for p in pools)
     # the prefill chunk from what stays free after the pool and the hot slots (the lend returns hot VRAM for the
     # prefill, so the scratch may also take the hot slots' share: counted at half)
     hot_bytes = hot * slot * (e["moe_layers"] if e else 0)

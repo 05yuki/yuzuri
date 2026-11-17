@@ -38,6 +38,10 @@ COMMON_ENV = {
     "SGLANG_UNBALANCED_LOAD_TIMEOUT_S": "1800",
     # the prompt length a prefill streams from is measured at the first launch (kt_stream_threshold)
     "KT_GPU_STREAM_PREFILL": "auto",
+    # the streamer and its card buffers are made at load. Made at the first forward that qualifies, they came after
+    # the hot lend had counted the card's free memory: an MXFP4 launch on one card kept 0.00 GiB of the lend's
+    # 1 GiB floor and the first 1,024-token forward ran out (11-17)
+    "KT_GPU_STREAM_EARLY_INIT": "1",
     # every streamed kernel call over blocks of this many rows: the CUTLASS workspaces are sized by it, not by the
     # chunk ceiling, so the ceiling is what the card holds (serve.py) and costs no scratch it does not use
     "KT_GPU_STREAM_ROW_BLOCK": "8192",
@@ -53,10 +57,10 @@ FORMAT_ENV = {
               # (bit-identical; V4.1 MXFP4 decode 51.7 -> 55.6 tok/s on two EPYC 7452, 11-14). As above: an
               # extension without them reads no such variable
               "KT_MXFP4_DEC_VCONV": "1", "KT_MXFP4_DEC_PFS": "1024"},
-    "NVFP4": {"KT_GPU_STREAM_EARLY_INIT": "1", "KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1"},
-    "BF16": {"KT_GPU_STREAM_EARLY_INIT": "1", "KT_GPU_STREAM_GRAPH": "1"},
+    "NVFP4": {"KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1"},
+    "BF16": {"KT_GPU_STREAM_GRAPH": "1"},
     "LLAMAFILE": {"KT_GGUF_NOCOPY": "1", "KT_GGUF_ZEROCOPY": "1", "KT_GGUF_STREAM_MMQ": "1",
-                  "KT_GGUF_STREAM_SOURCE": "bank", "KT_GPU_STREAM_EARLY_INIT": "1"},
+                  "KT_GGUF_STREAM_SOURCE": "bank"},
 }
 # SGLang's MoE runner for the GPU experts of a format (none: SGLang chooses)
 FORMAT_ARGS = {
