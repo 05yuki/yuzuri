@@ -1,5 +1,5 @@
 """What the tables say against what is in the tree: every hook listed exists, every feature's requirement is a
-feature, every module of the manifest is a file, every profile is a launch the launcher can fill, the server
+feature, every module of the manifest is a file, no launch of a named model is kept, the server
 listens on this machine unless told otherwise, the .pth stays silent once the checkout is gone, and every Python
 file compiles. No SGLang, no GPU.
 """
@@ -52,15 +52,10 @@ class Tables(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(PKG, "tree", e["path"])), e["path"])
             self.assertEqual(e["module"], "sglang." + e["path"][:-3].replace("/", "."))
 
-    def test_profiles(self):
-        paths = glob.glob(os.path.join(ROOT, "profiles", "*.json"))
-        self.assertTrue(paths)
-        for p in paths:
-            with open(p) as f:
-                prof = json.load(f)
-            cmd = prof["command"]
-            self.assertEqual(cmd[cmd.index("--host") + 1], "{host}", p)
-            self.assertNotIn("0.0.0.0", json.dumps(prof), p)
+    def test_no_named_profiles(self):
+        # the launch is built from the checkpoint: the repository keeps no launch of a named model
+        self.assertEqual(glob.glob(os.path.join(ROOT, "profiles", "*.json")), [])
+        self.assertNotIn("PROFILES", text(ROOT, "tools", "serve.py"))
 
     def test_listens_on_this_machine_by_default(self):
         src = text(ROOT, "tools", "serve.py")

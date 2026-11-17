@@ -139,8 +139,6 @@ yuzuri/tools/serve.py --package --venv <the server's venv> --config-dir <checkpo
 
 - `--dry-run` prints the arithmetic and stops: weights, KV a token, threads, the resident hot experts.
 
-- `--profile <name>` takes a measured command line from `profiles/` instead.
-
 - The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, this machine only.
   - `--host 0.0.0.0` opens it to the network.
   - SGLang asks for no key unless one is set: `--server-arg="--api-key <key>"`.
@@ -215,11 +213,11 @@ TP=1 is one card and the socket next to it.
   Where the weights leave less than the context, the count is 1 and the pool is what fits.
 
 - Hot slots: on, the experts on the cards, all layers and all cards together, lent from free pool pages, and the count a layer.
-  Two numbers are the count at the first decode and the count after the 131K prompt.
+  It is the count at the first decode.
   Off lends none: it keeps its fixed count a layer.
 
 - Decode: 1,024 tokens after a 384-token prompt, timed from the first token to the last.
-  It is the median of four prompts: two passages of Japanese prose and two of English (`tools/nll-text/`).
+  Five prompts of Japanese prose run (`tools/nll-text/`); the first is left out, and the number is the median of the other four.
   Sampling is temperature 1.0 and top-p 0.95, and the end-of-sequence token is ignored.
 
 - 35K prefill: the second of two different 35,000-token prompts, in tokens a second.
@@ -232,46 +230,48 @@ TP=1 is one card and the socket next to it.
   On and off differ by the launch-to-launch spread of one configuration.
   Gemma answers in a chat template, so its number on bare text only compares on with off.
 
-Each row is two launches on 2026-11-16.
-The pool, hot slots, prefill and NLL are `tools/check.py --prompt 35000 --long 131072`.
-The decode and long decode are a second launch, `tools/check.py --prompt 0 --long 131072`.
+Each on row is one launch on 2026-11-17, `tools/check.py --prompt 35000 --long 131072`.
+Each off row's decode and NLL are one launch on 2026-11-17.
+Its pool, hot count, prefill and long decode are the same settings' launch on 2026-11-16.
+The MiMo off row is the 2026-11-16 launch in every column: FP8 KV and `--swa-full-tokens-ratio 0.0657`, where on keeps the bf16 KV `--profile auto` reads.
 
 TP=2:
 
 | model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 3,445 (86 a layer) | 117.5 tok/s | 8,990 tok/s | 6,481 tok/s | 73.3 tok/s | 1.7751 |
-| | | off | 262,144 | 54 a layer | 54.5 tok/s | 440 tok/s | 435 tok/s | 49.6 tok/s | 1.7766 |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 1,433 (47 a layer) | 94.5 tok/s | 5,185 tok/s | 2,375 tok/s | 40.1 tok/s | 10.1739 |
-| | | off | 88,859 | 1 a layer | 36.5 tok/s | 223 tok/s | does not fit the pool | | 10.1520 |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 4,550 (94 a layer) | 64.7 tok/s | 4,579 tok/s | 4,234 tok/s | 52.0 tok/s | 1.5909 |
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 3,361 (84–85 a layer) | 112.0 tok/s | 9,023 tok/s | 6,556 tok/s | 74.1 tok/s | 1.7741 |
+| | | off | 262,144 | 54 a layer | 55.0 tok/s | 440 tok/s | 435 tok/s | 49.6 tok/s | 1.7766 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 1,484 (49–50 a layer) | 101.5 tok/s | 4,530 tok/s | 2,300 tok/s | 37.7 tok/s | 10.1885 |
+| | | off | 88,859 | 1 a layer | 36.2 tok/s | 223 tok/s | does not fit the pool | | 10.1520 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 4,435 (92–93 a layer) | 67.3 tok/s | 4,590 tok/s | 4,495 tok/s | 54.0 tok/s | 1.5918 |
 | | | off | 262,144 | 27 a layer | 46.6 tok/s | 287 tok/s | 283 tok/s | 46.0 tok/s | 1.5882 |
-| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 3,620 → 3,592 (75 a layer) | 67.2 tok/s | 4,734 tok/s | 4,509 tok/s | 58.2 tok/s | 1.5970 |
-| | | off | 262,144 | 28 a layer | 54.3 tok/s | 437 tok/s | 438 tok/s | 53.7 tok/s | 1.5959 |
-| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 1,162 → 1,020 (24 a layer) | 45.8 tok/s | 1,985 tok/s | 1,498 tok/s | 37.0 tok/s | 1.2328 |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 4,290 (89–90 a layer) | 79.3 tok/s | 4,410 tok/s | 4,181 tok/s | 62.7 tok/s | 1.5966 |
+| | | off | 262,144 | 28 a layer | 54.0 tok/s | 437 tok/s | 438 tok/s | 53.7 tok/s | 1.5973 |
+| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 1,092 (23–24 a layer) | 49.7 tok/s | 1,930 tok/s | 1,158 tok/s | 37.8 tok/s | 1.2330 |
 | | | off | 637,143 | 1 a layer | 27.3 tok/s | 95 tok/s | 94 tok/s | 22.0 tok/s | 1.2334 |
-| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | none | 24.4 tok/s | 1,999 tok/s | 2,233 tok/s | 24.2 tok/s | 1.0697 |
-| | | off | 610,560 | none | 24.3 tok/s | 94 tok/s | 94 tok/s | 23.7 tok/s | 1.0751 |
+| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | none | 24.8 tok/s | 1,750 tok/s | 2,173 tok/s | 24.9 tok/s | 1.0697 |
+| | | off | 610,560 | none | 24.5 tok/s | 94 tok/s | 94 tok/s | 23.7 tok/s | 1.0752 |
 
 TP=1:
 
 | model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 1,305 → 825 (32 a layer) | 58.4 tok/s | 5,549 tok/s | 4,075 tok/s | 40.0 tok/s | 1.7770 |
-| | | off | 262,144 | 3 a layer | 36.1 tok/s | 227 tok/s | 223 tok/s | 32.2 tok/s | 1.7755 |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 466 (15 a layer) | 47.3 tok/s | 2,895 tok/s | 1,224 tok/s | 28.5 tok/s | 10.1854 |
-| | | off | 31,762 | 1 a layer | 28.0 tok/s | 132 tok/s (30,762 tokens) | does not fit the pool | | 10.1983 |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 598 → 623 (12 a layer) | 38.8 tok/s | 2,999 tok/s | 2,238 tok/s | 33.3 tok/s | 1.5873 |
-| | | off | 18,240 | 1 a layer | 33.3 tok/s | 166 tok/s (17,240 tokens) | does not fit the pool | | 1.5902 |
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 1,273 (31–32 a layer) | 57.7 tok/s | 5,596 tok/s | 4,044 tok/s | 39.7 tok/s | 1.7781 |
+| | | off | 262,144 | 3 a layer | 36.2 tok/s | 227 tok/s | 223 tok/s | 32.2 tok/s | 1.7755 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 577 (19–20 a layer) | 54.8 tok/s | 2,905 tok/s | 1,168 tok/s | 26.6 tok/s | 10.1858 |
+| | | off | 31,762 | 1 a layer | 28.5 tok/s | 132 tok/s (30,762 tokens) | does not fit the pool | | 10.1983 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 533 (11–12 a layer) | 37.4 tok/s | 3,010 tok/s | 2,059 tok/s | 33.2 tok/s | 1.5847 |
+| | | off | 18,240 | 1 a layer | 33.2 tok/s | 166 tok/s (17,240 tokens) | does not fit the pool | | 1.5902 |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 3,018 (62–63 a layer) | 52.9 tok/s | 3,036 tok/s | 2,663 tok/s | 39.5 tok/s | 1.5972 |
+| | | off | 196,416 | 1 a layer | 39.5 tok/s | 267 tok/s | 269 tok/s | 39.2 tok/s | 1.5947 |
 
 - The long decode is below the decode in every row, on and off.
   Attention reads 131K tokens of KV at each step.
   On falls further than off, by design: the hot slots sit in free KV pages, and a 131K prompt takes those pages back.
-  Slots a rank held before and after the 131K prompt, two cards: Qwen3.5 3,445 → 2,965, Flash-Next NVFP4 4,550 → 2,822, Gemma 1,413 → 976, Flash-Next GGUF 3,592 → 1,438, MiMo 1,162 → 895.
-  One card: Qwen3.5 1,305 → 852, Gemma 466 → 211, Flash-Next NVFP4 599 → 610.
   The slots come back when the KV rows are freed.
 
-- GLM runs without hot slots in both: its profile turns the hot lend off.
+- GLM runs without hot slots in both.
+  Its config directory holds no expert tensor, and the hot slots are filled from the tensors the server's own loader reads.
 
 - These are one host's numbers.
   On another server, compare the same prompts with and without Yuzuri:
@@ -375,7 +375,7 @@ python -m unittest discover -s tests
 - These run without SGLang and without a GPU.
   - The hook helper is run against a stand-in module: a matching function, one that gained a parameter, one that
     lost one, a tree that already carries the change, a line a rewrite looks for that is gone.
-  - The tables are checked against the tree: hooks, features, manifest, profiles, licenses, file names in the text.
+  - The tables are checked against the tree: hooks, features, manifest, licenses, file names in the text.
 
 - `tests/gpu/test_kv_vmm.py` and `tools/test_gpu_parts.py` need a CUDA card.
   They check the KV library and Yuzuri's own GPU parts against plain torch.

@@ -12,7 +12,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 
 | Name | Default | Read in |
 |---|---|---|
-| `KT_AUTO_GROUP_MB` | `"400"` | auto_profile.py |
+| `KT_AUTO_GROUP_MB` | `"800"` | auto_profile.py |
 | `KT_CUTILE_NVFP4` | `"1"` | kt_cutile_nvfp4.py |
 | `KT_FAST_PINNED` | - | kt_pinned.py |
 | `KT_FAST_PINNED_MIN` | `str(64 << 20)` | kt_pinned.py |

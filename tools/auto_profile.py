@@ -7,8 +7,8 @@ from what the checkpoint holds, not from a list of models.
   * the GPU MoE runner for that format (SGLang's own choice for any other);
   * reasoning and tool-call parsers: SGLang's "auto" (from the chat template);
   * linear-attention state slots when the model has linear layers (modelprobe);
-  * the streamed prefill's group: as many experts as keep about KT_AUTO_GROUP_MB (400) on a rank
-    (the packed slot; with the bf16 streamer, everything a group keeps on the card);
+  * the streamed prefill's group: as many experts as keep about KT_AUTO_GROUP_MB (800) on a rank, counting
+    everything the streamer keeps there (its two slots, and the bf16 group buffer where it expands the group);
   * the environment every measured profile shares, and the format's own streamer switches.
 
 Usage: auto_profile.py <config dir> [--experts DIR | --gguf DIR] [--tp N] [--recipe DIR]   (prints the profile JSON)
@@ -95,6 +95,12 @@ def _headers(d):
     return out
 
 
+def _names_experts(d):
+    """Whether the safetensors under d name any MoE expert tensor."""
+    r = re.compile(r"^(?:.*\.)?layers\.\d+\.(?:[^.]+\.)*experts\.")
+    return any(r.match(k) for k in _headers(d))
+
+
 def expert_format(d):
     """kt-kernel's method for the experts under d, from one expert's tensors: (method, why)."""
     if any(f.endswith(".gguf") for f in os.listdir(d)):
@@ -157,17 +163,29 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
     e = (probe(src) if src != config_dir and not gguf else p).get("experts") or {}
     per_rank = (e.get("bytes_per_expert_mean") or 0) / max(1, tp)
     fmt_env = FORMAT_ENV.get(method, {})
+    no_hot = ""
+    if experts_dir and experts_dir != config_dir and not gguf and _has_weights(config_dir) and not _names_experts(config_dir):
+        # the hot slots are filled from the expert tensors the server's own loader hands each layer; a checkpoint
+        # that keeps none (its experts live only under --experts) leaves them empty, so the slots are not made
+        no_hot = "the config directory's own weights hold no expert tensor, and a hot expert is filled from them"
     if per_rank and fmt_env.get("KT_GPU_STREAM_W16") == "1":
         # the W16 streamer keeps, for every expert of a group, two packed DMA slots and the bf16 copy the kernel
         # reads (three matrices of hidden x intermediate), plus the MMQ buffers: count what stays on the card,
         # not the packed file (V4.1 MXFP4: 8.8 MB packed, 62 MB kept an expert a rank)
         H, I = c.get("hidden_size") or 0, c.get("moe_intermediate_size") or 0
         bf16 = (3 * H * I * 2) / max(1, tp) if H and I else 4 * per_rank
-        per_rank = 2 * per_rank + bf16 + (per_rank if fmt_env.get("KT_GPU_STREAM_MMQ") == "1" else 0)
+        kept = 2 * per_rank + bf16 + (per_rank if fmt_env.get("KT_GPU_STREAM_MMQ") == "1" else 0)
+    elif method == "NVFP4" and no_hot:
+        # with no expert resident on the card the layer holds no activation scale, and the NVFP4 streamer expands
+        # each group to bf16: it runs a quarter of the group it is given, in two packed slots of that quarter and a
+        # bf16 buffer four times one of them (GLM, 2026-11-17: the group counted as packed slots alone ran at 8)
+        kept = (2 * per_rank + 4 * per_rank) / 4
+    else:
+        kept = 2 * per_rank  # two device slots
     group = 16
-    if per_rank:
-        budget = int(os.environ.get("KT_AUTO_GROUP_MB", "400")) << 20
-        group = max(4, min(64, 1 << max(0, int(budget // per_rank).bit_length() - 1)))
+    if kept:
+        budget = int(os.environ.get("KT_AUTO_GROUP_MB", "800")) << 20
+        group = max(4, min(64, 1 << max(0, int(budget // kept).bit_length() - 1)))
     cmd = ["-m", "sglang.launch_server", "--model-path", "{config_dir}", "--served-model-name", "{served_model_name}",
            "--host", "{host}", "--port", "{port}", "--tp", "{tp}", "--numa-node", "{numa_nodes}",
            "--disable-custom-all-reduce", "--trust-remote-code", "--kv-cache-dtype", "{kv_cache_dtype}",
@@ -186,7 +204,11 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
         cmd += ["--max-mamba-cache-size", "{mamba_slots}"]
     env = dict(COMMON_ENV)
     env.update(FORMAT_ENV.get(method, {}))
+    note = ""
     env["KT_GPU_STREAM_GROUP"] = str(group)
+    if no_hot:
+        env["KT_KV_HOT_LEND"] = "0"
+        note = "; no hot expert, fixed or lent: no expert tensor in the config directory's own weights"
     if gguf and not _has_weights(config_dir):
         # a config directory with no weight file (tools/make-config-dir.py): the dense tensors come from the GGUF
         env["KT_GGUF_DENSE"] = "{experts_dir}"
@@ -197,7 +219,7 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
             env["SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"] = "1"
     return {
         "name": os.path.basename(config_dir.rstrip("/")),
-        "description": f"auto: {c.get('architecture')}, experts {method} ({why}), stream group {group}",
+        "description": f"auto: {c.get('architecture')}, experts {method} ({why}), stream group {group}{note}",
         "command": cmd, "command_with_placement": ["--init-expert-location", "{placement}"],
         "env": env, "env_by_tp": {str(tp): {}},
         "weights": {"gguf": bool(gguf), "experts_from": bool(experts_dir and experts_dir != config_dir) or bool(gguf),
@@ -208,7 +230,7 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
         "env_with_draft": {"KT_MTP_GGUF": "{draft_gguf}"},
         "defaults": {str(tp): {"kv_dtype": c.get("kv_store") or "bf16", "mamba_slots": 8 if linear else 1, "pools": tp, "chunk": None,
                                "threads": None, "free_min_gb": 1.0}},
-        "min_hot": 1,
+        "min_hot": 0 if no_hot else 1, "no_hot": no_hot,
     }
 
 

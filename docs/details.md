@@ -136,9 +136,9 @@ tools/serve.py --package --venv <the server's venv> --config-dir <model dir> \
 - `--profile auto`, the default, builds the profile from the checkpoint (`auto_profile.py`): the experts' format
   from one expert's tensor dtypes and scale names, the GPU MoE runner for it, the linear-attention slots when the
   model has linear layers, and the streamed group size.
-- `--profile <name>` takes `profiles/<name>.json`, a measured launch's command line with every path and sized value
-  as a placeholder.
-- `tools/profile-from-launch.py --pid <launch_server pid>` writes such a profile from a running launch.
+- The repository keeps no profile of a named model.
+- `tools/profile-from-launch.py --pid <launch_server pid>` writes a JSON from a launch running on your own machine,
+  with every path and sized value as a placeholder; `--profile FILE.json` launches from it.
 - `--hot`, `--chunk` and `--threads` override the plan for an experiment.
 - The server log and a manifest (command, environment, plan, package versions) go to `--log-dir/<timestamp>/`.
 
@@ -156,7 +156,7 @@ They are listed so a log can be read.
 - `KT_KV_HOT_LEND=1`, `KT_KV_HOT_EXTRA=auto`, `KT_KV_HOT_DYNAMIC_SLOTS=1`, `KT_KV_HOT_DYNAMIC_RESIDENT=1`,
   `KT_KV_HOT_SPARE_FLOOR_MB` (1,024). No free pages are kept aside for new requests: an allocation that needs
   pages the hot slots took gets back those pages and no more (`KT_KV_HOT_PARTIAL=0` gives the whole lend back
-  instead, and `KT_KV_HOT_RESERVE` then sets the tokens kept free; the GGUF profile, whose slots are per rank,
+  instead, and `KT_KV_HOT_RESERVE` then sets the tokens kept free; a GGUF pack, whose slots are per rank,
   runs that way).
 - `KT_GPU_STREAM_PREFILL=auto`: the prompt length the streamed prefill starts from is measured (where a window's
   fixed cost, timed at the first launch, meets the resident path's cost a token, read from the prompts the server is

@@ -95,16 +95,21 @@ def stream_rate(url, ids, new, timeout, sample=False):
     return (last[1] - first[1]) / (last[0] - first[0])
 
 
-def prose_prompts(url, n=384):
-    """Four prompts of the public-domain texts beside this file (two Japanese, two English); [] without them."""
+TEXTS = {"ja": "nll-text/ja-kokoro.txt", "en": "nll-text/en-holmes.txt"}
+
+
+def prose_prompts(url, lang="ja", n=384, count=5):
+    """`count` prompts of one public-domain text beside this file, from places spread over it; [] without it.
+    One language: the hot slots follow the experts the text routes to, and a change of language between the
+    prompts would time the slots moving, not the decode."""
     out = []
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("nll-text/ja-kokoro.txt", "nll-text/en-holmes.txt"):
+    for name in (TEXTS[lang],):
         try:
             text = open(os.path.join(here, name), encoding="utf-8").read()
         except OSError:
             return []
-        for at in (len(text) // 5, 3 * len(text) // 5):
+        for at in (k * len(text) // (count + 1) for k in range(1, count + 1)):
             try:
                 r = post(url + "/tokenize", {"prompt": text[at:at + 8 * n], "add_special_tokens": True}, 30)
             except Exception:  # noqa: BLE001
@@ -117,8 +122,10 @@ def prose_prompts(url, n=384):
 
 
 def decode_rate(url, prompts, new, timeout):
-    """The median over the prompts of a streamed, sampled decode of `new` tokens."""
+    """The median over the prompts of a streamed, sampled decode of `new` tokens.  The first prompt's decode is
+    run and left out: it is the one the hot slots settle during."""
     rates = [r for r in (stream_rate(url, ids, new, timeout, sample=True) for ids in prompts) if r]
+    rates = rates[1:] if len(rates) > 1 else rates
     return statistics.median(rates) if rates else None
 
 
@@ -148,6 +155,7 @@ def main():
     ap.add_argument("--long", type=int, default=0, help="one more prompt of this many tokens, and decode after it")
     ap.add_argument("--decode-tokens", type=int, default=1024, help="the tokens of each decode")
     ap.add_argument("--decode-only", action="store_true", help="the decode row only")
+    ap.add_argument("--decode-text", choices=sorted(TEXTS), default="ja", help="the language of the decode prompts")
     ap.add_argument("--log", help="the server log: error lines written during the check are counted")
     ap.add_argument("--json", help="write the rows here, for --compare")
     ap.add_argument("--timeout", type=int, default=7200)
@@ -192,8 +200,9 @@ def main():
         rows[name] = round(value, 2)
         print(f"  {name:26} {value:10.1f} {unit}")
 
-    prose = prose_prompts(url) or [prompt_ids(base, rng, 384) for _ in range(4)]
-    print(f"decode: {a.decode_tokens} sampled tokens after each of {len(prose)} prompts, first token to last, the median")
+    prose = prose_prompts(url, a.decode_text) or [prompt_ids(base, rng, 384) for _ in range(5)]
+    print(f"decode: {a.decode_tokens} sampled tokens after each of {len(prose)} prompts ({a.decode_text} prose), "
+          f"first token to last, the first left out, the median of the rest")
     row("decode", decode_rate(url, prose, a.decode_tokens, a.timeout))
     if a.decode_only:
         a.prompt = a.long = 0

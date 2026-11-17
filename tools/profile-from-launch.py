@@ -2,7 +2,7 @@
 """A serve profile from a launch that is running (or ran): the server process's environment and command line as
 they are, with the paths and the sized values turned into placeholders. No transcription from a launcher script.
 
-usage: profile-from-launch.py --pid PID | --environ FILE --command FILE   --name NAME --out profiles/NAME.json
+usage: profile-from-launch.py --pid PID | --environ FILE --command FILE   --name NAME --out FILE.json
          [--config-dir DIR] [--experts DIR] [--draft-dir DIR] [--cache-dir DIR] [--weights JSON]
   --pid        a running server: /proc/PID/environ and /proc/PID/cmdline (the launch_server process)
   --environ    a NUL-separated env dump (`tr '\\0' '\\n' < /proc/PID/environ` works too), with --command (one arg per line)

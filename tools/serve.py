@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serve a model with Yuzuri: probe the host, size the launch, set the profile's knobs, start SGLang.
 
-usage: serve.py --package --venv SERVER_VENV [--profile auto|NAME] --config-dir DIR [--experts DIR | --gguf DIR]
+usage: serve.py --package --venv SERVER_VENV [--profile auto|FILE.json] --config-dir DIR [--experts DIR | --gguf DIR]
                 [--draft-dir DIR] [--tp 1|2] [--context T] [--host 127.0.0.1] [--port 8080] [--hot N] [--chunk C]
                 [--kv-dtype bf16|fp8] [--mamba-slots N] [--threads N] [--placement FILE] [--hot-seed JSON]
                 [--draft-hot FILE] [--log-dir DIR] [--cache-dir DIR] [--env KEY=VALUE ...] [--background] [--dry-run]
@@ -14,7 +14,7 @@ usage: serve.py --package --venv SERVER_VENV [--profile auto|NAME] --config-dir 
   --host         the address the server listens on (default 127.0.0.1, this machine only; SGLang asks for no key
                  unless --server-arg="--api-key KEY")
   --profile      auto (the default): the command line and environment built from the checkpoint (auto_profile.py);
-                 or profiles/<NAME>.json, a measured launch's command line, env defaults (per TP) and weights layout
+                 or FILE.json, a launch captured with tools/profile-from-launch.py (command line, env, weights layout)
   --config-dir   the model directory SGLang loads (config + tokenizer; for a GGUF serve, tools/make-config-dir.py)
   --gguf / --experts   where the experts are (a GGUF dir, or a second checkpoint dir); default: the config dir
   --draft-dir    the MTP draft directory when the profile serves one (tools/make-draft-dir.py)
@@ -40,7 +40,6 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROFILES = os.path.join(os.path.dirname(HERE), "profiles")
 PACKAGE_TREE = os.path.join(os.path.dirname(HERE), "python", "yuzuri", "tree")
 FEATURES = os.path.join(os.path.dirname(HERE), "python", "yuzuri", "features.json")
 
@@ -229,7 +228,7 @@ def io_threads(env: dict, checkpoint: str, cache_dir: str, nodes) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", default="auto", help="profiles/<NAME>.json, or auto (built from the checkpoint)")
+    ap.add_argument("--profile", default="auto", help="auto (built from the checkpoint), or a JSON captured with tools/profile-from-launch.py")
     ap.add_argument("--venv", help="the server's Python venv (SGLang and kt-kernel installed in it)")
     ap.add_argument("--recipe", help="a recipe checkout (deepseek-v4.1-flash-1017-ktransformers): its .venv, "
                                      "third_party/sglang, prebuilt/lib and build/ when --venv is not given")
@@ -293,7 +292,11 @@ def main():
                                   a.gguf and os.path.abspath(a.gguf), a.tp or 2)
         print(f"profile {prof['description']}", flush=True)
     else:
-        pf = a.profile if a.profile.endswith(".json") else os.path.join(PROFILES, a.profile + ".json")
+        # a launch somebody captured on their own machine (tools/profile-from-launch.py); the repository keeps none
+        if not os.path.isfile(a.profile):
+            raise SystemExit(f"--profile {a.profile}: no such file. The default, auto, builds the launch from the "
+                             f"checkpoint; a JSON written by tools/profile-from-launch.py is the only other choice.")
+        pf = a.profile
         prof = json.load(open(pf))
     w = prof["weights"]
     for k in ("recipe", "config_dir", "gguf", "experts", "draft_dir", "placement", "hot_seed", "draft_hot", "log_dir", "cache_dir"):
@@ -404,6 +407,9 @@ def main():
     # experts a layer outside prefill; it needs the plan's KV pool and at least one resident hot expert
     kv_hot = prof.get("env", {}).get("KT_KV_HOT_LEND") == "1"
     key = f"tp{tp}-ctx{context}-mamba{mamba_slots}-{os.path.basename(experts_dir.rstrip('/'))}"
+    if a.hot and prof.get("no_hot"):
+        # an expert on the card with nothing to fill it answers wrong, quietly (GLM, 2026-11-17: NLL 1.07 -> 1.60)
+        raise SystemExit(f"--hot {a.hot}: {prof['no_hot']}. This launch keeps every expert on the CPU; drop --hot.")
     if a.hot is not None:
         hot = a.hot
     else:

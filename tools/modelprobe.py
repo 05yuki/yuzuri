@@ -182,6 +182,10 @@ def config_summary(cfg):
     if t.get("kv_lora_rank"):
         out["kv_layout"] = "mla"
         out["kv_bytes_per_token_bf16"] = full * (t["kv_lora_rank"] + (t.get("qk_rope_head_dim") or 0)) * 2
+        if t.get("index_topk") and not t.get("learnable_sink"):
+            # a sparse indexer over MLA: SGLang's own default for it is an FP8 store on a card of capability 10
+            # and up, and its bf16 decode kernel has no SM120 build (--kv-dtype bf16 for an older card)
+            out["kv_store"] = "fp8"
     elif t.get("compress_ratios"):
         # DeepSeek V4 style: one latent of head_dim (+ rope) per token and layer, compressed by the layer's ratio
         # (0 = uncompressed); the sliding window adds a share on top. The serve sizes its own hybrid pools
