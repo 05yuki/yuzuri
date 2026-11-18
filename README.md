@@ -87,7 +87,7 @@ Put an unpatched SGLang checkout ahead of it: `PYTHONPATH=<sglang checkout>/pyth
 - It runs DeepSeek-V4.1-Flash-1017 on SGLang + KTransformers, with Yuzuri at a pinned commit.
 - Its SGLang carries five patches, all in the model's own files.
 - Everything else the launch needs comes from Yuzuri's hooks.
-- `setup.sh` builds the venv, `serve.sh` starts the server and `tools/qualify.sh` checks and measures it.
+- Its `setup.sh` builds the venv, its `serve.sh` starts the server and its qualify script checks and measures it.
 - Its README has the numbers of that setup.
 
 ## Install

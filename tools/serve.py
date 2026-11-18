@@ -628,10 +628,11 @@ def main():
             manifest["packages"][n] = None
     with open(os.path.join(run, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
+    pool_nodes = [q["node"] for q in plan["cpu_pools"]]
     lent_note = (f", lent ~{plan['lent_from_empty_pool']}" if kv_lend else
                  f", up to {vals['lent']} more on the empty pool" if vals["lent"] else "")
     print(f"{prof['name']} tp {tp}: hot {hot} per layer (plan {plan['hot_experts_per_layer']}{lent_note}), "
-          f"chunk {chunk}, threads {threads} on nodes {[q["node"] for q in plan["cpu_pools"]]}, context {context}"
+          f"chunk {chunk}, threads {threads} on nodes {pool_nodes}, context {context}"
           + (f" of the model's {plan['model_context']}" if context != plan["model_context"] else "")
           + f" (pool = context), KV {kv_dtype}, static "
           + (f"{mem_fraction} of the card" if mem_fraction is not None else "share of the card left to SGLang"))
