@@ -267,6 +267,8 @@ def main():
     ap.add_argument("--wrap", default="", help="run the server under this command (a profiler: 'nsys launch ...'); "
                                               "server.pid is then the wrapper's")
     ap.add_argument("--background", action="store_true")
+    ap.add_argument("--host-reserve-gb", type=float, help="RAM the server takes beside the experts, GiB (read when the experts do not fit in RAM; default 42)")
+    ap.add_argument("--host-extra-gb", type=float, default=0.0, help="RAM this launch adds to that, GiB (HiCache, a model's own tables)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-plan", action="store_true", help="the prefill lend alone: no KV loan, no chunk per request")
     ap.add_argument("--package", action="store_true",
@@ -376,6 +378,10 @@ def main():
                 "--min-hot", str(prof.get("min_hot", 1)), "--free-min-gb", str(a.free_min_gb if a.free_min_gb is not None else d.get("free_min_gb", 1.0)), "--json"]
     if a.context:
         plan_cmd += ["--context", str(a.context)]
+    if a.host_reserve_gb is not None:
+        plan_cmd += ["--host-reserve-gb", str(a.host_reserve_gb)]
+    if a.host_extra_gb:
+        plan_cmd += ["--host-extra-gb", str(a.host_extra_gb)]
     if prof.get("max_context"):
         plan_cmd += ["--max-context", str(prof["max_context"])]
     if a.gguf:
@@ -571,6 +577,28 @@ def main():
         k, _, v = kv.partition("=")
         env[k] = v
     env = {k: v for k, v in env.items() if v != ""}
+    # the experts do not fit in the RAM this server may use (plan-launch.py): kt-kernel keeps a cache of them and
+    # reads the rest from the checkpoint as they are routed. What can do that is the experts' format's
+    cache_gib = int(plan.get("expert_cache_bytes", 0) // 2**30)
+    if plan.get("expert_cache_bytes"):
+        if "expert-cache" in names_off:
+            raise SystemExit("the experts do not fit in this server's RAM and expert-cache is off: nothing to serve them from")
+        if cache_gib < 1:
+            raise SystemExit(f"the experts do not fit in this server's RAM ({plan['ram_usable'] / 2**30:.0f} GiB) and "
+                             "nothing is left for a cache of them after the server's own share")
+        if method == "MXFP4":
+            if tp != 1:
+                raise SystemExit("the MXFP4 expert cache serves one GPU: --tp 1 (CUDA_VISIBLE_DEVICES picks the card)")
+            env.setdefault("KT_MXFP4_EXPERT_CACHE_GIB", str(cache_gib))
+        elif method == "LLAMAFILE":
+            env.setdefault("KT_GGUF_EXPERT_CACHE_GIB", str(cache_gib))
+            env["KT_GGUF_STREAM_SOURCE"] = "nvme"
+            if plan.get("expert_cache_iq1m_copy"):
+                env.setdefault("KT_GGUF_CACHE_IQ1M_T", "1")
+        else:
+            raise SystemExit(f"the experts do not fit in this server's RAM ({plan['ram_usable'] / 2**30:.0f} GiB) and "
+                             f"kt-kernel has no expert cache for {method}: more RAM, more NUMA nodes, or an MXFP4 or GGUF checkpoint")
+        pools = vals["pools"] = 1
     io_note = io_threads(env, experts_dir, a.cache_dir, [g["numa_node"] for g in ranks])
     cmd = [py]
     for arg in fill(prof["command"], vals):

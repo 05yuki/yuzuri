@@ -60,7 +60,10 @@ FORMAT_ENV = {
     "NVFP4": {"KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1"},
     "BF16": {"KT_GPU_STREAM_GRAPH": "1"},
     "LLAMAFILE": {"KT_GGUF_NOCOPY": "1", "KT_GGUF_ZEROCOPY": "1", "KT_GGUF_STREAM_MMQ": "1",
-                  "KT_GGUF_STREAM_SOURCE": "bank"},
+                  "KT_GGUF_STREAM_SOURCE": "bank",
+                  # kt-kernel's copy of the experts and the ranks' banks are placed by first touch: under SGLang's
+                  # hard bind they all land on rank 0's node, however much the other nodes have free
+                  "SGLANG_NUMA_BIND_V2": "0"},
 }
 # SGLang's MoE runner for the GPU experts of a format (none: SGLang chooses)
 FORMAT_ARGS = {
@@ -159,6 +162,27 @@ def probe(d):
                                      capture_output=True, text=True, check=True).stdout)
 
 
+def _gguf_block(t):
+    """Values in one block of a GGML type: the unit a quantized row can be cut at."""
+    return 1 if t in (0, 1, 30) else 32 if t in (2, 3, 6, 7, 8, 9) else 256
+
+
+def shared_expert_cut(gguf, tp):
+    """A shared expert's down projection whose input width, split over tp ranks, is not whole GGUF blocks:
+    (name, width, block) of the first one, else None. Such a model keeps the shared expert whole on every rank."""
+    if tp < 2:
+        return None
+    sys.path.insert(0, HERE)
+    import modelprobe
+
+    files = sorted(os.path.join(gguf, f) for f in os.listdir(gguf) if f.endswith(".gguf")) if os.path.isdir(gguf) else [gguf]
+    for path in files:
+        for name, _n, t, shape in modelprobe.gguf_tensors(path, dims=True):
+            if "down_shexp" in name and len(shape) == 2 and (shape[0] % tp or shape[0] // tp % _gguf_block(t)):
+                return name, shape[0], _gguf_block(t)
+    return None
+
+
 def build(config_dir, experts_dir=None, gguf=None, tp=2):
     src = gguf or experts_dir or config_dir
     method, why = expert_format(src)
@@ -221,6 +245,11 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
             # (kt_gguf_dense_qwen4exp), so SGLang's check that the card reads pageable memory does not apply
             cmd += ["--ple-offload-embedding", "--ple-offload-backend", "file"]
             env["SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK"] = "1"
+        cut = shared_expert_cut(gguf, tp)
+        if cut:
+            # a GGUF block cannot be cut: the shared expert whole on every rank
+            env["SGLANG_SHARED_EXPERT_TP1"] = "1"
+            note += f"; shared expert whole on every rank ({cut[0]}: {cut[1]} inputs over {tp} ranks are not blocks of {cut[2]})"
     return {
         "name": os.path.basename(config_dir.rstrip("/")),
         "description": f"auto: {c.get('architecture')}, experts {method} ({why}), stream group {group}{note}",

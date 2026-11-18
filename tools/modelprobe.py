@@ -17,9 +17,9 @@ import struct
 import sys
 
 # ggml type -> bits per weight (block bytes * 8 / block size); 42 is Strata's Q2_0 (18 B / 64)
-BPW = {0: 32, 1: 16, 2: 4.5, 3: 5, 6: 5.5, 7: 6, 8: 8.5, 9: 8, 10: 2.625, 11: 3.4375, 12: 4.5, 13: 5.5, 14: 6.5625,
-       15: 8, 16: 2.0625, 17: 2.3125, 18: 3.0625, 19: 1.5625, 20: 4.5, 21: 3.4375, 22: 2.5, 23: 4.25, 24: 8, 25: 16,
-       26: 32, 27: 64, 28: 8, 29: 4.5, 30: 16, 42: 2.25}
+BPW = {0: 32, 1: 16, 2: 4.5, 3: 5, 6: 5.5, 7: 6, 8: 8.5, 9: 9, 10: 2.625, 11: 3.4375, 12: 4.5, 13: 5.5, 14: 6.5625,
+       15: 9.125, 16: 2.0625, 17: 2.3125, 18: 3.0625, 19: 1.5625, 20: 4.5, 21: 3.4375, 22: 2.5625, 23: 4.25, 24: 8, 25: 16,
+       26: 32, 27: 64, 28: 64, 29: 1.75, 30: 16, 42: 2.25}
 TYPE_NAME = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K",
              12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S",
              20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64",
@@ -27,8 +27,9 @@ TYPE_NAME = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: 
 _GGUF_SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 
 
-def gguf_tensors(path):
-    """[(name, n_elements, ggml_type)] from one GGUF file's header."""
+def gguf_tensors(path, dims=False):
+    """[(name, n_elements, ggml_type)] from one GGUF file's header (dims: the tensor's dimensions as a fourth item,
+    GGUF order, the input width first)."""
     with open(path, "rb") as f:
         rd = lambda fmt: struct.unpack("<" + fmt, f.read(struct.calcsize("<" + fmt)))
         magic, version = rd("4sI")
@@ -59,12 +60,12 @@ def gguf_tensors(path):
         for _ in range(n_tensors):
             name = f.read(rd("Q")[0]).decode()
             nd = rd("I")[0]
-            dims = rd("Q" * nd)
+            shape = rd("Q" * nd)
             t, _off = rd("IQ")
             n = 1
-            for d in dims:
+            for d in shape:
                 n *= d
-            out.append((name, n, t))
+            out.append((name, n, t, shape) if dims else (name, n, t))
         return out
 
 

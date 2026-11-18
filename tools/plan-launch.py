@@ -111,24 +111,64 @@ def plan(host, model, a):
     # KT_HOT_KV_LEND: the empty pool's pages carry slots as well (~90% of the pool), given back as the KV grows;
     # the fixed KT_GPU_EXPERTS is the plan minus those (the TP1 default takes them, TP2 measured no gain)
     lent = int(kv * 0.9 // slot // e["moe_layers"]) if e and slot else 0
-    # CPU pools: one node per rank at TP2 (rank i on node i's card), the card's node at TP1
+    # CPU pools: one node per rank at TP2 (rank i on node i's card), the card's node at TP1. Only the nodes this
+    # process may run and allocate on count (numactl -N/-m, a cpuset, a container): a rank whose card's node is
+    # outside them takes the first node inside
+    al = host.get("allowed") or {}
+    usable = [x for x in sorted(host["numa"], key=lambda x: x["node"])
+              if (not al.get("cpus") or set(x["cpus"]) & set(al["cpus"]))
+              and (not al.get("mem_nodes") or x["node"] in al["mem_nodes"])] or list(host["numa"])
+    by_node = {x["node"]: x for x in usable}
     pools = []
     for g in ranks:
-        n = [x for x in host["numa"] if x["node"] == g["numa_node"]]
-        pools.append({"node": g["numa_node"], "threads": max(4, n[0]["physical_cores"] - 2) if n else 0,
-                      "ram_free": n[0]["mem_free"] if n else 0, "page_cache": n[0]["file_pages"] if n else 0})
-    ram_need = e["bytes_total"] + model["ple_bytes"] if e else model["ple_bytes"]
+        x = by_node.get(g["numa_node"]) or usable[0]
+        if x["node"] in {q["node"] for q in pools}:
+            continue
+        pools.append({"node": x["node"], "threads": max(4, x["physical_cores"] - 2),
+                      "ram_free": x["mem_free"], "page_cache": x["file_pages"]})
+    # GGUF experts are in RAM twice when they are all in RAM: kt-kernel's copy of them and the ranks' pinned banks
+    # the streamed prefill reads (measured 11-18: 123 GiB of experts, 131 GiB anonymous + 100 GiB pinned)
+    held_times = 2 if a.gguf else 1
+    ram_need = held_times * e["bytes_total"] + model["ple_bytes"] if e else model["ple_bytes"]
     # the experts' arenas are bound to their pools' nodes: when the ranks' nodes hold less RAM than the experts take
     # (one card on a two-socket machine, 269 GiB of experts against a 251 GiB node: the kernel killed the rank at
-    # 230 GiB, 11-17), the other nodes carry pools as well, in node order, until the experts fit
-    held = lambda: sum(x["mem_total"] for x in host["numa"] if x["node"] in {q["node"] for q in pools}) * 0.9
-    for x in sorted(host["numa"], key=lambda x: x["node"]):
+    # 230 GiB, 11-17), the other usable nodes carry pools as well, in node order, until the experts fit
+    held = lambda: sum(by_node[q["node"]]["mem_total"] for q in pools) * 0.9
+    for x in usable:
         if not e or ram_need <= held():
             break
         if x["node"] not in {q["node"] for q in pools}:
             pools.append({"node": x["node"], "threads": max(4, x["physical_cores"] - 2),
                           "ram_free": x["mem_free"], "page_cache": x["file_pages"]})
             notes.append(f"the experts take {ram_need / GiB:.0f} GiB of RAM, more than the ranks' nodes hold: node {x['node']} carries a CPU pool as well")
+    # the memory this server may take: its usable nodes, under the cgroup's limit when there is one
+    ram_usable = sum(x["mem_total"] for x in usable)
+    if al.get("memory_max"):
+        ram_usable = min(ram_usable, al["memory_max"])
+    # the experts do not fit in it: they stay on the drive and the RAM left after the server's own share is a cache
+    # of them (kt-kernel's expert cache, one CPU pool), the routed ones read from the checkpoint as they are used.
+    # The server's own share: --host-reserve-gb (dense weights' host copies, pinned streamer buffers, host KV,
+    # Python) and what the caller says it adds (--host-extra-gb: HiCache, a model's own tables)
+    cache, repack = 0, False
+    if e and ram_need > ram_usable * 0.9:
+        cache = int(ram_usable - (a.host_reserve_gb + a.host_extra_gb) * GiB)
+        what = ""
+        if a.gguf:
+            # kt-kernel's GGUF cache can keep, beside an IQ1_M tensor's rows, a copy laid out for the CPU decode
+            # (76 bytes a block of 256 values against IQ1_M's 56; the same integer dot products, 2.1x the speed on
+            # Zen 2). On when the cache holds that copy of every IQ1_M expert and the other experts' rows; the cache
+            # is never larger than the rows, the copies and 4 GiB
+            iq1m = model["buckets"]["experts"]["types"].get("IQ1_M", 0)
+            copy = iq1m * 76 / 56
+            repack = bool(copy) and cache >= copy + (e["bytes_total"] - iq1m) + 4 * GiB
+            cache = int(min(cache, e["bytes_total"] + (copy if repack else 0) + 4 * GiB))
+            what = ", with the IQ1_M decode copy" if repack else ""
+        first = max(pools, key=lambda q: q["threads"])
+        pools = [dict(first, threads=sum(q["threads"] for q in pools))]
+        share = min(1.0, cache / e["bytes_total"])
+        notes.append(f"the experts take {ram_need / GiB:.0f} GiB of RAM as this format is served from RAM and this server may use {ram_usable / GiB:.0f}: "
+                     f"an expert cache of {cache / GiB:.0f} GiB{what} ({100 * share:.0f}% of the experts' {e['bytes_total'] / GiB:.0f} GiB)"
+                     + (", the rest read from the drive when routed" if share < 1 else "; the prefill reads them from the drive"))
     threads = sum(p["threads"] for p in pools)
     # the prefill chunk from what stays free after the pool and the hot slots (the lend returns hot VRAM for the
     # prefill, so the scratch may also take the hot slots' share: counted at half)
@@ -139,8 +179,6 @@ def plan(host, model, a):
     for p in pools:
         if p["page_cache"] > 32 * GiB:
             notes.append(f"node {p['node']} holds {p['page_cache'] / GiB:.0f} GiB of page cache: drop it before the launch (another model's files) or the arenas spill to the other node")
-    if ram_need > sum(n["mem_total"] for n in host["numa"]) * 0.9:
-        notes.append(f"experts + PLE need {ram_need / GiB:.0f} GiB of RAM against {sum(n['mem_total'] for n in host['numa']) / GiB:.0f}")
     m = host["memory"]
     if m["swap_total"]:
         notes.append("swap is on: swapoff before a streamed-prefill launch")
@@ -164,7 +202,7 @@ def plan(host, model, a):
             # without the package's pool (kv-vmm, host KV off): the tokens of KV the card itself holds, and SGLang's
             # static share of the card that leaves the graphs and the decode's free memory
             "card_context": max(4096, min(a.context, fit)), "card_fraction": round(budget / vram, 3), "kv_bytes_per_token": kv_tok, "kv_dtype": a.kv_dtype, "mamba_slots": a.mamba_slots, "chunk": chunk,
-            "cpu_pools": pools, "threads": threads, "ram_need_experts_ple": ram_need, "notes": notes}
+            "cpu_pools": pools, "threads": threads, "expert_cache_bytes": cache, "expert_cache_iq1m_copy": repack, "ram_usable": ram_usable, "ram_need_experts_ple": ram_need, "notes": notes}
 
 
 def table(p):
@@ -207,6 +245,9 @@ def main():
     ap.add_argument("--mamba-slots", type=int, default=8)
     ap.add_argument("--embed-host", type=int, default=1)
     ap.add_argument("--draft-bytes", type=float)
+    ap.add_argument("--host-reserve-gb", type=float, default=42.0,
+                    help="RAM the server takes beside the experts, GiB (only read when the experts do not fit in RAM)")
+    ap.add_argument("--host-extra-gb", type=float, default=0.0, help="more RAM the launch takes beside that, GiB")
     ap.add_argument("--host-json")
     ap.add_argument("--model-json")
     ap.add_argument("--env", action="store_true")

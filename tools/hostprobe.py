@@ -59,6 +59,43 @@ def numa_nodes():
     return nodes
 
 
+def allowed():
+    """What this process may use: the CPUs of its affinity, the NUMA nodes its memory may come from (a bind policy
+    as numactl -m sets, else the cpuset's nodes), and its cgroup's memory limit (None: no limit)."""
+    cpus = sorted(os.sched_getaffinity(0))
+    nodes = None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        mode = ctypes.c_int(0)
+        mask = (ctypes.c_ulong * 16)()
+        # get_mempolicy (x86-64: 239, aarch64: 236): MPOL_BIND is 2
+        nr = {"x86_64": 239, "aarch64": 236}.get(os.uname().machine)
+        if nr and libc.syscall(nr, ctypes.byref(mode), mask, ctypes.c_ulong(16 * 8 * ctypes.sizeof(ctypes.c_ulong)),
+                               ctypes.c_void_p(0), ctypes.c_ulong(0)) == 0 and mode.value == 2:
+            bits = 8 * ctypes.sizeof(ctypes.c_ulong)
+            nodes = [i * bits + b for i, w in enumerate(mask) for b in range(bits) if w >> b & 1]
+    except Exception:
+        nodes = None
+    if not nodes:
+        for line in _read("/proc/self/status").splitlines():
+            if line.startswith("Mems_allowed_list:"):
+                nodes = _cpulist(line.split(":", 1)[1].strip())
+    limit = None
+    for line in _read("/proc/self/cgroup").splitlines():
+        if line.startswith("0::"):
+            d = "/sys/fs/cgroup" + line[3:].strip()
+            while d.startswith("/sys/fs/cgroup"):
+                v = _read(os.path.join(d, "memory.max"), "max").strip()
+                if v.isdigit():
+                    limit = int(v) if limit is None else min(limit, int(v))
+                if d == "/sys/fs/cgroup":
+                    break
+                d = os.path.dirname(d)
+    return {"cpus": cpus, "mem_nodes": nodes or [], "memory_max": limit}
+
+
 def cpu_info():
     text = _read("/proc/cpuinfo")
     flags = set()
@@ -144,6 +181,7 @@ def mounts(paths):
 def probe(mount_paths):
     g, gmeta = gpus()
     return {"hostname": os.uname().nodename, "kernel": os.uname().release, "cpu": cpu_info(), "numa": numa_nodes(),
+            "allowed": allowed(),
             "gpus": g, "driver": gmeta.get("driver"), "cuda_toolkit": gmeta.get("cuda_toolkit"),
             "gpu_in_use": gmeta.get("in_use", []), "memory": memory_settings(),
             "load_1m": os.getloadavg()[0], "mounts": mounts(mount_paths)}
