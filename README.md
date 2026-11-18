@@ -80,6 +80,16 @@ Nothing is sized by hand:
 Its SGLang is patched with mechanisms Yuzuri brings itself, so Yuzuri stops on it.
 Put an unpatched SGLang checkout ahead of it: `PYTHONPATH=<sglang checkout>/python`, for `setup.sh` and for the launch.
 
+## Demo recipe
+
+[yuzuri-deepseek-v4.1-flash-1017](https://github.com/05yuki/yuzuri-deepseek-v4.1-flash-1017) is a complete setup built on Yuzuri.
+
+- It runs DeepSeek-V4.1-Flash-1017 on SGLang + KTransformers, with Yuzuri at a pinned commit.
+- Its SGLang carries five patches, all in the model's own files.
+- Everything else the launch needs comes from Yuzuri's hooks.
+- `setup.sh` builds the venv, `serve.sh` starts the server and `tools/qualify.sh` checks and measures it.
+- Its README has the numbers of that setup.
+
 ## Install
 
 ```sh
@@ -349,6 +359,7 @@ These are the SGLang commits it has been launched on, on two RTX 5070 Ti (SM120)
 | `58484246d2` | the DeepSeek-V4.1 recipe's patched tree | 2026-11-04 |
 | `d193c34ae4` | upstream main, no patches | 2026-11-13 |
 | `8c7ec05287` | upstream main with the recipe's tier 0 patches | 2026-11-15 |
+| `8c7ec05287` | upstream main with the [demo recipe](#demo-recipe)'s five model patches | 2026-11-18 |
 
 On another commit, the startup report says which hooks went in.
 
