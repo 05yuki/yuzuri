@@ -632,6 +632,10 @@ def main():
         cmd[cmd.index("--max-running-requests") + 1] = str(a.max_running_requests)
     else:
         cmd += ["--max-running-requests", str(a.max_running_requests)]
+    if a.max_running_requests > 1 and not any("--cuda-graph-bs-decode" in x for x in cmd + a.server_arg):
+        # a decode graph for every number of running requests: SGLang captures a few sizes and pads a batch up
+        # to the next one, and the CPU computes the padding rows' experts too (three requests cost what four do)
+        cmd += ["--cuda-graph-bs-decode"] + [str(n) for n in range(1, a.max_running_requests + 1)]
     for more in a.server_arg:
         cmd += shlex.split(more)
     if a.wrap:

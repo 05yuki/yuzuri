@@ -296,6 +296,7 @@ TP=1:
 - **Concurrent requests.**
   One runs at a time by default.
   `serve.py --max-running-requests 4` runs up to four.
+  The decode graph is then captured for every number of running requests, so no step carries padding rows to the CPU.
   - At the default, a request that arrives while another runs waits in SGLang's queue.
   - With more, the streams decode together.
   - The CPU reads every expert any of them routes to, so streams of the same kind of text gain the most.
