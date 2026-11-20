@@ -478,7 +478,7 @@ def _rows_now(index: int, loc, seq: int = 0) -> None:
             from sglang.srt.layers.moe import kt_prefill_plan as p
 
             rows = int(loc.numel())
-            own = int(p.FIXED + p.ROW * rows + p.SEQ * seq + p.XS * rows * seq)
+            own = int(p.cost(rows, seq))
         except Exception:
             own = 0
         got += max(0, min(cost - got, _room_now(index) - own))
@@ -1173,9 +1173,7 @@ def host_room(index: int, floor: int = 0) -> int:
     w = kt_ledger.window_free(index)
     if w is None:
         return room - swa
-    s = max([int(q[1]) for q in p.MEASURED.get("points", [])] or [0])
-    a = p.ALIGN
-    first = int(p.FIXED + p.ROW * a + p.SEQ * s + p.XS * a * s)
+    first = int(p.cost(p.ALIGN, p.longest()))
     return min(room, int(w) - first - swa - kt_lend.MARGIN)
 
 

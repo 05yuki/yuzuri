@@ -39,6 +39,7 @@ def _cpulist(s):
 def numa_nodes():
     nodes = []
     base = "/sys/devices/system/node"
+    high = watermarks(_read("/proc/zoneinfo"))
     for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
         if not re.fullmatch(r"node\d+", d):
             continue
@@ -55,8 +56,28 @@ def numa_nodes():
                 mem[m.group(1)] = int(m.group(2)) * 1024
         nodes.append({"node": n, "cpus": cpus, "physical_cores": len(cores), "mem_total": mem.get("MemTotal"),
                       "mem_free": mem.get("MemFree"), "file_pages": mem.get("FilePages"),
-                      "anon_huge": mem.get("AnonHugePages")})
+                      "anon_huge": mem.get("AnonHugePages"),
+                      # what a server cannot fill: the zones' high watermarks (below them the kernel reclaims, and a
+                      # node of pinned and shared memory has nothing to give back) and what the kernel itself holds
+                      "watermark_high": high.get(n, 0),
+                      "mem_kernel": max(0, (mem.get("MemTotal") or 0) - (mem.get("MemFree") or 0)
+                                        - (mem.get("FilePages") or 0) - (mem.get("AnonPages") or 0))})
     return nodes
+
+
+def watermarks(zoneinfo, page=None):
+    """/proc/zoneinfo -> {node: bytes under its zones' high watermarks}."""
+    page = page or os.sysconf("SC_PAGE_SIZE")
+    out, node = {}, None
+    for line in zoneinfo.splitlines():
+        m = re.match(r"Node (\d+), zone", line)
+        if m:
+            node = int(m.group(1))
+            continue
+        m = re.match(r"\s+high\s+(\d+)\s*$", line)
+        if m and node is not None:
+            out[node] = out.get(node, 0) + int(m.group(1)) * page
+    return out
 
 
 def allowed():

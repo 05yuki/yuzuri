@@ -151,7 +151,11 @@ def plan(host, model, a):
     # Python) and what the caller says it adds (--host-extra-gb: HiCache, a model's own tables)
     cache, repack = 0, False
     if e and ram_need > ram_usable * 0.9:
-        cache = int(ram_usable - (a.host_reserve_gb + a.host_extra_gb) * GiB)
+        # and what no process can fill: the kernel's own memory on those nodes and their zones' high watermarks.
+        # A cache sized to the last byte leaves the node at its low watermark with nothing reclaimable (shared and
+        # pinned memory, no swap), and the next allocation there is an out-of-memory kill
+        kept = sum(x.get("watermark_high", 0) + x.get("mem_kernel", 0) for x in usable)
+        cache = int(ram_usable - kept - (a.host_reserve_gb + a.host_extra_gb) * GiB)
         what = ""
         if a.gguf:
             # kt-kernel's GGUF cache can keep, beside an IQ1_M tensor's rows, a copy laid out for the CPU decode
@@ -166,7 +170,7 @@ def plan(host, model, a):
         first = max(pools, key=lambda q: q["threads"])
         pools = [dict(first, threads=sum(q["threads"] for q in pools))]
         share = min(1.0, cache / e["bytes_total"])
-        notes.append(f"the experts take {ram_need / GiB:.0f} GiB of RAM as this format is served from RAM and this server may use {ram_usable / GiB:.0f}: "
+        notes.append(f"the experts take {ram_need / GiB:.0f} GiB of RAM as this format is served from RAM and this server may use {(ram_usable - kept) / GiB:.0f}: "
                      f"an expert cache of {cache / GiB:.0f} GiB{what} ({100 * share:.0f}% of the experts' {e['bytes_total'] / GiB:.0f} GiB)"
                      + (", the rest read from the drive when routed" if share < 1 else "; the prefill reads them from the drive"))
     threads = sum(p["threads"] for p in pools)

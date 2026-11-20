@@ -5,12 +5,17 @@ The launch chunk (--chunked-prefill-size) becomes the largest chunk the
 streamer's buffers are sized for; each request then gets the fewest chunks its
 remaining prompt needs and, for that count, the smallest equal chunk.
 
-A chunk of c rows whose forward ends at sequence s needs, above a window's start,
+What a chunk costs is read from what this server's forwards measured (TABLE): for each chunk size, how many bytes
+torch's allocation grew by at each sequence a forward of that size ended at.
 
-  cost(c, s) = FIXED + ROW * c + SEQ * s          (KT_PREFILL_PLAN_COST="FIXED_MiB,ROW_B,SEQ_B,CARRY_MiB",
-                                                   fitted over the lend's per-forward records)
+  a size measured, at a sequence it was measured to   the most a forward of it grew up to that sequence
+  past the sequence it was measured to                the rise the size measured furthest along a sequence had there;
+                                                      past that one's own, the rise into its last third carried on
+  between two sizes                                   the line between them
+  under the smallest size                             its cost a row
+  past the largest size                               its cost a row, or the slope from the size before it if steeper
 
-(+ CARRY for a chunk after the first of a window) and has
+and has
   room = free at the window's start + the free KV pages it borrows - kt_lend.MARGIN.
 The free memory is live: each TP rank's decode free memory now plus the step
 kt_lend measured from decode to a window's start (weights out, scratch in),
@@ -19,7 +24,12 @@ every rank plans the same chunk). Before the first window has measured that
 step, KT_PREFILL_PLAN_FREE_MB stands in. The last chunk of a request is the
 one with the longest sequence, so it is the one checked.
 
-Without KT_PREFILL_PLAN_COST the older model applies: cost = KT_PREFILL_PLAN_ROW_KB * rows.
+A chunk may be twice the largest one measured and no more (online_cap). The table goes to the lend's hint file as
+it grows, and the next launch of the same code starts from it.
+
+With a cost in the environment nothing is measured: KT_PREFILL_PLAN_COST="FIXED_MiB,ROW_B,SEQ_B,CARRY_MiB" is
+cost(c, s) = FIXED + ROW * c + SEQ * s (+ CARRY for a chunk after the first of a window), and
+KT_PREFILL_PLAN_ROW_KB alone is cost = ROW * c.
 """
 import math
 import os
@@ -40,9 +50,9 @@ ENABLED = os.environ.get("KT_PREFILL_PLAN", "0") == "1"
 FREE = int(os.environ.get("KT_PREFILL_PLAN_FREE_MB", "0") or 0) << 20
 ROW_KB = int(os.environ.get("KT_PREFILL_PLAN_ROW_KB", "0") or 0) << 10
 _cost = [x for x in os.environ.get("KT_PREFILL_PLAN_COST", "").split(",") if x]
+# the cost in the environment; measured (ONLINE), ROW is the smallest measured chunk's cost a row
 FIXED, ROW, SEQ = ((int(float(_cost[0]) * (1 << 20)), float(_cost[1]), float(_cost[2]))
                    if len(_cost) >= 3 else (0, float(ROW_KB), 0.0))
-XS = 0.0  # cross term, bytes a row a sequence token
 # what a later chunk of a window holds from the earlier ones (4th field, MiB)
 CARRY = int(float(_cost[3]) * (1 << 20)) if len(_cost) >= 4 else 0
 LIVE = os.environ.get("KT_PREFILL_PLAN_LIVE", "1") == "1"
@@ -53,28 +63,205 @@ ALIGN = int(os.environ.get("KT_PREFILL_PLAN_ALIGN", "1024"))
 _GGUF = bool(os.environ.get("KT_GGUF_V41_DENSE"))
 TAIL_STEPS = int(os.environ.get("KT_PREFILL_PLAN_TAIL_STEPS", "2" if _GGUF else "0"))
 # the chunk this setup is known to take without a plan (the lend's hint): what a
-# request gets while there is no free-memory step to plan with (the first window
-# of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
+# request gets while nothing is measured; unset, the launch chunk
 SAFE = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0)
-# no cost in the environment: measured from the windows this server runs
+# no cost in the environment: measured from the forwards this server runs
 ONLINE = not _cost and ROW_KB == 0
-MEASURED = {"windows": 0, "row": 0.0, "max_rows": 0}
+DEBUG = os.environ.get("KT_PREFILL_PLAN_DEBUG", "")
+
+TABLE = {}  # rows -> [(sequence, bytes grown)] by sequence, one forward size each
+LP_PTS = []  # (rows, sequence, bytes grown, rows with input logprobs): forwards that computed input logprobs
 LP = 0.0  # bytes a row whose input logprobs are computed, past a plain row (vocabulary-wide logits)
+REF = [None]  # the size measured furthest along a sequence, by three forwards or more
+PENDING = []  # forwards closed since the last plan: (rows, sequence, grown, logprob rows)
+SCRATCH = [0]  # bytes the earlier launch's windows left in the scratch: this launch's first window makes its own
+MEASURED = {"windows": 0, "max_rows": 0}
+_CURVE = {}
+POINTS = 32  # forwards kept of one chunk size
+SIZES = 48  # chunk sizes kept
 # rid -> the chunk a request was planned at when the online cap bound it (capped plans)
 CAPPED = {}
 
 
-def _lp_row(lp_pts) -> float:
-    """What a logprob row grew past the plain fit, the largest over the forwards that computed them."""
-    return max([0.0] + [max(0.0, g - FIXED - ROW * r - SEQ * s - XS * r * s) / lp for r, s, g, lp in lp_pts])
+def _at(pts, s):
+    """One measured size at sequence s: the most a forward of it grew up to s, and past its last forward the rise
+    into the last third of its sequence carried on."""
+    # a request's first chunks grow less than its later ones: a window near the start runs more rows
+    v = max([g for q, g in pts if q <= s] or [pts[0][1]])
+    last = pts[-1][0]
+    if s <= last or len(pts) < 3:
+        return v
+    # no rise, and the size costs past its sequence what it cost. Six 22,016-row chunks of a 131K prompt grew 7,282,
+    # 8,601, 8,799, 8,010, 8,784 MiB and a 524K prompt in such chunks stayed there (V4.1 on two cards, 11-18); a
+    # model whose indexer scores every row against the whole prefix keeps rising (V4-Flash-Vision, 11-09)
+    third = (last - pts[0][0]) / 3
+    if third <= 0:
+        return v
+    a = max(g for q, g in pts if q <= last - third)
+    b = max([g for q, g in pts if q > last - third] or [a])
+    return v + max(0.0, b - a) / third * (s - last)
 
 
-# The forwards an earlier launch of this setup measured, carried into this one (kt_lend's hint file,
-# <KT_PREFILL_LEND_HINT>-rank<r>.json "plan"): the first window is then planned from that launch's whole fit, not at
-# the unmeasured chunk and the doublings after it (Qwen3.5: a first 35K prompt in five chunks at 2,919 tok/s, the third
-# in one at 5,019). Every forward of the fit is carried, the runs of equal chunks with them: the sequence term has the
-# evidence it had (only the largest window carried fitted it at half, 11-09). A forward of this launch that grows past
-# what the carried fit says drops them, on every rank, and the launch measures for itself (_drop_carried).
+def _entry(r, s):
+    """What a forward of the measured size r costs at sequence s. Past the sequence it was measured to it rises as
+    the size measured furthest along a sequence (REF) did, a row for a row: V4.1 on one card grows 2.0 to 2.6 GiB
+    over the first 65K tokens of a prompt whatever the chunk, and no more after."""
+    pts = TABLE[r]
+    last, ref = pts[-1][0], REF[0]
+    if s <= last or ref is None or ref == r:
+        return _at(pts, s)
+    rise = max(0.0, _at(TABLE[ref], s) - _at(TABLE[ref], last))
+    return max(g for _, g in pts) + rise * max(1.0, r / ref)
+
+
+def _curve(s):
+    """(rows, cost at sequence s) over the measured sizes; a larger chunk costs no less than a smaller one."""
+    got = _CURVE.get(s)
+    if got is None:
+        if len(_CURVE) > 256:
+            _CURVE.clear()
+        got, top = [], 0.0
+        for r in sorted(TABLE):
+            top = max(top, _entry(r, s))
+            got.append((r, top))
+        _CURVE[s] = got
+    return got
+
+
+def _own(c, s, lpc=0.0):
+    """What a forward of c rows that ends at sequence s costs, lpc more a row for its input logprobs."""
+    if not ONLINE:
+        return FIXED + (ROW + lpc) * c + SEQ * s
+    curve = _curve(s)
+    if not curve:
+        return lpc * c
+    (r0, g0), (rt, gt) = curve[0], curve[-1]
+    if c <= r0:
+        v = g0 * c / r0
+    elif c > rt:
+        # past the largest size measured: its cost a row, or the slope from the size before it where that is
+        # steeper. online_cap keeps the step within twice the largest
+        slope = gt / rt
+        if len(curve) > 1:
+            slope = max(slope, (gt - curve[-2][1]) / (rt - curve[-2][0]))
+        v = gt + slope * (c - rt)
+    else:
+        i = next(k for k, (r, _) in enumerate(curve) if r >= c)
+        (ra, ga), (rb, gb) = curve[i - 1], curve[i]
+        v = ga + (gb - ga) * (c - ra) / (rb - ra)
+    return v + lpc * c
+
+
+cost = _own  # kt_kv_vmm: a forward's own memory
+
+
+def longest() -> int:
+    """The longest sequence a forward was measured at."""
+    return max([pts[-1][0] for pts in TABLE.values()] or [0])
+
+
+def _put(pts, seq, grown) -> None:
+    """One forward into its size's list, by sequence. The list keeps what the cost reads: the first forward, each
+    one that grew more than every one before it, and the last. Over POINTS, the two nearest in what they grew become
+    one, at the earlier's sequence and the later's bytes (the size costs no less at any sequence than it did)."""
+    pts.append((seq, grown))
+    pts.sort()
+    kept, top = [], -1
+    for q, g in pts:
+        if kept and kept[-1][0] == q:
+            kept[-1] = (q, max(g, kept[-1][1]))
+        elif g > top:
+            kept.append((q, g))
+        top = max(top, g)
+    if kept[-1][0] != pts[-1][0]:
+        kept.append(pts[-1])
+    while len(kept) > POINTS:
+        i = min(range(1, len(kept) - 2), key=lambda k: kept[k + 1][1] - kept[k][1])
+        kept[i:i + 2] = [(kept[i][0], kept[i + 1][1])]
+    pts[:] = kept
+
+
+def _refresh() -> None:
+    global ROW, LP
+    _CURVE.clear()
+    REF[0] = max([r for r, pts in TABLE.items() if len(pts) >= 3], key=lambda r: (TABLE[r][-1][0], r), default=None)
+    MEASURED["max_rows"] = max(TABLE or [0])
+    ROW = _own(ALIGN, 0) / ALIGN if TABLE else 0.0
+    # forwards that computed input logprobs are not a plain row's cost: 668-row scored chat pieces grew 1.9 GB
+    # against 0.95 GB for a 1,024-row prefill chunk. They price the logprob rows past the plain cost
+    LP = max([0.0] + [max(0.0, g - _own(r, s)) / lp for r, s, g, lp in LP_PTS]) if TABLE else 0.0
+
+
+def _fold(rows, seq, grown, lp_rows) -> None:
+    MEASURED["windows"] += 1
+    if lp_rows > 0:
+        LP_PTS.append((rows, seq, grown, lp_rows))
+        del LP_PTS[:-64]
+        return
+    _put(TABLE.setdefault(rows, []), seq, grown)
+    while len(TABLE) > SIZES:
+        # the size with the fewest forwards joins the next larger one: more rows cost no less
+        sizes = sorted(TABLE)
+        r = min(sizes[:-1], key=lambda x: (len(TABLE[x]), x))
+        for q, g in TABLE.pop(r):
+            _put(TABLE[sizes[sizes.index(r) + 1]], q, g)
+
+
+def observe_window(rows: int, seq: int, grown: int, alloc: int = 0, window: int = 0, lp_rows: int = 0,
+                   kept: int = 0) -> None:
+    """A closed prefill forward (kt_lend): its rows, the sequence it ended at and how many bytes torch's allocation
+    grew by. It enters the table at the next plan, where every rank has it (_sync).
+
+    kept is what earlier windows left in the scratch, which kt_lend counts in grown and in the free memory alike.
+    The table holds a forward without it, and the plan's free memory is without it too (_free_now): how much a
+    launch keeps depends on its first window (570 MiB after a 12,296-row one, 1,232 MiB after a 22,016-row one), so
+    a table with it in was 662 MiB too high in the next launch (11-19)."""
+    if not ONLINE or rows <= 0:
+        return
+    grown, alloc = max(0, grown - kept), max(0, alloc - kept)
+    if DEBUG == "1":  # each forward the plan learns from
+        print(f"[kt-plan] window {window}: {rows} rows at sequence {seq}, "
+              + (f"{lp_rows} with input logprobs, " if lp_rows > 0 else "")
+              + f"grew {grown >> 20} MiB ({alloc >> 20} MiB allocated)", flush=True)
+    PENDING.append((int(rows), int(seq), max(0, int(grown)), int(lp_rows)))
+
+
+def _reduce(scheduler, values, low=False):
+    """values as their most (least with low) over the TP ranks, on the scheduler's CPU group."""
+    group = getattr(scheduler, "tp_cpu_group", None)
+    if group is None:
+        return list(values)
+    import torch
+
+    if not torch.distributed.is_initialized():
+        return list(values)
+    t = torch.tensor([-v if low else v for v in values], dtype=torch.int64)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
+    return [-v if low else v for v in t.tolist()]
+
+
+def _sync(scheduler) -> None:
+    """The forwards closed since the last plan into the table, each at the most it grew on any rank: every rank
+    reaches chunk_for alike and holds the same table, so every rank plans the same chunk."""
+    n = _reduce(scheduler, [len(PENDING)], low=True)[0]
+    if n <= 0:
+        return
+    grown = _reduce(scheduler, [p[2] for p in PENDING[:n]])
+    for (rows, seq, _, lp_rows), g in zip(PENDING[:n], grown):
+        if g > 0:
+            _fold(rows, seq, g, lp_rows)
+    del PENDING[:n]
+    _refresh()
+    if DEBUG == "1":
+        print(f"[kt-plan] {len(TABLE)} chunk sizes measured, the largest {MEASURED['max_rows']} rows at "
+              f"{int(_own(MEASURED['max_rows'], longest())) >> 20} MiB; along a sequence as the {REF[0]}-row forwards, "
+              f"{LP / 1024:.0f} KiB a logprob row", flush=True)
+
+
+# The table an earlier launch of this setup measured, carried into this one (kt_lend's hint file,
+# <KT_PREFILL_LEND_HINT>-rank<r>.json "plan"): the first window is then planned from it, not at the unmeasured chunk
+# and the doublings after it (Qwen3.5: a first 35K prompt in five chunks at 2,919 tok/s, the third in one at 5,019).
+# This launch's forwards join it: one that grows more than the carried ones raises its size's cost.
 CARRY_HINT = os.environ.get("KT_PREFILL_LEND_HINT", "")
 CARRY_ON = os.environ.get("KT_PREFILL_PLAN_CARRY", "1") == "1"
 
@@ -96,30 +283,54 @@ def _stamp() -> str:
     return MEASURED["stamp"]
 
 
+def scratch_ahead() -> int:
+    """What a launch's first window is expected to leave in the scratch (the earlier launch's did): out of the free
+    memory until this launch has left its own, which the free memory at a window's start then has in it."""
+    from sglang.srt.layers.moe import kt_lend
+
+    return 0 if int(kt_lend.STATE.get("scratch_kept", 0) or 0) > 0 else SCRATCH[0]
+
+
+def _table_out():
+    return {"points": [[r, q, g] for r in sorted(TABLE) for q, g in TABLE[r]], "lp_points": [list(p) for p in LP_PTS]}
+
+
+def _table_in(rec) -> None:
+    for r, q, g in rec.get("points", []):
+        _put(TABLE.setdefault(int(r), []), int(q), int(g))
+    LP_PTS[:] = [tuple(int(v) for v in p) for p in rec.get("lp_points", []) if len(p) == 4][-64:]
+    _refresh()
+
+
 def record():
-    """The fit's forwards for the next launch (kt_lend._write_hint), the carried ones that still stand with them;
-    None until two chunk sizes are measured."""
-    pts = MEASURED.get("points") or []
-    if not ONLINE or not MEASURED.get("fitted") or len({p[0] for p in pts}) < 2:
+    """The table for the next launch (kt_lend writes it to the hint file); None until two chunk sizes are measured."""
+    if not ONLINE or len(TABLE) < 2:
         return None
-    import torch
+    rec = dict(_table_out(), stamp=_stamp(), rev=MEASURED["windows"], start=None)
+    try:
+        import torch
 
-    from sglang.srt.layers.moe import kt_ledger
+        from sglang.srt.layers.moe import kt_ledger
 
-    return {"stamp": _stamp(), "points": [list(p) for p in pts],
-            "lp_points": [list(p) for p in MEASURED.get("lp_points", [])],
-            # the free memory a window starts with is the ledger's, known once a start has been measured
-            "start": kt_ledger.carry_out(torch.cuda.current_device())}
+        # the free memory a window starts with is the ledger's, known once a start has been measured
+        rec["start"] = kt_ledger.carry_out(torch.cuda.current_device())
+        from sglang.srt.layers.moe import kt_lend
+
+        rec["scratch"] = int(kt_lend.STATE.get("scratch_kept", 0) or 0) or SCRATCH[0]
+    except Exception as e:
+        _say_once("prefill plan: the ledger's start was not recorded", e)
+    return rec
 
 
-def _carry_in() -> None:
-    """Once, at the first plan of a launch: the earlier launch's forwards as this one's first points."""
-    global FIXED, ROW, SEQ, LP
+def _carry_in(scheduler) -> None:
+    """Once, at the first plan of a launch: the earlier launch's table as this one's. Every rank must hold the same
+    one, or none is carried."""
     if MEASURED.get("carry_tried"):
         return
     MEASURED["carry_tried"] = True
-    if not (ONLINE and CARRY_ON and CARRY_HINT) or MEASURED.get("points"):
+    if not (ONLINE and CARRY_ON and CARRY_HINT) or TABLE:
         return
+    rec = {}
     try:
         import json
 
@@ -128,172 +339,33 @@ def _carry_in() -> None:
         with open(f"{CARRY_HINT}-rank{kt_lend._rank()}.json") as f:
             rec = json.load(f).get("plan") or {}
     except Exception:
+        pass
+    pts = [p for p in rec.get("points", []) if len(p) == 3]
+    ok = rec.get("stamp") == _stamp() and len({p[0] for p in pts}) >= 2
+    if rec and not ok:
+        print("[kt-plan] an earlier launch's forwards are not carried: "
+              + ("the package changed since" if rec.get("stamp") != _stamp() else "one chunk size only"), flush=True)
+    import zlib
+
+    mark = zlib.crc32(repr(sorted(map(tuple, pts))).encode()) if ok else 0
+    if _reduce(scheduler, [mark]) != _reduce(scheduler, [mark], low=True):
+        print("[kt-plan] an earlier launch's forwards are not carried: the ranks' hint files differ", flush=True)
         return
-    pts = [tuple(float(v) if i != 4 else int(v) for i, v in enumerate(p)) for p in rec.get("points", []) if len(p) == 6]
-    if rec.get("stamp") != _stamp() or len({p[0] for p in pts}) < 2:
-        if rec:
-            print("[kt-plan] an earlier launch's forwards are not carried: "
-                  + ("the package changed since" if rec.get("stamp") != _stamp() else "one chunk size only"), flush=True)
+    if not ok:
         return
-    MEASURED["points"] = pts[-64:]
-    MEASURED["lp_points"] = [tuple(float(v) for v in p) for p in rec.get("lp_points", []) if len(p) == 4][-64:]
-    MEASURED["carried"] = len(MEASURED["points"])
-    MEASURED["own"] = 0
-    MEASURED["windows"] = len(pts)
-    MEASURED["max_rows"] = int(max(p[0] for p in pts))
-    FIXED, ROW, SEQ = _fit(MEASURED["points"])
-    MEASURED["row"] = ROW
-    MEASURED["fitted"] = True
-    LP = _lp_row(MEASURED["lp_points"]) if MEASURED["lp_points"] else 0.0
+    _table_in({"points": pts, "lp_points": rec.get("lp_points", [])})
+    MEASURED["carried"] = len(pts)
+    SCRATCH[0] = max(0, int(rec.get("scratch", 0) or 0))
     try:
         import torch
 
         from sglang.srt.layers.moe import kt_ledger
 
         kt_ledger.carry_in(torch.cuda.current_device(), rec.get("start"))
-    except Exception:
-        pass
-    print(f"[kt-plan] {len(pts)} forwards carried from an earlier launch (up to {MEASURED['max_rows']} rows): fixed "
-          f"{FIXED >> 20} MiB, {ROW / 1024:.1f} KiB a row, {SEQ:.1f} B a sequence token, {XS * 1e3:.2f} mB a row a "
-          f"sequence token ({SEQ_WHY})", flush=True)
-
-
-def _drop_carried(why: str = "") -> None:
-    """The carried forwards leave the fit: this launch's own stand alone, and the envelope doubles from the largest
-    of them (online_cap), as on a launch with nothing carried."""
-    global FIXED, ROW, SEQ, LP, XS
-    if not MEASURED.get("carried"):
-        return
-    own = int(MEASURED.get("own", 0))
-    pts = MEASURED.get("points", [])
-    pts[:] = pts[len(pts) - own:] if own > 0 else []
-    lp = MEASURED.get("lp_points", [])
-    own_lp = int(MEASURED.get("own_lp", 0))
-    lp[:] = lp[len(lp) - own_lp:] if own_lp > 0 else []
-    MEASURED["carried"] = 0
-    MEASURED["dropped"] = True
-    MEASURED["windows"] = len(pts)
-    MEASURED["max_rows"] = int(max([p[0] for p in pts] or [0]))
-    if pts:
-        FIXED, ROW, SEQ = _fit(pts)
-        MEASURED["fitted"] = len({p[0] for p in pts}) >= 2 and ROW < max(p[2] / p[0] for p in pts)
-    else:
-        FIXED, ROW, SEQ, XS = 0, 0.0, 0.0, 0.0
-        MEASURED["fitted"] = False
-    MEASURED["row"] = ROW
-    LP = _lp_row(lp) if lp and pts else 0.0
-    print(f"[kt-plan] the carried forwards dropped{': ' + why if why else ''}; {len(pts)} of this launch stand, "
-          f"the largest {MEASURED['max_rows']} rows", flush=True)
-
-
-def observe_window(rows: int, seq: int, grown: int, alloc: int = 0, window: int = 0, lp_rows: int = 0) -> None:
-    """A closed prefill window (kt_lend.end_window): its rows and how many bytes torch's allocation grew
-    by. Under ONLINE the plan's cost a row is the largest growth a row seen; the fixed and sequence
-    terms stay 0 and the margin covers them. A window may grow to twice the largest one closed so far:
-    what a longer sequence costs a row (an indexer scored over the prefix) enters the envelope one
-    doubling at a time instead of one extrapolation (a 4096-row first window planned a 1M-context Vision
-    into an OOM at once, 11-05)."""
-    global FIXED, ROW, SEQ, LP
-    if not ONLINE or rows <= 0 or grown <= 0:
-        return
-    if MEASURED.get("carried") and lp_rows <= 0:
-        said = FIXED + ROW * rows + SEQ * seq + XS * rows * seq
-        if grown > said + max(SEQ_TOL, 0.02 * said):
-            MEASURED["drop"] = (f"{rows} rows at sequence {seq} grew {grown >> 20} MiB, the carried fit said "
-                                f"{int(said) >> 20} MiB")
-    MEASURED["windows"] += 1
-    MEASURED["max_rows"] = max(MEASURED["max_rows"], rows)
-    if MEASURED.get("carried"):
-        MEASURED["own_lp" if lp_rows > 0 else "own"] = min(64, int(MEASURED.get("own_lp" if lp_rows > 0 else "own", 0)) + 1)
-    if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1" and lp_rows > 0:
-        print(f"[kt-plan] window {window}: {rows} rows at sequence {seq}, {lp_rows} with input logprobs, grew "
-              f"{grown >> 20} MiB ({alloc >> 20} MiB allocated)", flush=True)
-    # forwards that computed input logprobs are not a plain row's cost: 668-row scored chat pieces
-    # grew 1.9 GB against 0.95 GB for a 1024-row prefill chunk, and a 35K prompt after them was planned at 2.9 MB a
-    # row, 1024-row chunks. They price the logprob rows on top of the plain fit; until a plain forward is
-    # seen they stand in for it, as before
-    if lp_rows > 0:
-        lp_pts = MEASURED.setdefault("lp_points", [])
-        lp_pts.append((float(rows), float(seq), float(grown), float(lp_rows)))
-        del lp_pts[:-64]
-        if MEASURED.get("points"):
-            LP = _lp_row(lp_pts)
-            return
-    pts = MEASURED.setdefault("points", [])
-    pts.append((float(rows), float(seq), float(grown), float(alloc), int(window), float(lp_rows)))
-    del pts[:-64]
-    if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":  # each forward the fit learns from
-        print(f"[kt-plan] window {window}: {rows} rows at sequence {seq}, grew {grown >> 20} MiB "
-              f"({alloc >> 20} MiB allocated)", flush=True)
-    fixed, row, sq = _fit(pts)
-    # per forward. A fit stands once the points hold two sizes.
-    MEASURED["fitted"] = MEASURED.get("fitted", False) or (
-        len({p[0] for p in pts}) >= 2 and row < max(p[2] / p[0] for p in pts))
-    if lp_rows <= 0 and MEASURED.get("lp_points") and all(len(p) > 5 and p[5] > 0 for p in pts[:-1]):
-        # the first plain forward: the logprob forwards that stood in for it leave the plain fit
-        pts[:] = pts[-1:]
-        fixed, row, sq = _fit(pts)
-    if (fixed, row, sq) != (FIXED, ROW, SEQ):
-        FIXED, ROW, SEQ = fixed, row, sq
-        MEASURED["row"] = row
-    if lp_rows <= 0 and MEASURED.get("lp_points"):
-        LP = _lp_row(MEASURED["lp_points"])
-        print(f"[kt-plan] cost from {len(pts)} windows: fixed {fixed >> 20} MiB, {row / 1024:.1f} KiB a row, "
-              f"{sq:.1f} B a sequence token, {XS * 1e3:.2f} mB a row a sequence token ({SEQ_WHY})", flush=True)
-
-
-def _fit(pts):
-    """the fit. FIXED + ROW * rows + SEQ * seq by least squares over the closed windows,
-    then FIXED raised until no window grew more than the line says (an envelope from above). One window, or
-    windows of one size, cannot separate the parts: all of the growth is then a row's, as before. A negative
-    sequence term is dropped, a row term that is not positive falls back to the largest growth a row."""
-    import torch
-
-    worst = max(g / r for r, _, g in pts)
-    if len({r for r, _, _ in pts}) < 2:
-        return 0, worst, 0.0
-    A = torch.tensor([[1.0, r, s] for r, s, _ in pts], dtype=torch.float64)
-    y = torch.tensor([g for _, _, g in pts], dtype=torch.float64)
-    row = sq = None
-    if len({s for _, s, _ in pts}) >= 2 and len(pts) >= 3:
-        sol = torch.linalg.lstsq(A, y.unsqueeze(1)).solution.squeeze(1)
-        if float(sol[1]) > 0 and float(sol[2]) >= 0:
-            row, sq = float(sol[1]), float(sol[2])
-    if row is None:
-        sol = torch.linalg.lstsq(A[:, :2], y.unsqueeze(1)).solution.squeeze(1)
-        row, sq = float(sol[1]), 0.0
-    if row <= 0:
-        return 0, worst, 0.0
-    fixed = max(0.0, max(g - row * r - sq * s for r, s, g in pts))
-    return int(fixed), row, sq
-
-
-def _sync_measured(scheduler) -> None:
-    """The online cost terms as their maximum over the TP ranks (every rank reaches chunk_for alike)."""
-    global FIXED, ROW, SEQ, XS, LP
-    import torch
-
-    group = getattr(scheduler, "tp_cpu_group", None)
-    if group is None or not torch.distributed.is_initialized():
-        return
-    def terms():
-        return torch.tensor([float(FIXED), float(ROW), float(SEQ), float(bool(MEASURED.get("fitted"))),
-                             float(MEASURED["max_rows"]), float(MEASURED["windows"]), float(XS), float(LP),
-                             float(bool(MEASURED.get("drop")))], dtype=torch.float64)
-
-    t = terms()
-    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
-    if t[8] > 0:
-        # a rank's forward outgrew the carried fit: every rank drops the carried forwards, then the terms again
-        _drop_carried(MEASURED.pop("drop", None) or "another rank's forward outgrew the carried fit")
-        t = terms()
-        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
-    FIXED, ROW, SEQ = int(t[0]), float(t[1]), float(t[2])
-    MEASURED["fitted"] = bool(t[3] > 0)
-    MEASURED["max_rows"] = int(t[4])
-    MEASURED["windows"] = int(t[5])
-    XS = float(t[6])
-    LP = float(t[7])
+    except Exception as e:
+        _say_once("prefill plan: the ledger's start was not carried", e)
+    print(f"[kt-plan] {len(pts)} forwards carried from an earlier launch: {len(TABLE)} chunk sizes up to "
+          f"{MEASURED['max_rows']} rows at {int(_own(MEASURED['max_rows'], longest())) >> 20} MiB", flush=True)
 
 
 def _lp_cost(req) -> float:
@@ -306,10 +378,9 @@ def _lp_cost(req) -> float:
 
 
 def online_cap(chunk: int) -> int:
-    """The chunk the online envelope allows now: twice the largest closed window. This launch's only: seeded with an
-    earlier launch's largest window, the first prompts ran in fewer, larger windows, the sequence term was fitted
-    from them at half its size, and a 131K prompt on DeepSeek V4-Flash-Vision outgrew its windows and stopped the
-    server (11-09)."""
+    """The chunk the table allows now: twice the largest forward measured. What a larger chunk costs enters the
+    table one doubling at a time instead of one extrapolation (a 4,096-row first window planned a 1M-context Vision
+    into an OOM at once, 11-05)."""
     if not ONLINE or MEASURED["max_rows"] <= 0:
         return chunk
     return max(ALIGN, min(chunk, 2 * MEASURED["max_rows"]))
@@ -349,7 +420,7 @@ def _margin() -> int:
 
 
 def _ready() -> bool:
-    return ENABLED and ROW > 0 and (FREE > 0 or LIVE)
+    return ENABLED and (FREE > 0 or LIVE) and (bool(TABLE) if ONLINE else ROW > 0)
 
 
 # KT_PREFILL_KV_LEND_FORCE=1: every window lends whatever the plan says (for checks
@@ -374,6 +445,9 @@ WIN = {}
 WIN_BASE = {}  # rid -> (WANT, SHORT) as the plan set them: a window whose chunk costs more raises them by it
 ISSUED = {}  # rid -> the largest chunk a window of the request was given (chunk_in_flight)
 WIN_SAID = {}
+# rid -> the longest sequence measured when the request was planned, where its end lay past it: the plan priced its
+# chunk on a rise carried on from the forwards before, and is made again as forwards further along come in
+AHEAD = {}
 
 
 STEP = [ALIGN]  # the step the chunks even out in: the scheduler's page once a plan has read it
@@ -424,14 +498,11 @@ def _window_chunk(req, rem: int, done: int, cap: int, scheduler=None) -> int:
             e = None
     else:
         budget, carry, lpc = w
-        top = int(MEASURED.get("max_rows", 0) or 0) if ONLINE else 0
         spare = int(e[0]) if e else 0
         bound = getattr(kt_kv_vmm, "prompt_rows_bound", None) if e else None
 
         def cost(x: int) -> float:
-            past = max(0, x - top) if top > 0 else 0  # as the plan counts them (fits)
-            s = done + min(x, rem)
-            return FIXED + carry + (ROW + lpc) * (x + past) + SEQ * s + XS * (x + past) * s
+            return carry + _own(x, done + min(x, rem), lpc)
 
         # the rows the largest window would bring, the most over the ranks: a window holds back no more than that.
         # The bound of the tensors' shapes alone kept some 700 MiB out of every window for rows of 0 to 192 MiB
@@ -459,7 +530,7 @@ def _window_chunk(req, rem: int, done: int, cap: int, scheduler=None) -> int:
                 c -= ALIGN
             c = _no_tail(c, rem)
             over = max(0, int(cost(c) - budget))
-            if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
+            if DEBUG == "1":
                 print(f"[kt-plan] window rows for {str(rid)[:8]}: {need >> 20} MiB of {spare >> 20} MiB set aside "
                       f"(the largest window's {most >> 20}), chunk {c} against the plan's {base}, {over >> 20} MiB past "
                       f"its cost", flush=True)
@@ -566,18 +637,6 @@ def window_want(fb):
     return most
 
 
-def kept_share(fb, kept: int) -> int:
-    """kt_lend._hot_topup: the part of the scratch earlier windows grew (kept, mapped at every start since) that the
-    cost of this window's chunk counts. The largest chunk measured grew it, and a forward's cost was recorded with
-    the scratch it needed, so a smaller chunk's cost holds its rows' share of it and no more: a 2,048-row chunk
-    planned at 1.2 GiB over 1.92 GiB kept left the forward 0.15 GiB (11-11)."""
-    rows = max((int(PLAN.get(r, 0) or 0) for r in (getattr(fb, "rids", None) or [])), default=0)
-    most = int(MEASURED.get("max_rows", 0) or 0) if ONLINE else 0
-    if kept <= 0 or rows <= 0 or most <= 0 or rows >= most:
-        return max(0, int(kept))
-    return int(kept) * rows // most
-
-
 def _remaining(req):
     """(tokens to prefill, tokens already in the cache) for the request."""
     total = len(getattr(req, "origin_input_ids", None) or []) + len(getattr(req, "output_ids", None) or [])
@@ -594,14 +653,14 @@ def _free_now(scheduler) -> int:
     from sglang.srt.layers.moe import kt_lend
 
     # the ledger's free memory alone: in decode at the next window's start, in a window for its
-    # chunks, with what earlier windows kept in the scratch added back (the start maps it, and the forwards' fitted
-    # cost includes it). The decode-to-window step (pf_delta, or KT_PREFILL_PLAN_DELTA_MB from an earlier launch),
+    # chunks. What earlier windows kept in the scratch is mapped by then and not in it, as it is not in a forward's
+    # cost; before this launch's first window has left any, what the earlier launch's left comes out (scratch_ahead). The decode-to-window step (pf_delta, or KT_PREFILL_PLAN_DELTA_MB from an earlier launch),
     # the in-window reading and the hot lend's spare are the ledger's holders now. Before a window start has been
     # measured: the constant (FREE)
     from sglang.srt.layers.moe import kt_ledger
 
     led = kt_ledger.window_free(torch.cuda.current_device())
-    mine = -1 if led is None else led + int(kt_lend.STATE.get("scratch_kept", 0) or 0)
+    mine = -1 if led is None else max(0, int(led) - scratch_ahead())
     t = torch.tensor([mine], dtype=torch.int64)
     group = getattr(scheduler, "tp_cpu_group", None)
     if group is not None and torch.distributed.is_initialized():
@@ -624,12 +683,25 @@ def _max_over_ranks(scheduler, v: int) -> int:
     return int(t.item())
 
 
+def rid_ahead(rid, rem: int) -> bool:
+    """Whether a planned request is planned again at this chunk: its plan priced the prompt's end past every forward
+    measured, forwards further along have come in since, and more than one chunk is left. A 131K prompt after a
+    65K one was planned from three 16,384-row forwards up to sequence 49,152, whose rise carried on to 131,072 made
+    a 1,024-row chunk cost 10.3 GiB: 43 chunks of 3,072 rows, 192 s against 63 s. The fourth forward, at 65,536,
+    came in after the plan and grew less than the third (V4.1 on two cards, 11-20)."""
+    at = AHEAD.get(rid)
+    if at is None or rem <= int(PLAN.get(rid, 0)) or longest() <= at:
+        return False
+    AHEAD[rid] = longest()
+    return True
+
+
 def chunk_for(scheduler, chunk: int) -> int:
     """Scheduler.get_new_batch_prefill: the chunk for the batch it is about to make."""
     from sglang.srt.layers.moe import kt_kv_prefill_lend
 
     getattr(kt_kv_prefill_lend, "bind_tree", lambda s: None)(scheduler)
-    if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "2":
+    if DEBUG == "2":
         q = getattr(scheduler, "waiting_queue", None)
         print(f"[kt-plan] chunk_for({chunk}): chunked {scheduler.chunked_req is not None}, queue {type(q).__name__} "
               f"of {len(q) if q is not None else None}, ready {_ready()}, windows {MEASURED['windows']}, row {ROW}",
@@ -637,7 +709,7 @@ def chunk_for(scheduler, chunk: int) -> int:
     if not chunk or chunk <= 0:
         return chunk
     # the first window reaches the planner before anything is measured
-    if not _ready() and not (ENABLED and ONLINE and MEASURED["windows"] == 0):
+    if not ENABLED or not (ONLINE or _ready()):
         return chunk
     req = scheduler.chunked_req
     if req is None:
@@ -662,7 +734,7 @@ def chunk_for(scheduler, chunk: int) -> int:
         except Exception as e:
             _say_once("prefill plan: the cached prefix of a waiting request was not matched", e)
     rem, done = _remaining(req)
-    if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1" and (rem > 2048 or done > 2048):
+    if DEBUG == "1" and (rem > 2048 or done > 2048):
         print(f"[kt-plan] chunk_for {str(req.rid)[:8]}: {'a later chunk' if req is scheduler.chunked_req else 'queued'}"
               f", {rem} to prefill after {done}, planned {req.rid in PLAN}, rows up {req.rid in ROWS_UP}, "
               f"stream from {_stream_from()}", flush=True)
@@ -672,36 +744,32 @@ def chunk_for(scheduler, chunk: int) -> int:
     if rem <= 0:
         return chunk
     if ONLINE:
-        _carry_in()
-        _sync_measured(scheduler)  # same on every rank
-        if MEASURED.get("drop"):  # one rank, no group to tell
-            _drop_carried(MEASURED.pop("drop"))
-    if ONLINE and MEASURED["windows"] == 0:
-        # nothing measured yet: the lend's own chunk, the first window measures
-        MEASURED["blind"] = min(chunk, SAFE) if SAFE > 0 else chunk
-        if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
-            print(f"[kt-plan] first window allowed {MEASURED['blind']} rows unmeasured", flush=True)
-        return MEASURED["blind"]
+        _carry_in(scheduler)
+        _sync(scheduler)  # same on every rank
+    if ONLINE and not TABLE:
+        # no plain forward measured yet (none at all, or only ones with input logprobs): the lend's own chunk
+        blind = min(chunk, SAFE) if SAFE > 0 else chunk
+        if DEBUG == "1":
+            print(f"[kt-plan] first window allowed {blind} rows unmeasured", flush=True)
+        return blind
     if not _ready():
         return chunk
-    if (ONLINE and _lp_cost(req) == 0
-            and all(len(p) > 5 and p[5] > 0 for p in MEASURED.get("points", []))):
-        # only forwards with input logprobs measured: a plain prompt's first window is as unmeasured as a fresh
-        # server's, and its chunks get what that one's did
-        return MEASURED.get("blind") or (min(chunk, SAFE) if SAFE > 0 else chunk)
     capped_at = online_cap(chunk)
     capped = capped_at < chunk
     chunk = capped_at
-    if (req is scheduler.chunked_req and req.rid in PLAN and not (ONLINE and not MEASURED.get("fitted"))
-            and CAPPED.get(req.rid) != PLAN[req.rid]):
+    if req is scheduler.chunked_req and req.rid in PLAN and CAPPED.get(req.rid) != PLAN[req.rid]:
         # a later chunk keeps the request's plan: with the overlap scheduler this
         # runs while the previous chunk's forward still holds its activations, so
         # the live free memory would be low by them
-        return _window_chunk(req, rem, done, chunk, scheduler)
+        again = rid_ahead(req.rid, rem)
+        if not again:
+            return _window_chunk(req, rem, done, chunk, scheduler)
+    else:
+        again = False
     from sglang.srt.layers.moe import kt_kv_prefill_lend
 
     free = _free_now(scheduler)
-    if free <= 0 and os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
+    if free <= 0 and DEBUG == "1":
         print(f"[kt-plan] chunk_for {str(req.rid)[:8]}: no free memory read ({free}), unplanned", flush=True)
     if free <= 0:
         return min(chunk, SAFE) if SAFE > 0 else chunk
@@ -730,11 +798,11 @@ def chunk_for(scheduler, chunk: int) -> int:
             rem, getattr(req, "prefix_indices", None)))
         # what the rows of prompts no request reads give back as these come in (the least over the ranks)
         idle = max(0, -_max_over_ranks(scheduler, -getattr(kt_kv_vmm, "prompt_rows_idle", lambda: 0)()))
-        kv_need = max(0, min(kv_need, int(room + idle - (FIXED + (ROW + _lp_cost(req)) * ALIGN))))
-        if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
+        kv_need = max(0, min(kv_need, int(room + idle - _own(ALIGN, done + rem, _lp_cost(req)))))
+        if DEBUG == "1":
             print(f"[kt-plan] rows for {req.rid[:8]}: asked {kv_asked >> 20} MiB, room {int(room) >> 20} MiB = free "
                   f"{int(free) >> 20} + loan {int(loan) >> 20} - margin {_margin() >> 20} - on demand {int(back) >> 20}"
-                  f", smallest chunk {int(FIXED + (ROW + _lp_cost(req)) * ALIGN) >> 20}, dec_free "
+                  f", smallest chunk {int(_own(ALIGN, done + rem, _lp_cost(req))) >> 20}, dec_free "
                   f"{int(kt_lend.STATE.get('dec_free', 0) or 0) >> 20}, rows in window "
                   f"{int(kt_lend.STATE.get('rows_in_window', 0) or 0) >> 20}", flush=True)
         if kv_need and kt_lend.STATE.get("phase") == "prefill":
@@ -775,14 +843,7 @@ def chunk_for(scheduler, chunk: int) -> int:
     def fits(c: int, n: int) -> bool:
         """The last chunk ends at the longest sequence and, when there is more than
         one, carries what the earlier ones left: it is the one that must fit."""
-        carry = CARRY if n > 1 else 0
-        # the rows past the largest forward measured count twice: the fit is a line through smaller forwards, and
-        # what it misses there is not in its envelope. a 131K calibration prompt went from 22,528-row
-        # forwards to 32,768 at 5,218 MiB of a 5,526 MiB room and ran the card out in its second chunk (11-11);
-        # counted twice it takes 27,648, and the next step up is planned from a forward of that size
-        past = max(0, c - MEASURED["max_rows"]) if ONLINE and MEASURED["max_rows"] > 0 else 0
-        return (FIXED + carry + (ROW + lpc) * (c + past) + SEQ * (done + rem) + XS * (c + past) * (done + rem)
-                + swa_cost(c) <= room)
+        return (CARRY if n > 1 else 0) + _own(c, done + rem, lpc) + swa_cost(c) <= room
 
     # the fewest chunks whose equal size, in whole ALIGN steps, fits (the step
     # rounds a chunk up: 35,000 in three is 11,667 rows, 12,288 once aligned)
@@ -811,10 +872,16 @@ def chunk_for(scheduler, chunk: int) -> int:
                                                                         "page_size", 0) or 1))
     if n > 1:
         c = min(c, _even(rem, n))
+    if again:
+        # only a larger chunk replaces the plan's: the plan was the careful one
+        if c <= PLAN[req.rid]:
+            return _window_chunk(req, rem, done, chunk, scheduler)
+        print(f"[kt-prefill-plan] {rem} tokens left of a prompt planned in chunks of {PLAN[req.rid]}: forwards "
+              f"measured to sequence {longest()} since, planned again", flush=True)
     if swa is not None and swa[1] > 0:
         # the SWA tokens the room holds past the chunk's own cost, at least the chunk's rows
         # held at once plus the window and two pages (sglang's need for it)
-        own = FIXED + (CARRY if n > 1 else 0) + (ROW + lpc) * c + SEQ * (done + rem) + XS * c * (done + rem)
+        own = (CARRY if n > 1 else 0) + _own(c, done + rem, lpc)
         held = c if rem <= c else c * max(1, int(swa[3]))
         win = int(getattr(getattr(scheduler, "tree_cache", None), "sliding_window_size", 0) or 0)
         ps = int(getattr(kt_kv_prefill_lend, "SWA", {}).get("ps", 1) or 1)
@@ -829,7 +896,7 @@ def chunk_for(scheduler, chunk: int) -> int:
         if kv_later > 0 and n > 1:
             ROWS_LATER[req.rid] = [kv_later, 2]
             free -= kv_later
-        if os.environ.get("KT_PREFILL_PLAN_DEBUG") == "1":
+        if DEBUG == "1":
             print(f"[kt-plan] rows for {req.rid[:8]}: phase {kt_lend.STATE.get('phase')}, rem {rem}, "
                   f"set aside {kv_need >> 20} MiB, chunk {c}", flush=True)
         if kv_need > 0:
@@ -851,14 +918,18 @@ def chunk_for(scheduler, chunk: int) -> int:
         WIN_BASE.clear()
         ISSUED.clear()
         WIN_SAID.clear()
+        AHEAD.clear()
     PLAN[req.rid] = c
-    ISSUED.pop(req.rid, None)
+    if done + rem > longest():
+        AHEAD[req.rid] = longest()
+    else:
+        AHEAD.pop(req.rid, None)
+    if not again:
+        ISSUED.pop(req.rid, None)
     WIN_BASE.pop(req.rid, None)
     WIN_SAID.pop(req.rid, None)
     if swa is None and n > 1:
-        _past = max(0, c - MEASURED["max_rows"]) if ONLINE and MEASURED["max_rows"] > 0 else 0
-        WIN[req.rid] = (FIXED + CARRY + (ROW + lpc) * (c + _past) + SEQ * (done + rem)
-                        + XS * (c + _past) * (done + rem), CARRY, lpc)
+        WIN[req.rid] = (CARRY + _own(c, done + rem, lpc), CARRY, lpc)
     else:
         WIN.pop(req.rid, None)
     if capped and c >= chunk:
@@ -867,8 +938,7 @@ def chunk_for(scheduler, chunk: int) -> int:
         CAPPED.pop(req.rid, None)
     # the loan when the estimate needs it, and always past the lend's own chunk:
     # there the estimate is extrapolated, and lending costs a few tens of ms
-    short = (FIXED + (CARRY if n > 1 else 0) + (ROW + lpc) * c + SEQ * (done + rem) + XS * c * (done + rem)
-             + swa_cost(c) + _margin() + back - free)
+    short = (CARRY if n > 1 else 0) + _own(c, done + rem, lpc) + swa_cost(c) + _margin() + back - free
     # past the largest window measured the cost is extrapolated: the loan is taken whole there (before anything is
     # measured, past the lend's own chunk)
     measured = int(MEASURED.get("max_rows", 0) or 0) if ONLINE else 0
@@ -882,138 +952,10 @@ def chunk_for(scheduler, chunk: int) -> int:
     if plan != STATS["last"]:
         STATS["last"] = plan
         print(f"[kt-prefill-plan] {rem} tokens to prefill after {done} cached: {n} chunk(s) of {c} "
-              f"(free {free >> 20} MiB + loan {loan >> 20} MiB, fixed {FIXED >> 20} MiB, "
-              f"{ROW / 1024:.0f} KiB a row, {SEQ:.0f} B a sequence token, {XS * 1e3:.2f} mB a row a "
-              f"sequence token, carry {CARRY >> 20} MiB, "
+              f"(free {free >> 20} MiB + loan {loan >> 20} MiB, {int(_own(c, done + rem, lpc)) >> 20} MiB a chunk "
+              f"at the prompt's end, {len(TABLE)} sizes measured up to {MEASURED['max_rows']} rows, "
+              f"carry {CARRY >> 20} MiB, "
               f"SWA mapped back {swa_cost(c) >> 20} MiB"
               + (f", {back >> 20} MiB back on the GPU for the images ({', '.join(ON_DEMAND)})" if back else "")
               + f", cap {chunk})", flush=True)
     return _window_chunk(req, rem, done, max(chunk, c))
-
-
-def _fit(pts):  # non-negative (this definition replaces the ones above)
-    """FIXED + ROW * rows + SEQ * seq + XS * rows * seq with no negative term: every subset of the terms that keeps
-    ROW is fitted by least squares, the one with the least error among those with no negative coefficient stands,
-    then FIXED is raised until no forward grew more than the fit says. Sets XS; returns (FIXED, ROW, SEQ)."""
-    global XS
-    import itertools
-
-    import torch
-
-    worst = max(g / r for r, _, g in pts)
-    XS = 0.0
-    if len({r for r, _, _ in pts}) < 2:
-        return 0, worst, 0.0
-    cols = torch.tensor([[1.0, r, s, r * s] for r, s, _ in pts], dtype=torch.float64)
-    y = torch.tensor([g for _, _, g in pts], dtype=torch.float64)
-    best = None
-    for k in range(1, 5):
-        for sub in itertools.combinations(range(4), k):
-            if 1 not in sub or len(pts) < len(sub):
-                continue
-            A = cols[:, list(sub)]
-            if int(torch.linalg.matrix_rank(A)) < len(sub):
-                continue
-            sol = torch.linalg.lstsq(A, y.unsqueeze(1)).solution.squeeze(1)
-            if any(float(v) < 0 for v in sol) or float(sol[list(sub).index(1)]) <= 0:
-                continue
-            err = float(((A @ sol - y) ** 2).sum())
-            if best is None or err < best[0] * (1 - 1e-9):
-                coef = [0.0, 0.0, 0.0, 0.0]
-                for i, v in zip(sub, sol.tolist()):
-                    coef[i] = v
-                best = (err, coef)
-    if best is None:
-        return 0, worst, 0.0
-    _, (c0, row, sq, xs) = best
-    XS = xs
-    fixed = max(0.0, max(g - row * r - sq * s - xs * r * s for r, s, g in pts))
-    return int(fixed), row, sq
-
-
-# the terms on the allocated bytes, a sequence term only where a request's chunks grew
-SEQ_TOL = int(os.environ.get("KT_PREFILL_PLAN_SEQ_TOL_MB", "32")) << 20
-SEQ_WHY = "no request has run two equal chunks yet"
-
-
-def _seq_growth(pts):
-    """What the run of equal chunks over the widest stretch of sequence grew in allocated bytes from its shortest
-    sequence to its longest, and whether any run had two sequences. A run is one request's chunks: the same rows and
-    the same state. The widest run decides: a request's second chunk allocates more than its first and the ones
-    after it no more (three 11,712-row chunks grew 230 MiB, twenty of 5,056 rows over 100K tokens 1 MiB, and the
-    three put a cross term in the fit that planned a 131K prompt in 1,024-row chunks, Flash-Next on one card, 11-13)."""
-    runs, key = [], None
-    for p in pts:
-        if len(p) < 5 or p[3] <= 0:
-            key = None
-            continue
-        if (p[4], p[0]) != key:
-            key = (p[4], p[0])
-            runs.append([])
-        runs[-1].append((p[1], p[3]))
-    grow, seen, span = 0.0, False, -1.0
-    for run in runs:
-        seqs = [s for s, _ in run]
-        if len(set(seqs)) < 2:
-            continue
-        seen = True
-        if max(seqs) - min(seqs) > span:
-            span, grow = max(seqs) - min(seqs), max(run)[1] - min(run)[1]
-    return seen, grow
-
-
-def _fit(pts):  # this definition replaces the ones above
-    """FIXED + ROW * rows + SEQ * seq + XS * rows * seq. The terms are chosen on the allocated bytes: a sequence term
-    only when a run of equal chunks grew past SEQ_TOL along its sequence, then with the cross term first (rows x
-    sequence; SEQ alone under-stated Vision's indexer logits at a larger chunk), and the fewest terms within 16 MiB a
-    forward of the least error. Their sizes are fitted on the forwards' cost, none negative, then FIXED is raised until
-    no forward cost more than the fit says. Sets XS and SEQ_WHY; returns (FIXED, ROW, SEQ)."""
-    global XS, SEQ_WHY
-    import itertools
-
-    import torch
-
-    worst = max(p[2] / p[0] for p in pts)
-    XS = 0.0
-    if len({p[0] for p in pts}) < 2:
-        return 0, worst, 0.0
-    seen, grow = _seq_growth(pts)
-    seq = seen and grow > SEQ_TOL
-    SEQ_WHY = (f"a request's equal chunks grew {int(grow) >> 20} MiB allocated along the sequence" if seen
-               else "no request has run two equal chunks yet")
-    cols = torch.tensor([[1.0, p[0], p[1], p[0] * p[1]] for p in pts], dtype=torch.float64)
-    cost = torch.tensor([p[2] for p in pts], dtype=torch.float64)
-    alloc = torch.tensor([p[3] if len(p) > 3 and p[3] > 0 else p[2] for p in pts], dtype=torch.float64)
-
-    def solve(sub, y):
-        A = cols[:, list(sub)]
-        if len(pts) < len(sub) or int(torch.linalg.matrix_rank(A)) < len(sub):
-            return None
-        sol = torch.linalg.lstsq(A, y.unsqueeze(1)).solution.squeeze(1)
-        if any(float(v) < 0 for v in sol) or float(sol[list(sub).index(1)]) <= 0:
-            return None
-        return sol, float(((A @ sol - y) ** 2).sum())
-
-    def ranked(with_seq):
-        subs = [sub for k in range(1, 5) for sub in itertools.combinations(range(4), k)
-                if 1 in sub and with_seq == bool({2, 3} & set(sub))]
-        # a subset the allocated bytes cannot fit without a negative term ranks after those they can (the cost
-        # decides: Vision's rank 1 fitted the cross term on the cost and not on the allocated bytes)
-        got = [(r[1] if r is not None else math.inf, sub) for sub in subs for r in [solve(sub, alloc)]]
-        # with the cross term first when the sequence counts, then the fewest terms within 16 MiB a forward of the
-        # least error, then the others by terms and error
-        near = min([e for e, _ in got if e < math.inf] or [0.0]) + len(pts) * float(16 << 20) ** 2
-        return [t[4] for t in sorted((with_seq and 3 not in sub, e > near, len(sub), e, sub) for e, sub in got)]
-
-    for sub in ranked(seq) + (ranked(False) if seq else []):
-        r = solve(sub, cost)
-        if r is None:
-            continue
-        coef = [0.0, 0.0, 0.0, 0.0]
-        for i, v in zip(sub, r[0].tolist()):
-            coef[i] = v
-        _, row, sq, xs = coef
-        XS = xs
-        fixed = max(0.0, max(p[2] - row * p[0] - sq * p[1] - xs * p[0] * p[1] for p in pts))
-        return int(fixed), row, sq
-    return 0, worst, 0.0

@@ -1295,9 +1295,11 @@ def _fw_close() -> None:
         STATE["fw_grown"] = int(grown + STATE.get("kept_at_start", 0))
         kt_prefill_plan.observe_window(fw["rows"], fw["seq"], STATE["fw_grown"],
                                        int(alloc - STATE.get("pf_abase", 0) + STATE.get("kept_at_start", 0)),
-                                       int(STATE.get("to_prefill", 0)), fw.get("lp", 0))
+                                       int(STATE.get("to_prefill", 0)), fw.get("lp", 0),
+                                       kept=int(STATE.get("kept_at_start", 0)))
     except Exception as e:
         _say_once("lend: a window's reserved bytes were not observed, the plan keeps its last fit", e)
+    _write_plan()
     if not HINT:
         return
     loan = 0
@@ -1323,6 +1325,35 @@ def _fw_close() -> None:
 
         with open(f"{HINT}-rank{_rank()}.windows.jsonl", "a") as f:
             f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def _write_plan() -> None:
+    """The plan's forwards into the hint file as each forward closes. _write_hint runs when a decode follows a
+    prefill: prompts sent one after another with one token asked of each left the file as the warmup wrote it, so the
+    next launch carried none of their forwards, and carried again the ones this launch had dropped (11-19)."""
+    if not HINT:
+        return
+    try:
+        import json
+
+        from sglang.srt.layers.moe import kt_prefill_plan
+
+        plan = kt_prefill_plan.record()
+        if plan is None:
+            return
+        key = plan.get("rev")
+        if STATE.get("plan_written") == key:
+            return
+        path = f"{HINT}-rank{_rank()}.json"
+        with open(path) as f:  # the file is _write_hint's: no file yet, nothing to add to
+            rec = json.load(f)
+        rec["plan"] = plan
+        with open(path + ".tmp", "w") as f:
+            json.dump(rec, f)
+        os.replace(path + ".tmp", path)
+        STATE["plan_written"] = key
     except Exception:
         pass
 
@@ -1453,12 +1484,12 @@ def _write_hint(rank: int) -> None:
     STATE["points"] = points
     rec["points"] = points
     # the plan's forwards for the next launch's first window (kt_prefill_plan._carry_in); an earlier launch's stay
-    # until this one has its own, unless this one found them wrong
+    # until this one has its own
     try:
         from sglang.srt.layers.moe import kt_prefill_plan
 
         plan = kt_prefill_plan.record()
-        if plan is None and not kt_prefill_plan.MEASURED.get("dropped"):
+        if plan is None:
             with open(path) as f:
                 plan = json.load(f).get("plan")
         if plan:
@@ -1795,8 +1826,7 @@ def _hot_topup(fb, dev) -> None:
     if want is None:
         n = sum(L.k for L in h.LAYERS)
     else:
-        kept = kt_prefill_plan.kept_share(fb, int(STATE.get("scratch_kept", 0) or 0))
-        have = int(kt_ledger.window_free(index)) + kept
+        have = int(kt_ledger.window_free(index)) - kt_prefill_plan.scratch_ahead()
         n = h.slots_for(want - have)
     n = h._over_ranks([n], torch.distributed.ReduceOp.MAX)[0]
     if n > 0:

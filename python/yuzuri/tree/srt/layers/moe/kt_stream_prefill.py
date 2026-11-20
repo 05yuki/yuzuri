@@ -864,9 +864,9 @@ class KTStreamPrefill:
             got += r
         return got
 
-    def _mxc_read(self, half: int, miss, where):
+    def _mxc_read_start(self, half: int, miss, where):
         """The missing experts' six pieces from the checkpoint into this DMA slot's half of the bounce: views
-        of each, by the group position."""
+        of each, by the group position, and the reads under way."""
         X = self._mxc
         per = X["per"]
         jobs, views = [], {}
@@ -884,15 +884,28 @@ class KTStreamPrefill:
                 need = max(need, o + (off - lo) + nb)
                 o += hi - lo
             views[j] = vs
-        t0 = time.perf_counter()
-        got = list(X["pool"].map(lambda a: self._mxc_pread(*a), jobs))
-        X["read_s"] += time.perf_counter() - t0
         X["reads"] += len(miss)
-        X["read_bytes"] += sum(got)
+        return views, [X["pool"].submit(self._mxc_pread, *a) for a in jobs]
+
+    def _mxc_wait(self, futs) -> None:
+        X = self._mxc
+        t0 = time.perf_counter()
+        X["read_bytes"] += sum(f.result() for f in futs)
+        X["read_s"] += time.perf_counter() - t0
+
+    def _mxc_read(self, half: int, miss, where):
+        views, futs = self._mxc_read_start(half, miss, where)
+        self._mxc_wait(futs)
         return views
 
     def _stage_cache(self, layer_idx: int, gi: int, experts, stats):
-        """_stage_zc from the expert cache: per expert six H2D copies into the slot's raw landing (the scale
+        self._stage_cache_end(self._stage_cache_begin(layer_idx, gi, experts, stats), stats)
+
+    def _stage_cache_begin(self, layer_idx: int, gi: int, experts, stats):
+        """_stage_zc from the expert cache, first half: the experts the cache does not hold start reading from
+        the drive. The second half is _stage_cache_end; between the two the caller queues the compute of the
+        group before, so the drive reads while the GPU computes (the reads were 41% of a one-socket prefill's
+        time when the two ran one after the other, 11-19). Staged: per expert six H2D copies into the slot's raw landing (the scale
         bytes into raw_e, widened on the GPU to the fp32 scales raw_s holds: ue8m0 e -> e << 23)."""
         from sglang.srt.layers.moe import kt_lend
 
@@ -920,13 +933,24 @@ class KTStreamPrefill:
                 srcs.append(None)
                 miss.append((j, lid))
         t0 = time.perf_counter()
+        futs = []
         if miss:
             # this slot's bounce half is free once the slot's last DMA is done
             if getattr(slot, "bounce_used", False):
                 slot.dma_done.synchronize()
-            for j, v in self._mxc_read(gi % 2, miss, where).items():
+            views, futs = self._mxc_read_start(gi % 2, miss, where)
+            for j, v in views.items():
                 srcs[j] = v
             slot.bounce_used = True
+        stats["dma_enq"] += time.perf_counter() - t0
+        return slot, n, srcs, futs
+
+    def _stage_cache_end(self, pending, stats):
+        """The reads _stage_cache_begin started are waited for, and the group's copies to the device queued."""
+        slot, n, srcs, futs = pending
+        X = self._mxc
+        t0 = time.perf_counter()
+        self._mxc_wait(futs)
         with torch.cuda.stream(self.transfer_stream):
             if slot.compute_used:
                 self.transfer_stream.wait_event(slot.compute_done)
@@ -943,7 +967,7 @@ class KTStreamPrefill:
         if X is None:
             return ""
         return (f"expert cache: {X['hits']} experts streamed from the cache, {X['reads']} read from the drive "
-                f"({X['read_bytes'] / 1e9:.1f} GB in {X['read_s']:.1f} s)")
+                f"({X['read_bytes'] / 1e9:.1f} GB, waited for {X['read_s']:.1f} s)")
 
     def _stage_zc(self, layer_idx: int, gi: int, experts, stats):
         """Three contiguous H2D copies: the group's consecutive expert blocks
@@ -1286,8 +1310,12 @@ class KTStreamPrefill:
                 self._mmq_regroup(slot, n)
             slot.compute_done.record(cur)
             slot.compute_used = True
+            pending = None
             if gi + 1 < len(groups):
-                self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
+                if self._mxc is not None and ZEROCOPY:
+                    pending = self._stage_cache_begin(layer_idx, gi + 1, groups[gi + 1], stats)
+                else:
+                    self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
             step = MMQ_ROUTES if MMQ_ROUTES > 0 else max(1, hi - lo)
             for r0 in range(lo, hi, step):
                 r1 = min(hi, r0 + step)
@@ -1307,6 +1335,8 @@ class KTStreamPrefill:
                 down.mul_(topk_weights[t, sidx].to(torch.float32).unsqueeze(1))
                 acc.index_add_(0, t, down.to(acc.dtype))
             stats["moe_enq"] += time.perf_counter() - t0
+            if pending is not None:
+                self._stage_cache_end(pending, stats)
 
     def _group_body(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids32, acc, out):
         """Scale prep + MoE + accumulate for one group, on the current stream.

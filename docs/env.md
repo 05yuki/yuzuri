@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-276 names.
+275 names.
 
 ## KT_
 
@@ -210,14 +210,13 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_PREFILL_PLAN_ALIGN` | `"1024"` | _finder.py, kt_prefill_plan.py, kt_stream_threshold.py |
 | `KT_PREFILL_PLAN_CARRY` | `"1"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_COST` | `""` | kt_prefill_plan.py |
-| `KT_PREFILL_PLAN_DEBUG` | - | kt_prefill_plan.py |
+| `KT_PREFILL_PLAN_DEBUG` | `""` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_DELTA_MB` | `"0"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_FREE_MB` | `"0"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_LIVE` | `"1"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_MARGIN_MB` | - | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_ROW_KB` | `"0"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_SAFE` | `"0"` | kt_kv_prefill_lend.py, kt_lend.py, kt_prefill_plan.py, kt_stream_threshold.py, warmup_prefill.py |
-| `KT_PREFILL_PLAN_SEQ_TOL_MB` | `"32"` | kt_prefill_plan.py |
 | `KT_PREFILL_PLAN_TAIL_STEPS` | `"2" if _GGUF else "0"` | kt_prefill_plan.py |
 | `KT_PREFILL_SWA_CHUNKS_IN_FLIGHT` | - | kt_kv_prefill_lend.py |
 | `KT_PREFILL_SWA_HOST_TRIM` | `"1"` | kt_kv_prefill_lend.py |
