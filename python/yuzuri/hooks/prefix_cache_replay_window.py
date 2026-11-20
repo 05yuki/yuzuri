@@ -20,7 +20,9 @@ _TAIL = "reprefill_tail_tokens"
 def _install(m):
     cache = m.UnifiedRadixCache
     todo = []
-    for name, params in (("checkpoint_into_tree", ["self", "req", "..."]), ("advance_unpublished_req", ["self", "req"])):
+    # later versions keep checkpoint_into_tree's body, the free with it, in _checkpoint_into_tree
+    inner = "_checkpoint_into_tree" if inspect.getattr_static(cache, "_checkpoint_into_tree", None) else "checkpoint_into_tree"
+    for name, params in ((inner, ["self", "req", "..."]), ("advance_unpublished_req", ["self", "req"])):
         fn = inspect.getattr_static(cache, name, None)
         try:
             src = inspect.getsource(fn) if fn is not None else ""
