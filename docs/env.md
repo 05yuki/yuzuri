@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-275 names.
+276 names.
 
 ## KT_
 
@@ -52,6 +52,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GGUF_STREAM_TIMELINE` | `"0"` | kt_stream_prefill_gguf_nvme.py |
 | `KT_GGUF_V41_DENSE` | - | kt_ep_methods.py, kt_gguf_dense.py, kt_lend.py, kt_prefill_plan.py |
 | `KT_GPU_MASK_ZERO` | `"0"` | kt_ep_methods.py, kt_kv_hot_lend.py |
+| `KT_GPU_ONE_CALL` | `"1"` | kt_ep_methods.py |
 | `KT_GPU_STREAM_COLLAPSE` | `"0"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_CPUCHECK` | `"1"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_DEBUG` | `"0"` | kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_nvfp4.py |
