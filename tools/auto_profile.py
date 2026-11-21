@@ -53,6 +53,9 @@ FORMAT_ENV = {
     "MXFP4": {"KT_GPU_STREAM_W16": "1", "KT_GPU_STREAM_ZEROCOPY": "1", "KT_GPU_STREAM_GRAPH": "1",
               "KT_GPU_STREAM_MMQ": "1", "KT_GPU_STREAM_HOST_BUFS": "3", "KT_WRITE_UP_FIRST": "1", "KT_GPU_MASK_ZERO": "1",
               "KT_MXFP4_SCALE_CODES": "1",
+              # two bits a group in the decode loop where a matrix holds at most four scales (kt-kernel decides
+              # per matrix at load; bit-identical). As above: an extension without it reads no such variable
+              "KT_MXFP4_SCALE_CODES2": "1",
               # kt-kernel's CPU decode: the activation row converted with PSHUFB, the weights prefetched 1 KB ahead
               # (bit-identical; V4.1 MXFP4 decode 51.7 -> 55.6 tok/s on two EPYC 7452, 11-14). As above: an
               # extension without them reads no such variable
