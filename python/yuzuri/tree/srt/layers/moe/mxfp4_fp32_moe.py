@@ -214,6 +214,116 @@ def _mxfp4_moe_gemv_gate_up_kernel(
 
 
 @triton.jit
+def _mxfp4_moe_gemv2_kernel(
+    a_ptr, b_ptr, bs_ptr, c_ptr, ids_ptr, w_ptr, ids2_ptr, w2_ptr, delta_b, delta_s, lut_ptr,
+    N, K,
+    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_cm,
+    A_DIV: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """_mxfp4_moe_gemv_kernel over two banks of experts of one shape in one launch: a route
+    is in the second bank (delta_b / delta_s bytes after the first one's weights / scales)
+    when its second weight is not 0, in the first when its first is not, else it is skipped."""
+    r = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    n_ok = offs_n < N
+    wt1 = tl.load(w_ptr + r)
+    wt2 = tl.load(w2_ptr + r)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    if (wt1 != 0.0) | (wt2 != 0.0):
+        second = wt2 != 0.0
+        e = tl.where(second, tl.load(ids2_ptr + r).to(tl.int64), tl.load(ids_ptr + r).to(tl.int64))
+        ob = tl.where(second, delta_b, 0).to(tl.int64)
+        os_ = tl.where(second, delta_s, 0).to(tl.int64)
+        a_row = a_ptr + (r // A_DIV) * stride_am
+        b_base = b_ptr + (e * stride_be + ob) + offs_n.to(tl.int64)[:, None] * stride_bn
+        s_base = bs_ptr + (e * stride_se + os_) + offs_n.to(tl.int64)[:, None] * stride_sn
+        acc2 = tl.zeros((BN, BK // 32), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            offs_k = k0 + tl.arange(0, BK)
+            a = tl.load(a_row + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)
+            kb = (k0 // 2 + tl.arange(0, BK // 2))[None, :]
+            ks = (k0 // 32 + tl.arange(0, BK // 32))[None, :]
+            packed = tl.load(b_base + kb, mask=n_ok[:, None] & (kb < K // 2), other=0)
+            packed = packed.to(tl.int32) & 0xFF
+            lo, hi = _e2m1_pair(lut_ptr, packed)
+            w = tl.interleave(lo, hi)
+            sc = tl.load(s_base + ks, mask=n_ok[:, None] & (ks < K // 32), other=127)
+            sc = _e8m0(sc.to(tl.int32) & 0xFF)
+            acc2 += tl.sum(tl.reshape(w * a[None, :], (BN, BK // 32, 32)), axis=2) * sc
+        acc = tl.sum(acc2, axis=1)
+    tl.store(c_ptr + r * stride_cm + offs_n, acc, mask=n_ok)
+
+
+@triton.jit
+def _mxfp4_moe_gemv_gate_up2_kernel(
+    a_ptr, b_ptr, bs_ptr, h_ptr, ids_ptr, w_ptr, ids2_ptr, w2_ptr, delta_b, delta_s, lut_ptr,
+    I, K, limit,
+    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_hm,
+    A_DIV: tl.constexpr, HAS_LIMIT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    """_mxfp4_moe_gemv_gate_up_kernel over two banks (see _mxfp4_moe_gemv2_kernel)."""
+    r = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    n_ok = offs_n < I
+    wt1 = tl.load(w_ptr + r)
+    wt2 = tl.load(w2_ptr + r)
+    hv = tl.zeros((BN,), dtype=tl.float32)
+    if (wt1 != 0.0) | (wt2 != 0.0):
+        second = wt2 != 0.0
+        e = tl.where(second, tl.load(ids2_ptr + r).to(tl.int64), tl.load(ids_ptr + r).to(tl.int64))
+        ob = tl.where(second, delta_b, 0).to(tl.int64)
+        os_ = tl.where(second, delta_s, 0).to(tl.int64)
+        a_row = a_ptr + (r // A_DIV) * stride_am
+        rows_g = offs_n.to(tl.int64)[:, None]
+        rows_u = rows_g + I
+        bg = b_ptr + (e * stride_be + ob) + rows_g * stride_bn
+        bu = b_ptr + (e * stride_be + ob) + rows_u * stride_bn
+        sg = bs_ptr + (e * stride_se + os_) + rows_g * stride_sn
+        su = bs_ptr + (e * stride_se + os_) + rows_u * stride_sn
+        acc_g = tl.zeros((BN, BK // 32), dtype=tl.float32)
+        acc_u = tl.zeros((BN, BK // 32), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            offs_k = k0 + tl.arange(0, BK)
+            a = tl.load(a_row + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)[None, :]
+            kb = (k0 // 2 + tl.arange(0, BK // 2))[None, :]
+            ks = (k0 // 32 + tl.arange(0, BK // 32))[None, :]
+            mb = n_ok[:, None] & (kb < K // 2)
+            msk = n_ok[:, None] & (ks < K // 32)
+            pg = tl.load(bg + kb, mask=mb, other=0).to(tl.int32) & 0xFF
+            pu = tl.load(bu + kb, mask=mb, other=0).to(tl.int32) & 0xFF
+            cg = _e8m0(tl.load(sg + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
+            cu = _e8m0(tl.load(su + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
+            glo, ghi = _e2m1_pair(lut_ptr, pg)
+            ulo, uhi = _e2m1_pair(lut_ptr, pu)
+            pg_ = tl.reshape(tl.interleave(glo, ghi) * a, (BN, BK // 32, 32))
+            pu_ = tl.reshape(tl.interleave(ulo, uhi) * a, (BN, BK // 32, 32))
+            acc_g += tl.sum(pg_, axis=2) * cg
+            acc_u += tl.sum(pu_, axis=2) * cu
+        g = tl.sum(acc_g, axis=1)
+        u = tl.sum(acc_u, axis=1)
+        if HAS_LIMIT:
+            g = tl.minimum(g, limit)
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+        hv = g / (1.0 + tl.exp(-g)) * u
+    tl.store(h_ptr + r * stride_hm + offs_n, hv, mask=n_ok)
+
+
+@triton.jit
+def _topk_wsum2_kernel(y_ptr, w_ptr, w2_ptr, out_ptr, K, TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    """_topk_wsum_kernel with a route's weight in one of two arrays (the other holds 0)."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = cols < K
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for t in tl.static_range(TOPK):
+        wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32) + tl.load(w2_ptr + row * TOPK + t).to(tl.float32)
+        acc += wt * tl.load(y_ptr + (row * TOPK + t) * K + cols, mask=m, other=0.0)
+    tl.store(out_ptr + row * K + cols, acc.to(out_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
 def _swiglu_f32_kernel(in_ptr, out_ptr, d, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -380,4 +490,50 @@ def mxfp4_moe_reference(hidden_states, w13, w13_scale, w2, w2_scale, topk_weight
             g, u = g.clamp(max=lim), u.clamp(-lim, lim)
         y = (torch.nn.functional.silu(g) * u) @ w2e.T
         out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
+    return out
+
+
+def two_banks_ok(hidden_states, a, b) -> bool:
+    """mxfp4_fp32_moe_two's conditions: decode-sized input (the per-route GEMV path) and two banks
+    (tuples of w13, w13_scale, w2, w2_scale) of one expert shape, layout and device."""
+    if not (hidden_states.shape[0] <= GEMV_MAX_TOKENS or torch.cuda.is_current_stream_capturing()):
+        return False
+    for x, y in zip(a, b):
+        if x.shape[1:] != y.shape[1:] or x.stride() != y.stride() or x.dtype != y.dtype or x.device != y.device:
+            return False
+    return True
+
+
+def mxfp4_fp32_moe_two(hidden_states, a, b, weights_a, ids_a, weights_b, ids_b, swiglu_limit=None):
+    """A decode step's routes over two banks of experts (a: the resident rows, b: lent slots; each a
+    tuple of w13, w13_scale, w2, w2_scale) in one launch of each kernel instead of one call a bank:
+    a call costs about 20 us before its first route. Every route has its weight in weights_a or in
+    weights_b (0 in the other, ids valid in both); the routes' outputs are summed in fp32 once."""
+    M, H = hidden_states.shape
+    topk = ids_a.shape[1]
+    w13, s13, w2, s2 = (t.view(torch.uint8) for t in a)
+    w13b, s13b, w2b, s2b = (t.view(torch.uint8) for t in b)
+    I = w13.shape[1] // 2
+    hidden_states = hidden_states.contiguous()
+    R = M * topk
+    dev = hidden_states.device
+    lim = float(swiglu_limit) if swiglu_limit else 0.0
+    h = torch.empty((R, I), dtype=torch.float32, device=dev)
+    y = torch.empty((R, H), dtype=torch.float32, device=dev)
+    ia, wa = ids_a.reshape(-1).contiguous(), weights_a.reshape(-1).contiguous()
+    ib, wb = ids_b.reshape(-1).contiguous(), weights_b.reshape(-1).contiguous()
+    bn, bk = GEMV_BN, GEMV_BK
+    lut = _e2m1_pair_lut(dev)
+    _mxfp4_moe_gemv_gate_up2_kernel[(R, triton.cdiv(I, bn))](
+        hidden_states, w13, s13, h, ia, wa, ib, wb,
+        w13b.data_ptr() - w13.data_ptr(), s13b.data_ptr() - s13.data_ptr(), lut, I, H, lim,
+        hidden_states.stride(0), w13.stride(0), w13.stride(1), s13.stride(0), s13.stride(1), h.stride(0),
+        A_DIV=topk, HAS_LIMIT=lim > 0, BN=bn, BK=bk, num_warps=GEMV_WARPS)
+    _mxfp4_moe_gemv2_kernel[(R, triton.cdiv(H, bn))](
+        h, w2, s2, y, ia, wa, ib, wb, w2b.data_ptr() - w2.data_ptr(), s2b.data_ptr() - s2.data_ptr(), lut, H, I,
+        h.stride(0), w2.stride(0), w2.stride(1), s2.stride(0), s2.stride(1), y.stride(0),
+        A_DIV=1, BN=bn, BK=bk, num_warps=GEMV_WARPS)
+    out = torch.empty((M, H), dtype=hidden_states.dtype, device=dev)
+    _topk_wsum2_kernel[(M, triton.cdiv(H, 1024))](
+        y, weights_a.contiguous(), weights_b.contiguous(), out, H, TOPK=topk, BLOCK=1024)
     return out

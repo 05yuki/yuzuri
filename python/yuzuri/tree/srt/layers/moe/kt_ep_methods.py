@@ -112,6 +112,29 @@ def building(is_draft: bool):
 _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 
 _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+# KT_GPU_ONE_CALL=0: the resident rows and the lent slots as two calls of the GPU expert method, as before
+_gpu_one_call = os.environ.get("KT_GPU_ONE_CALL", "1") != "0"
+
+
+def _two_banks(self, layer, x, hot, streamer):
+    """The two banks (w13, w13_scale, w2, w2_scale of the resident rows and of the lent slots) when a decode
+    step can run both in one launch: the fp32 MXFP4 method on both, every masked route at weight 0, banks of
+    one shape, no streamer and no check of the slots against the CPU. Else None."""
+    if not (_gpu_one_call and _gpu_mask_zero and streamer is None and hot is not None and hot[1] is not None):
+        return None
+    from sglang.srt.layers.moe import kt_kv_hot_lend
+
+    L = self.__dict__.get("_kt_kv_hot")
+    if L is None or kt_kv_hot_lend.CHECK or not kt_kv_hot_lend._MASK_ZERO or L.shadow is None:
+        return None
+    if type(self.gpu_method).__name__ != "Mxfp4Fp32MoEMethod" or type(L.method).__name__ != "Mxfp4Fp32MoEMethod":
+        return None
+    from sglang.srt.layers.moe.mxfp4_fp32_moe import two_banks_ok
+
+    names = ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+    a = tuple(getattr(layer, n) for n in names)
+    b = tuple(getattr(L.shadow, n) for n in names)
+    return (a, b) if two_banks_ok(x, a, b) else None
 
 _hot_check = os.environ.get("KT_HOT_CHECK") == "1"
 
@@ -528,8 +551,19 @@ def apply(
         streamer is not None
         and getattr(self.gpu_method, "streams_hot_experts", False)
     ):
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
-        output = gpu_combine_input.hidden_states
+        one = _two_banks(self, layer, x, hot, streamer)
+        if one is not None:
+            # the resident rows and the lent slots in one launch of each kernel (mxfp4_fp32_moe_two)
+            from sglang.srt.layers.moe.mxfp4_fp32_moe import mxfp4_fp32_moe_two
+
+            output = mxfp4_fp32_moe_two(
+                x, one[0], one[1], masked_topk_output.topk_weights, masked_topk_output.topk_ids,
+                hot[1].topk_output.topk_weights, hot[1].topk_output.topk_ids,
+                swiglu_limit=self.gpu_method.runner.config.swiglu_limit)
+            hot = (hot[0], None, hot[2], hot[3])
+        else:
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
         if streamer is not None and _hot_check:
             from sglang.srt.layers.moe.kt_stream_prefill import hot_reference_check
 
