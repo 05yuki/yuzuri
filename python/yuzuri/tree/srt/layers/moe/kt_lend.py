@@ -161,7 +161,10 @@ def _tms():
         import torch_memory_saver as m
 
         _saver = m.torch_memory_saver
-        _saver.hook_mode = "torch"
+        # SGLang's own memory saver (--enable-memory-saver) has set the saver up already, in its mode: the lend's
+        # regions, pauses and resumes go by tag in either mode, so it is used as it is
+        if getattr(_saver, "_impl_ctor_kwargs", None) is not None:
+            _saver.hook_mode = "torch"
     return _saver
 
 
@@ -1577,6 +1580,19 @@ def before_forward(forward_batch) -> None:
     streamed = _streamed(forward_batch)
     rows = forward_batch.input_ids.shape[0]
     mode = getattr(forward_batch, "forward_mode", None)
+    if streamed and DEBUG and STATE["phase"] == "prefill":
+        _d = STATE["device"]
+        _ledger("W", f"forward of {rows} rows (free {torch.cuda.mem_get_info(_d)[0] >> 20} MiB, torch allocated "
+                     f"{torch.cuda.memory_allocated(_d) >> 20}, reserved {torch.cuda.memory_reserved(_d) >> 20})", _d)
+    if streamed and STATE["phase"] == "prefill":
+        # a window's forward starts from the driver's free memory, not from what the forward before it left cached in
+        # torch. A chunk's tensors are not the sizes of the chunk before it (more rows, or the same rows further
+        # along the sequence), so most of that cache cannot serve it and it asks the driver for more while the cache
+        # is held: between two 21,888-row chunks torch held 13.9 GiB of a 15.6 GiB card, 0.7 GiB was free and the
+        # next chunk needed 0.3 GiB more than the last (Flash-Next NVFP4, the launch's 65,536-token prompt, 11-22).
+        # torch gives its cache back when an allocation of its own fails and tries again; an allocation in a saver
+        # region (the scratch) ends the process there instead (tms_torch_malloc exits on out-of-memory)
+        torch.cuda.empty_cache()
     if not streamed and STATE["phase"] == "decode" and mode is not None and mode.is_extend():
         # a forward that does not stream runs in decode's memory: the pool's rows yield its margin now (its input
         # logprobs) and come back at the next decode (host_in_flight). Keeping the margin free from every window's
@@ -1854,6 +1870,51 @@ def _kv_loan(forward_batch) -> None:
     kt_kv_prefill_lend.lend(runner, forward_batch, hot_stays=bool(STATE.get("hot_stays")))
 
 
+def _spans_back(dev) -> None:
+    """The lent spans' contents back on the card after their region was resumed: from the mirror, or the host copy."""
+    if STATE.get("mirror") is not None:
+        m = STATE["mirror"]
+        for f in m["reads"].values():  # a read-ahead still landing in a bounce
+            f.result()
+        m["reads"].clear()
+        cur = torch.cuda.current_stream(dev)
+        evs = [None, None]
+        for i, dspan in enumerate(STATE["dev_spans"]):
+            k = i % 2
+            if evs[k] is not None:
+                evs[k].synchronize()
+            _mirror_read_layer(i, k)
+            dspan.copy_(_mirror_view(i, k, dspan.numel()), non_blocking=True)
+            evs[k] = torch.cuda.Event()
+            evs[k].record(cur)
+        for ev in evs:
+            if ev is not None:
+                ev.synchronize()
+        STATE["pf_bounce_used"] = [False, False]
+    else:
+        for base, span, dspan in zip(
+            STATE["bases"], STATE["spans"], STATE["dev_spans"]
+        ):
+            dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
+
+
+def park_out(dev) -> bool:
+    """For a server that leaves the cards (kt_park): the lend's spans go as at a window's start, and nothing else of
+    a window happens. False when there is nothing lent or a window is open."""
+    if not STATE.get("dev_spans") or STATE.get("phase", "decode") != "decode":
+        return False
+    torch.cuda.synchronize(dev)
+    _tms().pause(STATE.get("tag", TAG_WEIGHTS))
+    return True
+
+
+def park_back(dev) -> None:
+    """The spans park_out sent away, mapped and filled again."""
+    _tms().resume(STATE.get("tag", TAG_WEIGHTS))
+    _spans_back(dev)
+    torch.cuda.synchronize(dev)
+
+
 def end_window() -> None:
     """Close a prefill window: record it, bring the weights back. The model
     runner does this before the first forward after a prefill; the probe
@@ -1941,30 +2002,7 @@ def end_window() -> None:
                 kt_kv_prefill_lend.swa_lend("end of window")
         _check_room(dev)
         _tms().resume(STATE.get("tag", TAG_WEIGHTS))
-        if STATE.get("mirror") is not None:
-            m = STATE["mirror"]
-            for f in m["reads"].values():  # a read-ahead still landing in a bounce
-                f.result()
-            m["reads"].clear()
-            cur = torch.cuda.current_stream(dev)
-            evs = [None, None]
-            for i, dspan in enumerate(STATE["dev_spans"]):
-                k = i % 2
-                if evs[k] is not None:
-                    evs[k].synchronize()
-                _mirror_read_layer(i, k)
-                dspan.copy_(_mirror_view(i, k, dspan.numel()), non_blocking=True)
-                evs[k] = torch.cuda.Event()
-                evs[k].record(cur)
-            for ev in evs:
-                if ev is not None:
-                    ev.synchronize()
-            STATE["pf_bounce_used"] = [False, False]
-        else:
-            for base, span, dspan in zip(
-                STATE["bases"], STATE["spans"], STATE["dev_spans"]
-            ):
-                dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
+        _spans_back(dev)
         # KT_HOT_DYNAMIC=1: the slots a mirror restored to their load-time experts get their residents back
         try:
             from sglang.srt.layers.moe import kt_hot_cache

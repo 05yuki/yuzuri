@@ -56,6 +56,10 @@ def numa_nodes():
                 mem[m.group(1)] = int(m.group(2)) * 1024
         nodes.append({"node": n, "cpus": cpus, "physical_cores": len(cores), "mem_total": mem.get("MemTotal"),
                       "mem_free": mem.get("MemFree"), "file_pages": mem.get("FilePages"),
+                      # what is taken and cannot be reclaimed for a new server: everything that is neither free nor
+                      # page cache, and the shared memory counted in the page cache (another server's arenas)
+                      "mem_held": max(0, (mem.get("MemTotal") or 0) - (mem.get("MemFree") or 0)
+                                      - (mem.get("FilePages") or 0) + (mem.get("Shmem") or 0)),
                       "anon_huge": mem.get("AnonHugePages"),
                       # what a server cannot fill: the zones' high watermarks (below them the kernel reclaims, and a
                       # node of pinned and shared memory has nothing to give back) and what the kernel itself holds
@@ -130,6 +134,23 @@ def cpu_info():
     return {"model": model, "isa": isa, "logical_cpus": os.cpu_count()}
 
 
+def visible(found, spec):
+    """The cards a launch may take: all of them, or those CUDA_VISIBLE_DEVICES names, in its order. An entry is a
+    card's index as nvidia-smi numbers them (PCI bus order, which the launcher also gives CUDA), or the start of
+    its UUID. An entry that names no card stops the launch: a server on another card than the one asked for is
+    worse than none."""
+    if not spec or not spec.strip():
+        return found
+    out = []
+    for e in (x.strip() for x in spec.split(",") if x.strip()):
+        hit = [g for g in found if (e.isdigit() and g["index"] == int(e)) or (not e.isdigit() and g["uuid"].startswith(e))]
+        if len(hit) != 1:
+            raise SystemExit(f"CUDA_VISIBLE_DEVICES names {e!r}: {len(hit)} of this host's {len(found)} GPUs match")
+        if hit[0] not in out:
+            out.append(hit[0])
+    return out
+
+
 def gpus():
     smi = shutil.which("nvidia-smi")
     if not smi:
@@ -153,12 +174,15 @@ def gpus():
         g["numa_node_known"] = g["numa_node"] >= 0
         if g["numa_node"] < 0:
             g["numa_node"] = nodes[0] if len(nodes) == 1 else nodes[g["index"] % len(nodes)]
+    # a launch asked for some of the cards (two servers on one host, one a card): the others are not this launch's
+    res = visible(res, os.environ.get("CUDA_VISIBLE_DEVICES"))
     procs = subprocess.run([smi, "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True).stdout
     using = []
     for line in procs.strip().splitlines():
         u, pid, pname, mem = [v.strip() for v in line.split(",")]
-        using.append({"gpu_uuid": u, "pid": int(pid), "name": pname, "used": int(mem) * 2**20})
+        if any(g["uuid"] == u for g in res):  # another server on a card this launch does not take is not in its way
+            using.append({"gpu_uuid": u, "pid": int(pid), "name": pname, "used": int(mem) * 2**20})
     cuda = ""
     nvcc = shutil.which("nvcc") or ("/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc") else None)
     if nvcc:

@@ -261,6 +261,9 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, overrides any default")
     ap.add_argument("--server-arg", action="append", default=[], metavar="ARGS",
                     help="arguments passed on to sglang.launch_server as they are, e.g. --server-arg='--enable-hierarchical-cache --hicache-write-policy write_back --hicache-ratio 2'")
+    ap.add_argument("--beside", action="store_true",
+                    help="start although other processes hold memory on these cards (a server parked with YUZURI_PARK=1): the plan "
+                         "counts what they hold now, so they must be parked before this launch and while this server runs")
     ap.add_argument("--no-calibrate", action="store_true",
                     help="a setup's first launch measures the prefill plan on the first requests, not on prompts of "
                          "its own before it reports ready")
@@ -360,7 +363,10 @@ def main():
     # --- host, defaults for this TP, model, plan
     host = json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json", "--mounts", experts_dir]))
     if host["gpu_in_use"]:
-        raise SystemExit("GPUs in use: " + ", ".join(f"{u['name']}({u['pid']})" for u in host["gpu_in_use"]))
+        who = ", ".join(f"{u['name']}({u['pid']}, {u['used'] / (1 << 30):.1f} GiB)" for u in host["gpu_in_use"])
+        if not a.beside:
+            raise SystemExit("GPUs in use: " + who + " (--beside starts next to a parked server)")
+        print(f"! beside {who}: the plan takes what the cards have free now")
     gpus = sorted(host["gpus"], key=lambda g: g["numa_node"])
     tp = a.tp or int(sorted(prof["defaults"])[0])
     if str(tp) not in prof["defaults"]:
@@ -397,7 +403,18 @@ def main():
     cal_tp = str((prof.get("constants") or {}).get("from", {}).get("tp") or (list(prof["defaults"])[0] if len(prof["defaults"]) == 1 else ""))
     if prof.get("constants") and cal_tp == str(tp):
         plan_cmd += ["--constants", pf]
+    # the launch's own command says where the per-layer token table is: read from a file it is not RAM
+    words = [str(w) for w in prof.get("command", [])] + [w for x in a.server_arg for w in shlex.split(x)]
+    if any(w == "--ple-offload-backend=file" or (w == "--ple-offload-backend" and words[k + 1:k + 2] == ["file"])
+           for k, w in enumerate(words)):
+        plan_cmd += ["--table-in-file"]
+    if a.beside:
+        plan_cmd += ["--beside"]
+    if os.environ.get("YUZURI_PARK") == "1" or "YUZURI_PARK=1" in a.env:
+        plan_cmd += ["--park"]
     plan = json.loads(sh(plan_cmd))
+    if plan.get("stop"):
+        raise SystemExit(plan["stop"])
     context = context_length = plan["context"]
     mem_fraction = plan["mem_fraction"]
     names_off = {f["name"] for f in feat_off}
@@ -650,6 +667,11 @@ def main():
     run = os.path.join(a.log_dir, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(run, exist_ok=True)
     env["YUZURI_RUN_DIR"] = run  # each worker writes hooks-<pid>.json there: what every hook became
+    # kt-kernel's CPU pools on the plan's nodes: without this it numbers them 0, 1, ..., so a one-card launch on
+    # another node's card ran its experts on node 0 (two servers, one a card, shared node 0's cores: 1.3 tok/s each)
+    _nodes = [q["node"] for q in plan["cpu_pools"]][: vals["pools"]]
+    if len(_nodes) == vals["pools"] and "KT_NUMA_NODES" not in env:
+        env["KT_NUMA_NODES"] = ",".join(str(n) for n in _nodes)
     manifest = {"profile": prof["name"], "command": cmd, "features": feat_on,
                 "env": {k: v for k, v in env.items() if k.startswith(("KT_", "SGLANG_", "CUDA_", "OMP_", "NCCL_", "TORCH"))},
                 "plan": plan, "host": {k: host[k] for k in ("hostname", "kernel", "driver", "cuda_toolkit")}, "packages": {}}

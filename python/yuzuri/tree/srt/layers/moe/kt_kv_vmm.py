@@ -90,6 +90,11 @@ def _load():
         _lib.kv_vmm_malloc_split.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
         _lib.kv_vmm_device_bytes.restype = ctypes.c_size_t
         _lib.kv_vmm_device_bytes.argtypes = [ctypes.c_void_p]
+    if hasattr(_lib, "kv_vmm_park"):  # a library built before the park has neither
+        _lib.kv_vmm_park.restype = ctypes.c_longlong
+        _lib.kv_vmm_park.argtypes = [ctypes.c_int]
+        _lib.kv_vmm_unpark.restype = ctypes.c_longlong
+        _lib.kv_vmm_unpark.argtypes = [ctypes.c_int]
     _lib.kv_vmm_free.restype = None
     _lib.kv_vmm_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
     if not DIRECT:

@@ -50,6 +50,7 @@ TABLE = {
     "kt_routed_scale_once": ("tier 0 10 routed-scale-once", NEED, "the routed scaling factor applied once"),
     "kt_shared_experts": ("-", NEED, "shared-experts fusion off under KT"),
     "host_allreduce": ("-", OPT, "large all-reduces through host memory"),
+    "park": ("-", OPT, "YUZURI_PARK=1: the server leaves the cards and comes back with its sessions"),
     "indexer_no_deepgemm_sm12x": ("-", NEED, "the torch indexer on SM12x"),
     "indexer_small_cards": ("-", OPT, "the indexer's score product reduced in place"),
     "sparse_mla_by_layout": ("tier 0 11 v41-kv-layout", NEED, "the sparse MLA kernel by the latent's layout"),

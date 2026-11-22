@@ -711,6 +711,16 @@ def chunk_for(scheduler, chunk: int) -> int:
     # the first window reaches the planner before anything is measured
     if not ENABLED or not (ONLINE or _ready()):
         return chunk
+    # the forward that ran last is measured before the plan reads the table. It closes at the next forward's start
+    # otherwise, after this plan: a launch's calibration planned its 65,536-token prompt without the 16,384-row
+    # forward at sequence 32,768 that had just run, 850 MiB under what that forward cost (11-22)
+    from sglang.srt.layers.moe import kt_lend as _lend
+
+    if _lend.STATE.get("fw") is not None and _lend.STATE.get("phase") == "prefill":
+        import torch
+
+        torch.cuda.synchronize(_lend.STATE["device"])
+        _lend._fw_close()
     req = scheduler.chunked_req
     if req is None:
         q = scheduler.waiting_queue

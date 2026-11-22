@@ -15,7 +15,23 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_AOT = Path(__file__).resolve().parents[2] / "kernels" / "aot"
+def _aot_dir():
+    """Where sgl-kernel's sources are: beside this file in a patched tree, else in the installed SGLang."""
+    here = Path(__file__).resolve().parents[2] / "kernels" / "aot"
+    if (here / "csrc").is_dir():
+        return here
+    try:
+        import sglang
+
+        there = Path(sglang.__file__).resolve().parent / "kernels" / "aot"
+        if (there / "csrc").is_dir():
+            return there
+    except Exception:
+        pass
+    return None
+
+
+_AOT = _aot_dir()
 _SOURCES = (
     "csrc/quantization/gguf/gguf_kernel.cu",
     "csrc/elementwise/activation.cu",
@@ -130,6 +146,11 @@ def load_if_needed() -> None:
     """Build (once, cached in torch's extensions directory) and register the kernels when the GPU needs them."""
     global _loaded
     if _loaded or not needed():
+        return
+    if _AOT is None:
+        # an SGLang that ships no ahead-of-time sources compiles its kernels for the card it finds: nothing to rebuild
+        _loaded = True
+        logger.info("sgl-kernel's sources are not in this SGLang: its kernels are left as it builds them")
         return
     _load()
     _loaded = True

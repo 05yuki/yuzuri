@@ -27,6 +27,7 @@ from yuzuri.hooks import (  # noqa: F401
     mqa_scratch_and_rope,
     model_runner_seams,
     moe_layer_kt_methods,
+    park,
     mxfp4_fp32,
     mxfp4_runner_resident,
     prefix_cache_replay_window,

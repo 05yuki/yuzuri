@@ -138,6 +138,10 @@
    "path": "srt/layers/moe/kt_lend.py"
   },
   {
+   "module": "sglang.srt.layers.moe.kt_park",
+   "path": "srt/layers/moe/kt_park.py"
+  },
+  {
    "module": "sglang.srt.layers.moe.kt_lend_probe",
    "path": "srt/layers/moe/kt_lend_probe.py"
   },

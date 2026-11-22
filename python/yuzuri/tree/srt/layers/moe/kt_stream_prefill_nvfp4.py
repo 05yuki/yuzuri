@@ -44,6 +44,12 @@ import torch
 from sglang.srt.runtime_context import get_parallel
 
 
+
+def _peer_gone(t0: float) -> bool:
+    from sglang.srt.layers.moe import kt_stream_prefill
+
+    return kt_stream_prefill.peer_gone(t0)
+
 def get_tensor_model_parallel_rank() -> int:
     return get_parallel().tp_rank
 
@@ -617,7 +623,7 @@ class KTStreamPrefill:
                         break
                     except (FileNotFoundError, ConnectionRefusedError):
                         c.close()
-                        if time.time() - t0 > 600:
+                        if _peer_gone(t0):
                             raise
                         time.sleep(0.05)
                 layers = sorted(per_rank[r])

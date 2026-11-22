@@ -37,6 +37,9 @@
 //                                   bytes moved, or -1 when the device has no memory for one
 //   kv_vmm_device_bytes(ptr)        how many bytes from the start of ptr's range are
 //                                   device memory (its whole size when none is host)
+//   kv_vmm_park(device) / kv_vmm_unpark(device)
+//                                   every mapped device chunk of the device's ranges to host memory and
+//                                   unmapped, and back with its contents
 //   KV_VMM_RELEASED_ZERO=1          every range behaves so: a released chunk reads as
 //                                   zeros instead of faulting (a diagnostic for stray
 //                                   reads of lent KV pages; 10-17)
@@ -65,6 +68,7 @@ typedef struct {
   unsigned char* hostm;  // per chunk, 1 = host memory; NULL: host_from decides (kv_vmm_place_range sets it)
   int numa;       // their NUMA node
   CUmemGenericAllocationHandle* h;  // 0 = unmapped (zero: the zero chunk)
+  void** park;  // per chunk, its contents in host memory while kv_vmm_park holds it (NULL: none parked)
 } alloc_t;
 
 static alloc_t allocs[MAX_ALLOCS];
@@ -302,6 +306,10 @@ void kv_vmm_free(void* ptr, ssize_t size, int device, void* stream) {
       }
     }
     cuMemAddressFree(a->va, a->size);
+    if (a->park) {
+      for (int i = 0; i < a->nch; i++) free(a->park[i]);
+      free(a->park);
+    }
     free(a->h);
     free(a->hostm);
     allocs[k] = allocs[--nallocs];
@@ -380,6 +388,76 @@ long long kv_vmm_restore(void* ptr, size_t off, size_t len) {
   }
   pthread_mutex_unlock(&mu);
   return n;
+}
+
+// kv_vmm_park(device): every device chunk mapped under a range of the device goes to host memory (an ordinary
+// buffer a chunk) and is unmapped, so the card holds none of them; the ranges, their tensors and the graphs that
+// name them stay where they are. kv_vmm_unpark(device) maps each again and copies it back. For a server that
+// leaves the cards while another runs (kt_park): the pools that are not token KV (recurrent states, tables) keep
+// their contents this way. Returns the bytes moved, or -1 (a park that fails has put back what it took).
+long long kv_vmm_unpark(int device);
+
+long long kv_vmm_park(int device) {
+  if (device < 0 || device >= MAX_DEV) return -1;
+  pthread_mutex_lock(&mu);
+  long long n = 0;
+  int bad = 0;
+  if (!ok(cuCtxSynchronize(), "cuCtxSynchronize (park)")) bad = 1;
+  for (int k = 0; k < nallocs && !bad; k++) {
+    alloc_t* a = &allocs[k];
+    if (a->device != device) continue;
+    for (int i = 0; i < a->nch && !bad; i++) {
+      if (!a->h[i] || is_host(a, i)) continue;
+      if (!a->park) a->park = (void**)calloc((size_t)a->nch, sizeof(void*));
+      void* buf = a->park ? malloc(a->chunk) : NULL;
+      if (!buf || !ok(cuMemcpyDtoH(buf, a->va + (size_t)i * a->chunk, a->chunk), "cuMemcpyDtoH (park)")) {
+        free(buf);
+        bad = 1;
+        break;
+      }
+      a->park[i] = buf;
+      unmap_chunk(a, i);
+      released[device] += a->chunk;
+      n += (long long)a->chunk;
+    }
+  }
+  pthread_mutex_unlock(&mu);
+  if (bad) {
+    kv_vmm_unpark(device);
+    return -1;
+  }
+  return n;
+}
+
+long long kv_vmm_unpark(int device) {
+  if (device < 0 || device >= MAX_DEV) return -1;
+  pthread_mutex_lock(&mu);
+  long long n = 0;
+  int bad = 0;
+  for (int k = 0; k < nallocs; k++) {
+    alloc_t* a = &allocs[k];
+    if (a->device != device || !a->park) continue;
+    for (int i = 0; i < a->nch; i++) {
+      if (!a->park[i]) continue;
+      if (!a->h[i]) {
+        if (!map_chunk(a, i)) {
+          bad = 1;  // its contents stay in host memory for another try
+          continue;
+        }
+        released[device] -= a->chunk;
+      }
+      if (!ok(cuMemcpyHtoD(a->va + (size_t)i * a->chunk, a->park[i], a->chunk), "cuMemcpyHtoD (unpark)")) {
+        bad = 1;
+        continue;
+      }
+      free(a->park[i]);
+      a->park[i] = NULL;
+      n += (long long)a->chunk;
+    }
+  }
+  if (!ok(cuCtxSynchronize(), "cuCtxSynchronize (unpark)")) bad = 1;
+  pthread_mutex_unlock(&mu);
+  return bad ? -1 : n;
 }
 
 // the chunk size of the allocation that holds ptr (0: not kv_vmm memory)

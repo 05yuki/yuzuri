@@ -33,11 +33,14 @@ if [[ "${1:-}" == "--package" ]]; then
   nvcc_ver="$("$py" -c 'import importlib.metadata as m; print(m.version("nvidia-cuda-nvcc"))' 2>/dev/null || true)"
   have="$("$py" -c 'import importlib.metadata as m; print(m.version("nvidia-cuda-tileiras"))' 2>/dev/null || true)"
   if [[ -n "$nvcc_ver" && "$have" != "$nvcc_ver" ]]; then
+    # tileiras compiles FlashInfer's cuTile kernels, which only an NVFP4 checkpoint loads: a venv whose nvcc has no
+    # tileiras of its version (13.0 has none) still serves every other format
     if command -v uv >/dev/null 2>&1; then
-      uv pip install --python "$py" --no-deps "nvidia-cuda-tileiras==$nvcc_ver"
+      uv pip install --python "$py" --no-deps "nvidia-cuda-tileiras==$nvcc_ver" || tileiras_missing=1
     else
-      "$py" -m pip install --no-deps "nvidia-cuda-tileiras==$nvcc_ver"
+      "$py" -m pip install --no-deps "nvidia-cuda-tileiras==$nvcc_ver" || tileiras_missing=1
     fi
+    [[ -z "${tileiras_missing:-}" ]] || echo "no nvidia-cuda-tileiras $nvcc_ver to install (above): an NVFP4 checkpoint's cuTile kernels will not compile in this venv until nvcc and tileiras have one version; other formats are not affected" >&2
   fi
   # kt-kernel's and FlashInfer's Python files are not written to: a launch makes its copies of six of them with
   # Yuzuri's edits (python/yuzuri/_patched.py). Made here once, so an edit that does not fit this venv stops now

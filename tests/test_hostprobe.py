@@ -37,6 +37,26 @@ class Watermarks(unittest.TestCase):
             self.assertGreaterEqual(n["watermark_high"], 0)
             self.assertGreaterEqual(n["mem_kernel"], 0)
 
+class Visible(unittest.TestCase):
+    G = [{"index": 0, "uuid": "GPU-aaaa-1", "numa_node": 0}, {"index": 1, "uuid": "GPU-bbbb-2", "numa_node": 1}]
+
+    def test_unset_is_every_card(self):
+        self.assertEqual(hostprobe.visible(self.G, None), self.G)
+        self.assertEqual(hostprobe.visible(self.G, ""), self.G)
+
+    def test_an_index_picks_that_card(self):
+        self.assertEqual([g["numa_node"] for g in hostprobe.visible(self.G, "1")], [1])
+
+    def test_order_is_the_callers(self):
+        self.assertEqual([g["index"] for g in hostprobe.visible(self.G, "1,0")], [1, 0])
+
+    def test_a_uuid_prefix(self):
+        self.assertEqual([g["index"] for g in hostprobe.visible(self.G, "GPU-bbbb")], [1])
+
+    def test_a_card_that_is_not_there_stops(self):
+        with self.assertRaises(SystemExit):
+            hostprobe.visible(self.G, "2")
+
 
 if __name__ == "__main__":
     unittest.main()

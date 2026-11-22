@@ -88,6 +88,23 @@ GGML_TYPE_MXFP4 = 39
 ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
 
 
+
+_PEER_SAID = {}
+
+
+def peer_gone(t0: float, what: str = "another rank") -> bool:
+    """While a rank waits for another rank's part of the hand-over: False for as long as the server lives. A load
+    that takes long is not a failure (a 96 GiB table written to its file kept one rank loading for twelve minutes
+    while the other gave up after ten, 11-22); SGLang ends every rank when one dies, and a rank whose parent is gone
+    stops here."""
+    if os.getppid() == 1:
+        return True
+    minute = int((time.time() - t0) // 60)
+    if minute >= 2 and _PEER_SAID.get(what) != minute:
+        _PEER_SAID[what] = minute
+        print(f"[kt-stream] still waiting for {what} after {minute} min: it is loading", flush=True)
+    return False
+
 def _block_rows(T: int) -> int:
     return min(T, ROW_BLOCK) if ROW_BLOCK > 0 else T
 # KT_SWIGLU_CLAMP=0: the streamed experts' clamp lookup and W16 call as they
@@ -362,7 +379,7 @@ class _Flags:
         t0 = time.time()
         while self.arr[i] < v:
             time.sleep(0.0001)
-            if time.time() - t0 > 600:
+            if peer_gone(t0):
                 raise RuntimeError(f"kt-stream: waited 600 s for {what} (flag {i} >= {v}, is {self.arr[i]})")
 
     # layout helpers
@@ -646,7 +663,7 @@ class KTStreamPrefill:
                         break
                     except (FileNotFoundError, ConnectionRefusedError):
                         c.close()
-                        if time.time() - t0 > 600:
+                        if peer_gone(t0):
                             raise
                         time.sleep(0.05)
                 layers = sorted(per_rank[r])

@@ -155,6 +155,36 @@ yuzuri/tools/serve.py --package --venv <the server's venv> --config-dir <checkpo
 
 - The first launch of an NVFP4 model compiles FlashInfer's cuTile kernels.
 
+## Several models on the same cards
+
+Servers that take turns: the one a request names runs on all the cards and both sockets, the others wait in host memory with their sessions.
+
+```sh
+yuzuri/tools/front.py --port 8000 --serve-arg "--package --venv <the server's venv> --tp 2" \
+    --model <checkpoint dir A> --model <checkpoint dir B>
+```
+
+- The front starts a server for each model, one after the other.
+  Each is parked before the next one starts beside it.
+
+- A request names its model, as on any OpenAI-compatible server.
+  When that model is the one that waits, the front lets the running requests finish, parks that server and resumes the other.
+  Requests keep their order.
+
+- A parked server keeps its prefix cache: a prompt it has seen is not computed again after it comes back.
+
+- A switch took about 5 s between Flash-Next NVFP4 and Gemma 4 26B on two 16 GB cards (park 3.4 to 4.1 s, resume 1.2 to 1.6 s).
+
+- A parked server leaves 1.0 to 1.7 GiB on a card: the CUDA context, the kernels, the libraries' own workspaces.
+
+- RAM decides which models fit together: every server keeps its experts in RAM while it waits.
+  A launch beside other servers that does not fit stops with the numbers.
+
+- `--model` also takes serve.py arguments after the directory, or a model's own launcher: see `tools/front.py --help`.
+  `--backend <url>` puts the front before servers started by hand with `YUZURI_PARK=1`.
+
+- A server started with `YUZURI_PARK=1` parks and resumes on `POST /yuzuri/park` and `/yuzuri/resume`, and answers 503 to requests while it is parked.
+
 ## Features
 
 Every feature is on by default, and each can be turned off on its own.

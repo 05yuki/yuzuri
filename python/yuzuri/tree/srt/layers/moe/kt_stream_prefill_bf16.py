@@ -55,6 +55,12 @@ USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"
 ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
 
 
+
+def _peer_gone(t0: float) -> bool:
+    from sglang.srt.layers.moe import kt_stream_prefill
+
+    return kt_stream_prefill.peer_gone(t0)
+
 def _rows(T: int) -> int:
     """Rows a kernel call takes for a chunk of T rows."""
     return min(T, ROW_BLOCK) if ROW_BLOCK > 0 else T
@@ -174,7 +180,7 @@ class KTStreamPrefill:
                         break
                     except (FileNotFoundError, ConnectionRefusedError):
                         c.close()
-                        if time.time() - t0 > 600:
+                        if _peer_gone(t0):
                             raise
                         time.sleep(0.05)
                 layers = sorted(per_rank[r])

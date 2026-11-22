@@ -261,14 +261,19 @@ def window_free(index: int):
     """The free memory the next window starts with: free now, plus the holders' parts, plus the smallest error
     measured at the last window starts. None until a window start has been measured.
     In a window, the free memory its chunks have, on the base the forwards' cost is measured on: free now plus
-    what torch reserved since the window's start (the cost counts that growth). The KV loan is already in the
+    what the window allocated since its start (the cost counts that growth) and torch's returnable cache. The KV loan is already in the
     free memory. What else the window mapped since its start stays taken: the scratch grown to a larger chunk, and
     the SWA pages."""
     from sglang.srt.layers.moe import kt_lend
 
     st = kt_lend.STATE
-    if st.get("phase") == "prefill" and st.get("pf_base") is not None:
-        return int(torch.cuda.mem_get_info(index)[0]) + int(torch.cuda.memory_reserved(index) - st["pf_base"])
+    if st.get("phase") == "prefill" and st.get("pf_abase") is not None:
+        # free now, what torch's cache would hand back, and what the window has allocated since its start (a
+        # forward's cost is counted from there). Not everything torch reserved since: the idle blocks of the scratch
+        # region's own pool stay reserved, serve no plain allocation and are in no forward's cost. Counting them, a
+        # launch's calibration planned 21,888-row chunks into 8.4 GiB where 7.3 were there (Flash-Next NVFP4, 11-22)
+        return (int(torch.cuda.mem_get_info(index)[0]) + _releasable(index)
+                + int(torch.cuda.memory_allocated(index) - st["pf_abase"]))
     errs = ERRS.get(index)
     if not errs:
         return None
