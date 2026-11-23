@@ -119,7 +119,7 @@ What it leaves alone:
 
 - kt-kernel's C++ extension is not rebuilt.
   - `setup.sh` reports what that build lacks and what Yuzuri turns off for it (`tools/check-kt-kernel.py`).
-  - Those are NVFP4 one-byte scale codes for the hot lend's refill, and GGUF weight types.
+  - Those are NVFP4 one-byte scale codes for the CPU decode, and GGUF weight types.
 
 To undo it:
 
@@ -271,8 +271,8 @@ TP=1 is one card and the socket next to it.
   On and off differ by the launch-to-launch spread of one configuration.
   Gemma answers in a chat template, so its number on bare text only compares on with off.
 
-Each on row is one launch on 2026-11-17, `tools/check.py --prompt 35000 --long 131072`.
-Each off row's decode and NLL are one launch on 2026-11-17.
+Each on row is one launch on 2026-11-23, `tools/check.py --prompt 35000 --long 131072`.
+Each off row's decode and NLL are one launch on 2026-11-17, on the same host.
 Its pool, hot count, prefill and long decode are the same settings' launch on 2026-11-16.
 The MiMo off row is the 2026-11-16 launch in every column: FP8 KV and `--swa-full-tokens-ratio 0.0657`, where on keeps the bf16 KV `--profile auto` reads.
 
@@ -280,33 +280,33 @@ TP=2:
 
 | model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 3,361 (84–85 a layer) | 112.0 tok/s | 9,023 tok/s | 6,556 tok/s | 74.1 tok/s | 1.7741 |
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 3,401 (85–86 a layer) | 107.0 tok/s | 9,029 tok/s | 6,543 tok/s | 68.4 tok/s | 1.7743 |
 | | | off | 262,144 | 54 a layer | 55.0 tok/s | 440 tok/s | 435 tok/s | 49.6 tok/s | 1.7766 |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 1,484 (49–50 a layer) | 101.5 tok/s | 4,530 tok/s | 2,300 tok/s | 37.7 tok/s | 10.1885 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 1,510 (50–51 a layer) | 99.4 tok/s | 4,512 tok/s | 2,247 tok/s | 40.0 tok/s | 10.1822 |
 | | | off | 88,859 | 1 a layer | 36.2 tok/s | 223 tok/s | does not fit the pool | | 10.1520 |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 4,435 (92–93 a layer) | 67.3 tok/s | 4,590 tok/s | 4,495 tok/s | 54.0 tok/s | 1.5918 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 4,930 (102–103 a layer) | 65.7 tok/s | 4,585 tok/s | 4,467 tok/s | 54.5 tok/s | 1.5927 |
 | | | off | 262,144 | 27 a layer | 46.6 tok/s | 287 tok/s | 283 tok/s | 46.0 tok/s | 1.5882 |
-| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 4,290 (89–90 a layer) | 79.3 tok/s | 4,410 tok/s | 4,181 tok/s | 62.7 tok/s | 1.5966 |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 4,139 (86–87 a layer) | 74.6 tok/s | 4,433 tok/s | 4,127 tok/s | 62.3 tok/s | 1.5954 |
 | | | off | 262,144 | 28 a layer | 54.0 tok/s | 437 tok/s | 438 tok/s | 53.7 tok/s | 1.5973 |
-| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 1,092 (23–24 a layer) | 49.7 tok/s | 1,930 tok/s | 1,158 tok/s | 37.8 tok/s | 1.2330 |
+| MiMo-V2.6-Flash | MXFP4 | on | 1,048,576 | 1,190 (25–26 a layer) | 48.1 tok/s | 1,614 tok/s | 1,140 tok/s | 37.4 tok/s | 1.2335 |
 | | | off | 637,143 | 1 a layer | 27.3 tok/s | 95 tok/s | 94 tok/s | 22.0 tok/s | 1.2334 |
-| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | none | 24.8 tok/s | 1,750 tok/s | 2,173 tok/s | 24.9 tok/s | 1.0697 |
+| GLM-5.3-Flash | NVFP4, FP8 dense | on | 1,048,576 | none | 24.5 tok/s | 2,242 tok/s | 2,245 tok/s | 24.5 tok/s | 1.0752 |
 | | | off | 610,560 | none | 24.5 tok/s | 94 tok/s | 94 tok/s | 23.7 tok/s | 1.0752 |
 
 TP=1:
 
 | model | experts | | pool | hot slots | decode | 35K prefill | 131K prefill | long decode | NLL |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 1,273 (31–32 a layer) | 57.7 tok/s | 5,596 tok/s | 4,044 tok/s | 39.7 tok/s | 1.7781 |
+| Qwen3.5-35B-A3B | bf16 | on | 262,144 | 1,299 (32–33 a layer) | 63.7 tok/s | 7,044 tok/s | 3,871 tok/s | 39.9 tok/s | 1.7753 |
 | | | off | 262,144 | 3 a layer | 36.2 tok/s | 227 tok/s | 223 tok/s | 32.2 tok/s | 1.7755 |
-| Gemma 4 26B-A4B | bf16 | on | 262,144 | 577 (19–20 a layer) | 54.8 tok/s | 2,905 tok/s | 1,168 tok/s | 26.6 tok/s | 10.1858 |
+| Gemma 4 26B-A4B | bf16 | on | 262,144 | 589 (19–20 a layer) | 55.9 tok/s | 2,388 tok/s | 1,088 tok/s | 27.6 tok/s | 10.1883 |
 | | | off | 31,762 | 1 a layer | 28.5 tok/s | 132 tok/s (30,762 tokens) | does not fit the pool | | 10.1983 |
-| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 533 (11–12 a layer) | 37.4 tok/s | 3,010 tok/s | 2,059 tok/s | 33.2 tok/s | 1.5847 |
+| Qwen3.8-Flash-Next | NVFP4 (ModelOpt, W4A4) | on | 262,144 | 731 (15–16 a layer) | 35.2 tok/s | 2,551 tok/s | 2,455 tok/s | 32.2 tok/s | 1.5952 |
 | | | off | 18,240 | 1 a layer | 33.2 tok/s | 166 tok/s (17,240 tokens) | does not fit the pool | | 1.5902 |
-| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 3,018 (62–63 a layer) | 52.9 tok/s | 3,036 tok/s | 2,663 tok/s | 39.5 tok/s | 1.5972 |
+| Qwen3.8-Flash-Next | GGUF IQ3_S | on | 262,144 | 3,064 (63–64 a layer) | 52.7 tok/s | 3,020 tok/s | 2,735 tok/s | 39.6 tok/s | 1.5955 |
 | | | off | 196,416 | 1 a layer | 39.5 tok/s | 267 tok/s | 269 tok/s | 39.2 tok/s | 1.5947 |
 
-- The long decode is below the decode in every row, on and off.
+- The long decode is at or below the decode in every row, on and off.
   Attention reads 131K tokens of KV at each step.
   On falls further than off, by design: the hot slots sit in free KV pages, and a 131K prompt takes those pages back.
   The slots come back when the KV rows are freed.

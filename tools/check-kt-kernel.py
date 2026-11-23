@@ -29,9 +29,10 @@ def main() -> int:
         print("  NVFP4 scale codes: yes")
     else:
         print("  NVFP4 scale codes: no")
-        print("    effect: on an NVFP4 checkpoint the CPU arenas hold the scales folded to bf16, so the hot lend's")
-        print("            slots cannot be refilled from them: the server logs 'dynamic slots off' and the slots keep")
-        print("            the placement's experts (decode is slower on prompts unlike the profile's hot list).")
+        print("    effect: on an NVFP4 checkpoint the CPU arenas hold the block scales folded with scale_2 into fp32.")
+        print("            The CPU experts read those, or one-byte codes the extension makes from them where it reads")
+        print("            KT_MXFP4_SCALE_CODES. The hot lend's cuTile slots recover the checkpoint's bytes from the fp32")
+        print("            scales, checked against the checkpoint at launch ('block scales recovered' in the log).")
         print("    build:  kt-kernel with GeneralMOEConfig.scale_codes (kvcache-ai/ktransformers#2268),")
         print("            then run setup.sh --package again.")
 

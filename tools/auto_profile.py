@@ -62,7 +62,8 @@ FORMAT_ENV = {
               "KT_MXFP4_DEC_VCONV": "1", "KT_MXFP4_DEC_PFS": "1024"},
     # KT_MXFP4_SCALE_CODES: the same one-byte codes for NVFP4's block scales (kt-kernel's FP4 kernel serves both;
     # a matrix has at most 127 e4m3 values times one scale_2). Flash-Next, every expert on the CPU: 43.9 -> 47
-    # tok/s, the same tokens (11-23)
+    # tok/s, the same tokens (11-23). serve.py turns it off where the arenas hold the codes already
+    # (KT_SCALE_ARENA_CODES=1)
     "NVFP4": {"KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_MXFP4_SCALE_CODES": "1"},
     "BF16": {"KT_GPU_STREAM_GRAPH": "1"},
     "LLAMAFILE": {"KT_GGUF_NOCOPY": "1", "KT_GGUF_ZEROCOPY": "1", "KT_GGUF_STREAM_MMQ": "1",

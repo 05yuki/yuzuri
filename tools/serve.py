@@ -577,6 +577,10 @@ def main():
             env={**env, "CUDA_VISIBLE_DEVICES": "", "YUZURI_PACKAGE": "0"})
         takes = probe.stdout.strip().endswith("True")
         env["KT_SCALE_ARENA_CODES"] = "1" if takes else "0"
+        if takes:
+            # the arenas hold the codes already: KT_MXFP4_SCALE_CODES would build them again from fp32 scales the
+            # arenas do not hold (a segmentation fault at the first CPU forward)
+            env["KT_MXFP4_SCALE_CODES"] = "0"
         codes_note = ("NVFP4: kt-kernel keeps the checkpoint's e4m3 scale bytes; GPU experts and streamed groups on "
                       "cuTile from them" if takes else
                       "NVFP4: this kt-kernel reads no e4m3 scale codes, so the CPU experts' block scales are folded "
