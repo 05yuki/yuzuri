@@ -1342,6 +1342,195 @@ def _arena_load_cutile(st, L: _Layer, e: int, dst, order: int) -> None:
     dst[("nv", "kt_cutile_w2_alpha")].view(-1).copy_(s2d[e:e + 1]).mul_(g2)
 
 
+# KT_KV_HOT_CUTILE_BATCH=1: cuTile slots are filled by one kernel for all of a batch's slots, reading the registered
+# expert arenas through their host addresses (the card reads them over PCIe), instead of six copies and the scale
+# recovery's kernels a slot from the host: a round's 180 swaps took 30 to 50 ms of host time (11-23)
+CUTILE_BATCH = os.environ.get("KT_KV_HOT_CUTILE_BATCH", "1") == "1"
+CUTILE_CHUNK = 8192  # elements a program
+_CB = {"ok": None, "verified": 0}
+
+
+def _cutile_batch_ok(dev) -> bool:
+    """The card reads registered host memory through the host pointer (CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_
+    REGISTERED_MEM), and Triton is there."""
+    if _CB["ok"] is None:
+        ok = CUTILE_BATCH
+        try:
+            import ctypes
+
+            import triton  # noqa: F401
+
+            cu = ctypes.CDLL("libcuda.so.1")
+            d, v = ctypes.c_int(), ctypes.c_int()
+            index = dev.index if dev.index is not None else torch.cuda.current_device()
+            ok = ok and cu.cuDeviceGet(ctypes.byref(d), index) == 0 and cu.cuDeviceGetAttribute(ctypes.byref(v), 91, d) == 0 \
+                and v.value == 1
+        except Exception:
+            ok = False
+        _CB["ok"] = bool(ok)
+    return _CB["ok"]
+
+
+def _cutile_layer_jobs(st, L: _Layer, js, es, order: int):
+    """_cutile_jobs for all of one layer's (slot, expert) pairs at once, as numpy columns (src, dst, count, kind,
+    divisor): the slots' addresses from each role tensor's base and stride, no tensor made a slot."""
+    li = L.layer_idx
+    ar = st._arenas[li]
+    roles = DYN["roles"][L.idx]
+    T = {key: L.slots[nm] for key, nm in roles.items()}
+    js = np.asarray(js, np.int64)
+    es = np.asarray(es, np.int64)
+
+    def base(key):
+        t = T[key]
+        return t.data_ptr() + js * (t.stride(0) * t.element_size()), t[0].numel() * t.element_size()
+
+    W, wb = base(("w13", False))
+    S, sb = base(("w13", True))
+    W2, w2b = base(("w2", False))
+    S2, s2b = base(("w2", True))
+    A13, a13b = base(("nv", "kt_cutile_w13_alpha"))
+    A2, _ = base(("nv", "kt_cutile_w2_alpha"))
+    nb, cb = wb // 2, sb // 2
+    ws, cs = ar[0][1], ar[3][1]
+    a, b = (0, 1) if order == 0 else (1, 0)
+    p = [ar[k][0].data_ptr() for k in range(6)]
+    cut = DYN.get("cut")
+    f = np.float32
+    if cut is None:
+        s2g, s2d = st._s2[li]
+        s2u = st._s2u.get(li, s2g)
+        g1, g2 = st._g12.get(li, (1.0, 1.0))
+        key = ("host_s2c", li)
+    else:
+        s2g, s2u, s2d, g1, g2 = cut[li]
+        key = ("host_s2", li)
+    hs = _CB.get(key)
+    if hs is None:
+        hs = _CB[key] = tuple(t.float().cpu().numpy() for t in (s2g, s2u, s2d))
+    hg, hu, hd = hs
+    one = np.ones_like(es, dtype=np.float32)
+    cols = [  # (src, dst, count, kind, divisor)
+        (p[a] + es * ws, W, nb // 4, 0, one), (p[b] + es * ws, W + nb, nb // 4, 0, one),
+        (p[2] + es * ws, W2, w2b // 4, 0, one)]
+    if cut is None:
+        cols += [(p[3 + a] + es * cs, S, cb // 4, 0, one), (p[3 + b] + es * cs, S + cb, cb // 4, 0, one),
+                 (p[5] + es * cs, S2, s2b // 4, 0, one)]
+    else:
+        sc = (hg, hu)
+        cols += [(p[3 + a] + es * cs, S, cb, 1, sc[a][es]), (p[3 + b] + es * cs, S + cb, cb, 1, sc[b][es]),
+                 (p[5] + es * cs, S2, s2b, 1, hd[es])]
+    # the alphas in fp32 as _arena_load_cutile's mul_ by a Python float computes them (the scalar in fp32 first)
+    zero = np.zeros_like(es)
+    cols.append((zero, A13, 1, 2, hg[es].astype(f) * f(g1)))
+    if a13b > 4:
+        cols.append((zero, A13 + 4, 1, 2, hu[es].astype(f) * f(g1 / g2)))
+    cols.append((zero, A2, 1, 2, hd[es].astype(f) * f(g2)))
+    n = len(es)
+    return [np.concatenate([np.broadcast_to(np.asarray(c[i], dtype=(np.float32 if i == 4 else np.int64)), (n,))
+                            for c in cols]) for i in range(5)]
+
+
+def _slot_copy_kernel():
+    k = _CB.get("kernel")
+    if k is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _slot_copy(SRC, DST, CNT, KIND, DIV, BLOCK: tl.constexpr):
+            i = tl.program_id(0)
+            src = tl.load(SRC + i)
+            dst = tl.load(DST + i)
+            n = tl.load(CNT + i)
+            kind = tl.load(KIND + i)
+            dv = tl.load(DIV + i)
+            off = tl.arange(0, BLOCK)
+            if kind == 0:
+                for o in range(0, n, BLOCK):
+                    m = o + off < n
+                    v = tl.load(src.to(tl.pointer_type(tl.int32)) + o + off, mask=m)
+                    tl.store(dst.to(tl.pointer_type(tl.int32)) + o + off, v, mask=m)
+            elif kind == 1:
+                for o in range(0, n, BLOCK):
+                    m = o + off < n
+                    v = tl.load(src.to(tl.pointer_type(tl.float32)) + o + off, mask=m, other=0.0)
+                    q = tl.math.div_rn(v, dv).to(tl.float8e4nv)
+                    tl.store(dst.to(tl.pointer_type(tl.float8e4nv)) + o + off, q, mask=m)
+            else:
+                tl.store(dst.to(tl.pointer_type(tl.float32)), dv)
+
+        k = _CB["kernel"] = _slot_copy
+    return k
+
+
+def _run_jobs(cols, dev) -> None:
+    """The jobs (numpy columns src, dst, count, kind, divisor) on the current stream: cut into programs of
+    CUTILE_CHUNK elements, one launch."""
+    src, dst, cnt, kind, div = cols
+    if not len(src):
+        return
+    C = CUTILE_CHUNK
+    pieces = np.maximum(1, -(-cnt // C))
+    rep = np.repeat(np.arange(len(src)), pieces)
+    first = np.repeat(np.cumsum(pieces) - pieces, pieces)
+    o = (np.arange(rep.size) - first) * C  # this program's first element in its job
+    k = kind[rep]
+    table = np.stack((src[rep] + o * 4, dst[rep] + o * np.where(k == 0, 4, 1), np.minimum(C, cnt[rep] - o), k,
+                      div[rep].astype(np.float32).view(np.int32).astype(np.int64)))
+    host = torch.from_numpy(np.ascontiguousarray(table).reshape(-1)).pin_memory()
+    t = host.to(dev, non_blocking=True)
+    R = rep.size
+    _slot_copy_kernel()[(R,)](t[:R], t[R:2 * R], t[2 * R:3 * R], t[3 * R:4 * R],
+                               t[4 * R:].to(torch.int32).view(torch.float32), BLOCK=1024, num_warps=4)
+    _CB.setdefault("keep", []).append(host)  # the pinned table lives until its copy is done (a few rounds)
+    del _CB["keep"][:-8]
+
+
+def _cutile_fill_many(groups, order: int) -> list:
+    """[(layer, [(slot, expert)])] into their cuTile slots by one _run_jobs; returns the groups this path did not
+    take (the caller loads them one by one)."""
+    from sglang.srt.layers.moe import kt_stream_prefill
+
+    st = kt_stream_prefill._instance
+    left, jobs, done, dev = [], [], [], None
+    for L, loads in groups:
+        roles = DYN["roles"][L.idx]
+        if not loads or ("nv", "kt_cutile_w13_alpha") not in roles or st is None:
+            left.append((L, loads))
+            continue
+        dev = L.slots[roles[("w13", False)]].device
+        if not _cutile_batch_ok(dev):
+            left.append((L, loads))
+            continue
+        st._register_arenas(L.layer_idx)
+        jobs.append(_cutile_layer_jobs(st, L, [j for j, _ in loads], [e for _, e in loads], order))
+        done.append((L, loads))
+    if jobs:
+        _run_jobs([np.concatenate([c[i] for c in jobs]) for i in range(5)], dev)
+    if done and _CB["verified"] < 3 and not torch.cuda.is_current_stream_capturing():
+        _CB["verified"] += 1
+        L, loads = done[0]
+        roles = DYN["roles"][L.idx]
+        j, e = loads[0]
+        got = {key: L.slots[nm][j] for key, nm in roles.items()}
+        ref = {key: torch.empty_like(t) for key, t in got.items()}
+        _arena_load(L, e, ref, order)
+        torch.cuda.synchronize(dev)
+        bad = {str(k): int((ref[k].reshape(-1).view(torch.uint8) != got[k].reshape(-1).view(torch.uint8)).sum())
+               for k in ref}
+        if any(bad.values()):
+            raise RuntimeError(f"KT_KV_HOT_CUTILE_BATCH: layer {L.layer_idx} slot {j} (expert {e}) differs from the "
+                               f"slot-by-slot load: {bad}")
+        _log(f"cuTile batch fill: layer {L.layer_idx} slot {j} (expert {e}) equal to the slot-by-slot load "
+             f"({sum(len(x) for _, x in done)} slots in one launch)")
+    return left
+
+
+def _cutile_fill(L: _Layer, loads, order: int) -> bool:
+    return not _cutile_fill_many([(L, loads)], order)
+
+
 def _arena_load_bf16(st, L: _Layer, e: int, dst, order: int) -> None:
     """_arena_load for the BF16 method: kt-kernel's arenas hold the plain row-major bf16
     rows ([N, K] gate and up, [K, N] down), the slot layout's own bytes: three copies."""
@@ -1837,6 +2026,8 @@ def _dyn_fill(L: _Layer, k: int, lo=None) -> None:
         _arena_fill_batch(L, loads, DYN["order"])
     elif way == "marlin":
         _marlin_fill_batch(L, loads, DYN["order"])
+    elif FILL_BATCH and _cutile_fill(L, loads, DYN["order"]):
+        pass
     else:
         for j, e in loads:
             _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
@@ -2244,7 +2435,14 @@ def _dyn_round_impl(dev) -> None:
         side = DYN["stream"]
         with torch.cuda.stream(side):
             side.wait_event(DYN["ev_unmap"])
-            for L, w, i, _, e in swaps:
+            rest = swaps
+            if CUTILE_BATCH and all(w == 0 for _, w, _, _, _ in swaps):
+                by = {}
+                for L, w, i, _, e in swaps:
+                    by.setdefault(L.idx, (L, []))[1].append((i, e))
+                rest = [(L, 0, i, None, e) for L, loads in _cutile_fill_many(list(by.values()), DYN["order"])
+                        for i, e in loads]
+            for L, w, i, _, e in rest:
                 if w == 0:
                     dst = {key: L.slots[nm][i] for key, nm in DYN["roles"][L.idx].items()}
                 else:
@@ -2383,10 +2581,15 @@ def _spread_step(dev) -> None:
             h = have[li] = set(L.held[: L.k])
         if j >= L.k or L.held[j] != -1 or e in h:
             continue  # the slot went (a shrink) or a round filled it, or put the expert elsewhere
-        _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
         L.held[j] = e
         h.add(e)
         rows.append((li, e, j))
+    by = {}
+    for li, e, j in rows:
+        by.setdefault(li, (LAYERS[li], []))[1].append((j, e))
+    for L, loads in _cutile_fill_many(list(by.values()), DYN["order"]):
+        for j, e in loads:
+            _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
     if rows:
         t = torch.tensor(rows, dtype=torch.int64).to(dev)
         STATE["tbl"][t[:, 0], t[:, 1]] = t[:, 2]

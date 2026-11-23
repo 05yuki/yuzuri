@@ -32,6 +32,8 @@ import os
 
 import torch
 
+from sglang.srt.layers.moe import kt_nvfp4_decode
+
 ENABLED = os.environ.get("KT_CUTILE_NVFP4", "1") == "1"
 
 # (convention, parameter suffixes: weights, block scales, the weights' global, the activations' global, and
@@ -489,8 +491,35 @@ class CutileNvfp4Method:
         w = topk.topk_weights.float()
         w = torch.where(ids < 0, torch.zeros_like(w), w)  # the CPU's routes add nothing
         wp, ts = self._pack(layer)
+        a4 = layer.__dict__["_kt_cutile"]["a4"]
+        if x.shape[0] <= kt_nvfp4_decode.ROWS:
+            why = kt_nvfp4_decode.supports(x, self.activation, ts[0], ts[3])
+            if not why:
+                out = kt_nvfp4_decode.run(x, ids, w, ts[0], ts[1], ts[2], ts[3], ts[4], ts[5], ts[6], a4, self.activation)
+                if kt_nvfp4_decode.CHECK and kt_nvfp4_decode._CHECKED[0] < kt_nvfp4_decode.CHECK \
+                        and not torch.cuda.is_current_stream_capturing():
+                    kt_nvfp4_decode._CHECKED[0] += 1
+                    act = MoEActivationPack(x, None, ids, w, routing_input_mode=RoutingInputMode.PackedPrecomputed)
+                    moe, ceiling = _moe(int(ts[0].shape[0]), int(x.shape[1]), int(ts[3].shape[2]) * 2,
+                                        int(ids.shape[1]), self.activation, a4, x.device)
+                    with _scratch(x.shape[0], ceiling):
+                        ref = moe(act, wp)
+                    _release(moe, x.shape[0], ceiling)
+                    d = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-30)
+                    _log(f"decode kernel against cuTile, {x.shape[0]} rows, layer {getattr(layer, 'layer_id', '?')}: "
+                         f"relative difference {float(d):.2e}")
+            else:
+                _log(f"the decode kernel does not take this layer ({why}): cuTile runs it", once="decode-" + why)
+                out = None
+        else:
+            out = None
+        if out is not None:
+            rsf = getattr(self.moe_runner_config, "routed_scaling_factor", None)
+            if rsf is not None and float(rsf) != 1.0:
+                out.mul_(float(rsf))
+            return StandardCombineInput(hidden_states=out)
         moe, ceiling = _moe(int(ts[0].shape[0]), int(x.shape[1]), int(ts[3].shape[2]) * 2, int(ids.shape[1]),
-                            self.activation, layer.__dict__["_kt_cutile"]["a4"], x.device)
+                            self.activation, a4, x.device)
         outs = []
         step = min(ceiling, ROWS)
         for lo in range(0, x.shape[0], step):

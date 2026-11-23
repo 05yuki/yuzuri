@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-281 names.
+286 names.
 
 ## KT_
 
@@ -123,6 +123,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_KV_HOT_CHECK_DUMP_REL` | `"0.2"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_CHECK_REPEAT` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_CHECK_SLOT_REL` | `"0.05"` | kt_kv_hot_lend.py |
+| `KT_KV_HOT_CUTILE_BATCH` | `"1"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYNAMIC_RESIDENT` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYNAMIC_SLOTS` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_DYN_ASYNC` | `"1"` | kt_kv_hot_lend.py |
@@ -182,6 +183,10 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_NAN_TRACE` | - | model_runner_seams.py |
 | `KT_NAN_TRACE_LINES` | `"12"` | kt_nan_trace.py |
 | `KT_NUMA_NODES` | - | kt_ep_methods.py |
+| `KT_NVFP4_DECODE_CHECK` | `"0"` | kt_nvfp4_decode.py |
+| `KT_NVFP4_DECODE_G1` | `"16,128,8"` | kt_nvfp4_decode.py |
+| `KT_NVFP4_DECODE_G2` | `"16,4"` | kt_nvfp4_decode.py |
+| `KT_NVFP4_DECODE_ROWS` | `"4"` | kt_nvfp4_decode.py |
 | `KT_NVFP4_STREAM_W16` | `"0"` | kt_stream_prefill_nvfp4.py |
 | `KT_PREFILL_KV_LEND` | `"0"` | kt_kv_prefill_lend.py |
 | `KT_PREFILL_KV_LEND_CHECK` | `"0"` | kt_kv_prefill_lend.py |

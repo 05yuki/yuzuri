@@ -14,6 +14,10 @@
    "path": "srt/layers/moe/kt_cutile_nvfp4.py"
   },
   {
+   "module": "sglang.srt.layers.moe.kt_nvfp4_decode",
+   "path": "srt/layers/moe/kt_nvfp4_decode.py"
+  },
+  {
    "module": "sglang.srt.layers.moe.kt_ep_methods",
    "path": "srt/layers/moe/kt_ep_methods.py"
   },
