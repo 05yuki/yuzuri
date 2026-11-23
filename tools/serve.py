@@ -159,6 +159,41 @@ def sh(cmd, **kw):
     return r.stdout
 
 
+def wait_for_leaving(probe, limit_s=180.0, unlisted_min=1 << 30):
+    """The host as hostprobe reads it, once no card holds memory for a server on its way out.
+
+    A server that was just stopped leaves nvidia-smi's listing several seconds before the driver frees its memory:
+    that waits for the last process with the card's device file open (its launcher). A plan made in between reads
+    the memory as taken and sizes the launch from what is left. So when a card holds more than unlisted_min that no
+    listed process accounts for, and no listed process is using the cards, this waits for the processes hostprobe
+    found holding the card unlisted to end (or, when it can read none, for the memory to come back), then probes
+    again. After limit_s it stops with the cards, the memory and the processes."""
+    t0 = time.time()
+    said = set()
+    while True:
+        host = probe()
+        if host["gpu_in_use"]:
+            return host  # a server is on the cards: the check after this says so, or --beside starts next to it
+        held = [g for g in host.get("gpu_leaving", []) if g["unlisted"] > unlisted_min]
+        if not held:
+            return host
+        pids = sorted({p["pid"] for g in held for p in g["pids"]})
+        key = (tuple(pids), len(held))
+        what = ", ".join("%.1f GiB" % (g["unlisted"] / (1 << 30)) for g in held)
+        if key not in said:
+            said.add(key)
+            print(f"! the cards hold {what} for no listed process: waiting for "
+                  + (", ".join(sorted({f"{p['name']}({p['pid']})" for g in held for p in g["pids"]}))
+                     or "the driver to free it")
+                  + " to end", flush=True)
+        if time.time() - t0 > limit_s:
+            raise SystemExit(f"the cards still hold {what} for no listed process after {limit_s:.0f} s "
+                             f"(processes holding them: {pids or 'none readable'})")
+        end = time.time() + 5.0
+        while time.time() < end and any(os.path.exists(f"/proc/{p}") for p in pids):
+            time.sleep(0.1)
+        if not pids:
+            time.sleep(1.0)
 
 
 def model_layers(config_dir):
@@ -361,7 +396,8 @@ def main():
         cuda_home = wheels[0] if wheels and os.path.exists(os.path.join(wheels[0], "bin", "nvcc")) else "/usr/local/cuda"
 
     # --- host, defaults for this TP, model, plan
-    host = json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json", "--mounts", experts_dir]))
+    host = wait_for_leaving(lambda: json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json",
+                                                   "--mounts", experts_dir])))
     if host["gpu_in_use"]:
         who = ", ".join(f"{u['name']}({u['pid']}, {u['used'] / (1 << 30):.1f} GiB)" for u in host["gpu_in_use"])
         if not a.beside:

@@ -183,13 +183,65 @@ def gpus():
         u, pid, pname, mem = [v.strip() for v in line.split(",")]
         if any(g["uuid"] == u for g in res):  # another server on a card this launch does not take is not in its way
             using.append({"gpu_uuid": u, "pid": int(pid), "name": pname, "used": int(mem) * 2**20})
+    leaving = _leaving(smi, res)
     cuda = ""
     nvcc = shutil.which("nvcc") or ("/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc") else None)
     if nvcc:
         v = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout
         m = re.search(r"release (\d+\.\d+)", v)
         cuda = m.group(1) if m else ""
-    return res, {"driver": driver, "cuda_toolkit": cuda, "in_use": using}
+    return res, {"driver": driver, "cuda_toolkit": cuda, "in_use": using, "leaving": leaving}
+
+
+def _leaving(smi, res):
+    """Memory a card holds for no process nvidia-smi lists, and the processes that still have the card's device file
+    open without being listed. A server on its way out looks like this: its schedulers are gone from the listing,
+    and the driver keeps their memory until the last process with the device file open ends (the launcher, about
+    6 s later on a 16 GB card). A running server's other processes (tokenizer, detokenizer) hold the file too, with
+    no memory, so the memory says whether anything is leaving. Only this user's processes can be read."""
+    listed_mib = {}  # bus -> MiB nvidia-smi lists for the card's processes, every type (G as well as C)
+    pids = set()
+    out = subprocess.run([smi, "-q", "-d", "PIDS"], capture_output=True, text=True).stdout
+    bus = None
+    for line in out.splitlines():
+        s = line.strip()
+        m = re.match(r"^GPU ([0-9A-Fa-f]+:[0-9A-Fa-f]+:[0-9A-Fa-f]+\.[0-9A-Fa-f]+)$", s)
+        if m:
+            bus = m.group(1).lower()
+        elif s.startswith("Process ID") and bus:
+            pids.add(int(s.split(":")[1]))
+        elif s.startswith("Used GPU Memory") and bus and "MiB" in s:
+            listed_mib[bus] = listed_mib.get(bus, 0) + int(s.split(":")[1].split()[0])
+    minors = {}
+    for g in res:
+        b = g["bus"].lower()
+        info = _read(f"/proc/driver/nvidia/gpus/{b[4:] if b.startswith('00000000:') else b}/information")
+        m = re.search(r"Device Minor:\s*(\d+)", info)
+        if m:
+            minors[f"/dev/nvidia{m.group(1)}"] = g
+    holders = {}
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) in pids or int(p) == os.getpid():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{p}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                t = os.readlink(f"/proc/{p}/fd/{fd}")
+            except OSError:
+                continue
+            if t in minors:
+                holders.setdefault(minors[t]["uuid"], set()).add(int(p))
+    res_by_uuid = {}
+    for g in res:
+        b = g["bus"].lower()
+        res_by_uuid[g["uuid"]] = {"unlisted": max(0, g["vram_used"] - listed_mib.get(b, 0) * 2**20),
+                                  "pids": sorted(holders.get(g["uuid"], set()))}
+    return [{"gpu_uuid": u, "unlisted": v["unlisted"],
+             "pids": [{"pid": p, "name": _read(f"/proc/{p}/comm", "?").strip()} for p in v["pids"]]}
+            for u, v in res_by_uuid.items()]
 
 
 def memory_settings():
@@ -228,7 +280,7 @@ def probe(mount_paths):
     return {"hostname": os.uname().nodename, "kernel": os.uname().release, "cpu": cpu_info(), "numa": numa_nodes(),
             "allowed": allowed(),
             "gpus": g, "driver": gmeta.get("driver"), "cuda_toolkit": gmeta.get("cuda_toolkit"),
-            "gpu_in_use": gmeta.get("in_use", []), "memory": memory_settings(),
+            "gpu_in_use": gmeta.get("in_use", []), "gpu_leaving": gmeta.get("leaving", []), "memory": memory_settings(),
             "load_1m": os.getloadavg()[0], "mounts": mounts(mount_paths)}
 
 
