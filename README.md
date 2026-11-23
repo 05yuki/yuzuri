@@ -173,9 +173,10 @@ yuzuri/tools/front.py --port 8000 --serve-arg "--package --venv <the server's ve
 
 - A parked server keeps its prefix cache: a prompt it has seen is not computed again after it comes back.
 
-- A switch took about 5 s between Flash-Next NVFP4 and Gemma 4 26B on two 16 GB cards (park 3.4 to 4.1 s, resume 1.2 to 1.6 s).
+- A switch between Flash-Next NVFP4 and Gemma 4 26B on two 16 GB cards adds about 2 s to the first token (park 0.8 to 1.1 s, resume 0.4 s).
+  The first park of a server takes longer: it makes its pinned host buffers once.
 
-- A parked server leaves 1.0 to 1.7 GiB on a card: the CUDA context, the kernels, the libraries' own workspaces.
+- A parked server leaves 1.0 to 1.9 GiB on a card: the CUDA context, the kernels, the libraries' own workspaces.
 
 - RAM decides which models fit together: every server keeps its experts in RAM while it waits.
   A launch beside other servers that does not fit stops with the numbers.
@@ -419,6 +420,10 @@ python -m unittest discover -s tests
   - The hook helper is run against a stand-in module: a matching function, one that gained a parameter, one that
     lost one, a tree that already carries the change, a line a rewrite looks for that is gone.
   - The tables are checked against the tree: hooks, features, manifest, licenses, file names in the text.
+
+- `tools/ref-nll-hf.py` scores the same 24 pieces as `tools/nll.py` with the model's own class in transformers, one block at a time on one card.
+  It shares no code with the server, so `tools/nll.py compare ref.json served.json` says how far the server is from it.
+  ModelOpt NVFP4 experts take their arithmetic from NVIDIA ModelOpt (`--modelopt <dir>`).
 
 - `tests/gpu/test_kv_vmm.py` and `tools/test_gpu_parts.py` need a CUDA card.
   They check the KV library and Yuzuri's own GPU parts against plain torch.

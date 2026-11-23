@@ -1138,6 +1138,25 @@ def _nv_setup(st) -> str:
         return "the streamer has no one-byte block scales (KT_GPU_STREAM_SCALE_BYTES=1)"
     if any(M.nv_isc is None for M in LAYERS):
         return "a shadow has no input scales"
+    return _nv_setup_up(st)
+
+
+def _nv_setup_up(st) -> str:
+    """DYN["nv"]: every layer's (gate, up, down) scale_2, the up ones read from the checkpoint here."""
+    import json
+    import sys
+
+    from safetensors import safe_open
+
+    from sglang.srt.layers.moe import kt_stream_prefill
+
+    if any(M.layer_idx not in st._s2 for M in LAYERS):
+        # the streamer reads its gate and down scale_2 at its first streamed prefill: a decode came first
+        if not hasattr(st, "_load_scale_2"):
+            return "the streamer holds no scale_2 of the layers"
+        st._load_scale_2(LAYERS[0].wrapper)
+        if any(M.layer_idx not in st._s2 for M in LAYERS):
+            return "the streamer's scale_2 does not cover the layers"
     path = LAYERS[0].wrapper.kt_config.weight_path
     idx = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
     sample = next((k for k in idx if ".mlp.experts.0.up_proj.weight_scale_2" in k), None)
@@ -1205,24 +1224,91 @@ def _arena_load_nvfp4(st, L: _Layer, e: int, dst, order: int) -> None:
 
 def _cutile_setup(st) -> str:
     """What the cuTile NVFP4 loads need beyond the arenas, or why they cannot be made: the block scales as the
-    checkpoint's one-byte e4m3 codes in the arenas (KT_SCALE_ARENA_CODES=1), and the streamer's cuTile tables
-    (every layer's gate, up and down scale_2, its activation globals)."""
+    checkpoint's one-byte e4m3 codes, and every layer's gate, up and down scale_2 and its activation globals.
+    With KT_SCALE_ARENA_CODES=1 the arenas hold the codes and the streamer (on cuTile) the tables. Without it (a
+    kt-kernel that folds the scales to fp32) the codes are recovered from the arenas' fp32 scales, expert by expert
+    as it is loaded (the fold is e4m3 x scale_2 rounded to bf16: dividing by scale_2 and rounding to e4m3 gives
+    the checkpoint's byte back; checked against the checkpoint here), and the tables are read here."""
+    from sglang.srt.layers.moe import kt_cutile_nvfp4
     from sglang.srt.layers.moe import kt_stream_prefill_nvfp4 as snv
 
-    if not snv.CODES:
-        return "the arenas hold fp32 block scales, not the checkpoint's e4m3 bytes (KT_SCALE_ARENA_CODES=1)"
-    if not getattr(st, "cutile", False):
-        return "the streamer is not on cuTile: it holds no up scale_2 or activation globals"
-    missing = [M.layer_idx for M in LAYERS if M.layer_idx not in st._s2 or M.layer_idx not in st._s2u]
-    if missing:
-        return f"the streamer has no scale_2 of layers {missing[:4]}"
+    DYN.pop("cut", None)
+    if snv.CODES:
+        if not getattr(st, "cutile", False):
+            return "the streamer is not on cuTile: it holds no up scale_2 or activation globals"
+        missing = [M.layer_idx for M in LAYERS if M.layer_idx not in st._s2 or M.layer_idx not in st._s2u]
+        if missing:
+            return f"the streamer has no scale_2 of layers {missing[:4]}"
+        return ""
+    why = _nv_setup_up(st)  # DYN["nv"]: (gate, up, down) scale_2 of every layer
+    if why:
+        return why
+    path = LAYERS[0].wrapper.kt_config.weight_path
+    try:
+        g12 = kt_cutile_nvfp4.checkpoint_layer_globals(path)
+    except Exception as exc:
+        return f"the checkpoint's activation globals could not be read ({type(exc).__name__}: {exc})"
+    DYN["cut"] = {li: DYN["nv"][li] + tuple(g12.get(li, (1.0, 1.0))) for li in DYN["nv"]}
+    bad = _cutile_recovered_check(st, path)
+    if bad:
+        DYN.pop("cut", None)
+        return bad
+    _log("cuTile slots: block scales recovered from the arenas' fp32 scales (this kt-kernel keeps no e4m3 codes); "
+         "they equal the checkpoint's bytes on the experts checked")
+    return ""
+
+
+def _recovered_codes(st, li: int, e: int):
+    """Expert e's e4m3 block-scale bytes (gate [N, K/16], up [N, K/16], down [K, N/16], this rank's part) from the
+    arenas' fp32 scales."""
+    from sglang.srt.layers.moe import kt_stream_prefill_nvfp4 as snv
+
+    ar = st._arenas[li]
+    cs = ar[3][1]
+    N, K = st.N, st.K
+    s2g, s2u, s2d = (t[e:e + 1].cpu() for t in DYN["cut"][li][:3])
+    return (snv._to_e4m3(snv._host_scales(ar[3][0], e, cs, N, K // 16), s2g)[0],
+            snv._to_e4m3(snv._host_scales(ar[4][0], e, cs, N, K // 16), s2u)[0],
+            snv._to_e4m3(snv._host_scales(ar[5][0], e, cs, K, N // 16), s2d)[0])
+
+
+def _cutile_recovered_check(st, path: str) -> str:
+    """The recovered bytes against the checkpoint's, three experts of the first and the last layer; "" when equal."""
+    import json
+
+    from safetensors import safe_open
+
+    from sglang.srt.layers.moe import kt_stream_prefill_nvfp4 as snv
+
+    idx = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
+    sample = next((k for k in idx if ".mlp.experts.0.gate_proj.weight_scale" in k and k.endswith(".weight_scale")), None)
+    if sample is None:
+        return f"no gate_proj.weight_scale in {path}"
+    tpl = sample.split(".layers.")[0] + ".layers.{L}.mlp.experts.{E}.{P}_proj.weight_scale"
+    N, K, r = st.N, st.K, st.rank
+    for li in sorted({LAYERS[0].layer_idx, LAYERS[-1].layer_idx}):
+        E = st._num_experts(li)
+        p2l = snv._physical_to_logical(li, E)
+        for e in sorted({0, E // 2, E - 1}):
+            got = _recovered_codes(st, li, e)
+            for proj, mine in zip(("gate", "up", "down"), got):
+                k = tpl.format(L=li, E=p2l[e], P=proj)
+                with safe_open(os.path.join(path, idx[k]), "pt") as f:
+                    ck = f.get_tensor(k)
+                ck = (ck[r * N:(r + 1) * N] if proj != "down"
+                      else ck[:, r * (N // 16):(r + 1) * (N // 16)].contiguous()).view(torch.uint8)
+                if ck.shape != mine.shape or bool((ck != mine).any()):
+                    n = int((ck != mine).sum()) if ck.shape == mine.shape else -1
+                    return (f"the block scales recovered from the arenas differ from the checkpoint's (layer {li}, "
+                            f"expert {e}, {proj}: {n} of {mine.numel()} bytes)")
     return ""
 
 
 def _arena_load_cutile(st, L: _Layer, e: int, dst, order: int) -> None:
     """_arena_load for ModelOpt NVFP4 under kt_cutile_nvfp4: the packed e2m1 weights and the e4m3 block-scale
-    bytes as the arenas hold them (the streamer's cuTile staging, one expert); the alphas as
-    kt_cutile_nvfp4.fold_globals makes them from scale_2 (gate times g1, up times g1 / g2, down times g2)."""
+    bytes as the arenas hold them (the streamer's cuTile staging, one expert), or the bytes recovered from the
+    arenas' fp32 scales (_cutile_setup); the alphas as kt_cutile_nvfp4.fold_globals makes them from scale_2 (gate
+    times g1, up times g1 / g2, down times g2)."""
     li = L.layer_idx
     ar = st._arenas[li]
     w13, w2 = dst[("w13", False)].view(torch.uint8), dst[("w2", False)].view(torch.uint8)
@@ -1233,12 +1319,22 @@ def _arena_load_cutile(st, L: _Layer, e: int, dst, order: int) -> None:
     w13[:n].view(-1).copy_(ar[a][0][e * ws:e * ws + nb], non_blocking=True)
     w13[n:].view(-1).copy_(ar[b][0][e * ws:e * ws + nb], non_blocking=True)
     w2.view(-1).copy_(ar[2][0][e * ws:e * ws + w2.numel()], non_blocking=True)
-    s13[:n].view(-1).copy_(ar[3 + a][0][e * cs:e * cs + cb], non_blocking=True)
-    s13[n:].view(-1).copy_(ar[3 + b][0][e * cs:e * cs + cb], non_blocking=True)
-    s2.view(-1).copy_(ar[5][0][e * cs:e * cs + s2.numel()], non_blocking=True)
-    s2g, s2d = st._s2[li]
-    s2u = st._s2u.get(li, s2g)
-    g1, g2 = st._g12.get(li, (1.0, 1.0))
+    cut = DYN.get("cut")
+    if cut is None:
+        s13[:n].view(-1).copy_(ar[3 + a][0][e * cs:e * cs + cb], non_blocking=True)
+        s13[n:].view(-1).copy_(ar[3 + b][0][e * cs:e * cs + cb], non_blocking=True)
+        s2.view(-1).copy_(ar[5][0][e * cs:e * cs + s2.numel()], non_blocking=True)
+        s2g, s2d = st._s2[li]
+        s2u = st._s2u.get(li, s2g)
+        g1, g2 = st._g12.get(li, (1.0, 1.0))
+    else:
+        s2g, s2u, s2d, g1, g2 = cut[li]
+        # the fp32 scales go to the card as the weights do and become the bytes there: nothing waits on the host
+        # (three host tensors copied one by one made a slot 1.45 ms, 7.2 s for a lend of 4,933)
+        dev = s13.device
+        for view, k, div in ((s13[:n], 3 + a, (s2g, s2u)[a]), (s13[n:], 3 + b, (s2g, s2u)[b]), (s2, 5, s2d)):
+            raw = ar[k][0][e * cs:e * cs + 4 * view.numel()].to(dev, non_blocking=True)
+            view.view(-1).copy_((raw.view(torch.float32) / div[e:e + 1]).to(torch.float8_e4m3fn).view(torch.uint8))
     t = dst[("nv", "kt_cutile_w13_alpha")].view(-1)
     t[:1].copy_(s2g[e:e + 1]).mul_(g1)
     if t.numel() > 1:
@@ -2246,6 +2342,64 @@ class _Phases:
         return ", ".join(f"{n} {ms:.0f}" for n, ms in self.parts)
 
 
+# KT_KV_HOT_FILL_SPREAD=<forwards>: a fresh lend maps its slots at once and fills them over that many forwards, the
+# highest-scored experts first, instead of filling them all before the forward that asked (4,456 slots: 1.4 s before
+# the first token after a resume). 0: all at once.
+FILL_SPREAD = int(os.environ.get("KT_KV_HOT_FILL_SPREAD", "64") or 0)
+
+
+def _spread_hold(L: _Layer, k: int) -> list:
+    """The slots of a fresh lend that wait: [(score, layer, slot, expert)], their held entries emptied until they
+    are filled. Bank slots (a copy on the card) do not wait."""
+    out = []
+    S = DYN.get("scores")
+    for j in range(k):
+        e = L.held[j]
+        if e < 0 or (e == L.n + j and j < L.b):
+            continue
+        out.append((float(S[L.idx, e]) if S is not None else 0.0, L.idx, j, e))
+        L.held[j] = -1
+    return out
+
+
+def _spread_back() -> None:
+    """The slots still waiting keep their experts in the held lists (a release: the next lend fills them)."""
+    for _, li, j, e in STATE.pop("backlog", None) or ():
+        L = LAYERS[li]
+        if j < L.x and L.held[j] == -1 and e not in L.held:
+            L.held[j] = e
+
+
+def _spread_step(dev) -> None:
+    """One forward's share of the waiting slots, on the current stream: the copies, then their table entries (the
+    same order on every rank: the same lists, the same scores, the same count a forward)."""
+    bl, n = STATE["backlog"], STATE["backlog_n"]
+    rows, have = [], {}
+    while bl and len(rows) < n:
+        _, li, j, e = bl.pop()
+        L = LAYERS[li]
+        h = have.get(li)
+        if h is None:
+            h = have[li] = set(L.held[: L.k])
+        if j >= L.k or L.held[j] != -1 or e in h:
+            continue  # the slot went (a shrink) or a round filled it, or put the expert elsewhere
+        _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
+        L.held[j] = e
+        h.add(e)
+        rows.append((li, e, j))
+    if rows:
+        t = torch.tensor(rows, dtype=torch.int64).to(dev)
+        STATE["tbl"][t[:, 0], t[:, 1]] = t[:, 2]
+        _union()
+    STATE["backlog_done"] = STATE.get("backlog_done", 0) + len(rows)
+    if not bl:
+        STATE["backlog"] = None
+        if STATE["lends"] in (1, 2, 3, 10, 100, 1000) or CHECK or PHASES:
+            _log(f"lend {STATE['lends']}: {STATE.pop('backlog_done', 0)} waiting slots filled over "
+                 f"{(time.perf_counter() - STATE['backlog_t']) * 1e3:.0f} ms of forwards")
+        STATE.pop("backlog_done", None)
+
+
 def tick(runner) -> None:
     """kt_lend.before_forward outside a prefill window (decode, and extends below
     the streaming threshold), outside any graph: lend when there is room."""
@@ -2272,6 +2426,10 @@ def tick(runner) -> None:
     STATE.pop("stood", None)
     STATE.pop("stood_t", None)
     STATE["owed"] = 0
+    if more and not regrow and STATE.get("backlog"):
+        # a fresh lend's slots are still being filled: no round and no growth until they are
+        _spread_step(LAYERS[0].slots[LAYERS[0].names[0][1]].device)
+        return
     if more and not regrow:
         if DYNAMIC and DYN["on"] and LAYERS[0].k:
             _dyn_round(LAYERS[0].slots[LAYERS[0].names[0][1]].device)
@@ -2401,6 +2559,7 @@ def tick(runner) -> None:
         ev0.record()
     if regrow and DYNAMIC and DYN["on"]:
         _dyn_settle(dev)
+    later = []
     for L, k, b in zip(LAYERS, ks, base):
         if regrow and DYNAMIC and DYN["on"]:
             _dyn_fill(L, k, lo=b)
@@ -2413,11 +2572,17 @@ def tick(runner) -> None:
                     for _, nm in L.names:
                         L.slots[nm][j].copy_(L.banks[nm][j], non_blocking=True)
         elif k and DYNAMIC:
+            if FILL_SPREAD and DYN["on"]:
+                later += _spread_hold(L, k)
             _dyn_fill(L, k)
         elif k > b:
             for _, nm in L.names:
                 L.slots[nm][b:k].copy_(L.banks[nm][b:k], non_blocking=True)
         L.k = k
+    if later:
+        later.sort()  # the highest score last: _spread_step pops from the end
+        STATE["backlog"], STATE["backlog_t"] = later, time.perf_counter()
+        STATE["backlog_n"] = -(-len(later) // FILL_SPREAD)
     if PHASES:
         ev1.record()
     ph("fill issued")
@@ -2649,6 +2814,7 @@ def release(why: str) -> None:
         return
     t0 = time.perf_counter()
     ph = _Phases(t0)
+    _spread_back()
     dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
     kd = _k_dev(dev)
     kd.zero_()

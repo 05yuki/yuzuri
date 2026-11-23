@@ -927,9 +927,15 @@ def _info(t):
     return HOST_INFO[t.data_ptr()]
 
 
-def _set_rows(t, rows: int) -> int:
-    """The first rows of every block of t on the card, the rest in host memory; returns the bytes moved or -1."""
+def _set_rows(t, rows: int, live: bool = False) -> int:
+    """The first rows of every block of t on the card, the rest in host memory; returns the bytes moved or -1.
+    live: on the way to host memory, chunks with nothing mapped (lent pages) are left as they are (a park)."""
     lib = _load()
+    place = lib.kv_vmm_place_range
+    if live and hasattr(lib, "kv_vmm_place_range_live"):
+        place = lib.kv_vmm_place_range_live
+        place.restype = ctypes.c_longlong
+        place.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
     i = _info(t)
     rows = max(0, min(rows, i["rows"]))
     moved = 0
@@ -939,7 +945,7 @@ def _set_rows(t, rows: int) -> int:
             n = lib.kv_vmm_place_range(ctypes.c_void_p(t.data_ptr()), ctypes.c_size_t(base + i["dev"] * i["row"]),
                                        ctypes.c_size_t((rows - i["dev"]) * i["row"]), 1)
         elif rows < i["dev"]:
-            n = lib.kv_vmm_place_range(ctypes.c_void_p(t.data_ptr()), ctypes.c_size_t(base + rows * i["row"]),
+            n = place(ctypes.c_void_p(t.data_ptr()), ctypes.c_size_t(base + rows * i["row"]),
                                        ctypes.c_size_t((i["dev"] - rows) * i["row"]), 0)
         else:
             n = 0

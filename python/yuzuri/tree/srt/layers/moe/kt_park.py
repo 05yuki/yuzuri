@@ -43,6 +43,37 @@ def region():
     return kt_lend._tms().region(tag=TAG, enable_cpu_backup=True)
 
 
+def _vmm_bytes(nbytes: int, index: int):
+    """nbytes of the card on kv_vmm's remappable memory, or None without the library: a park takes them to pinned
+    host memory with the pools (kv_vmm_park, about 15 GB/s from the second park on), where the saver's region with
+    its host copy took 1.3 s for 1.6 GiB."""
+    try:
+        from sglang.srt.layers.moe import kt_kv_vmm
+
+        kt_kv_vmm._load()
+        blk = kt_kv_vmm._Block(int(nbytes), int(index))
+        return torch.as_tensor(blk, device=f"cuda:{index}")
+    except Exception as exc:
+        _log(f"kv_vmm holds no buffer for the park ({type(exc).__name__}: {exc}): the saver's region takes it")
+        return None
+
+
+def buffers():
+    """Around the making of a persistent buffer that must leave the card at a park and come back at its address:
+    kv_vmm's pool when torch can allocate from it, else the saver's region."""
+    if not ENABLED:
+        return contextlib.nullcontext()
+    try:
+        from sglang.srt.layers.moe import kt_kv_vmm
+
+        kt_kv_vmm._load()
+        if kt_kv_vmm._pool is not None:
+            return torch.cuda.use_mem_pool(kt_kv_vmm._pool)
+    except Exception:
+        pass
+    return region()
+
+
 def adopt(model) -> None:
     """Once, after the load and before any graph is captured: the model's own tensors into the region."""
     if not ENABLED:
@@ -82,8 +113,10 @@ def adopt(model) -> None:
     # small tensors one allocation each cost 0.15 to 0.19 GiB a card (Flash-Next, 1.19 GiB of tensors)
     made = {}
     if total:
-        with region():
-            buf = torch.empty(total, dtype=torch.uint8, device=f"cuda:{i}")
+        buf = _vmm_bytes(total, i)
+        if buf is None:
+            with region():
+                buf = torch.empty(total, dtype=torch.uint8, device=f"cuda:{i}")
         STATE.setdefault("adopted_ptrs", set()).add(buf.untyped_storage().data_ptr())
         for t, d, off, again in plan:
             if not again:
@@ -191,8 +224,9 @@ def park() -> None:
 
     from sglang.srt.layers.moe import kt_kv_prefill_lend
 
-    # the slots leave the routing and give their memory back, then the pool pages they had borrowed are mapped
-    # again and the lend is closed (as when a pool is cleared): the next decode after a resume lends afresh
+    # the slots leave the routing and give their memory back; the pool pages they had borrowed stay unmapped and
+    # rejoin the free list (as at a window's start): they hold nothing, so they are neither mapped nor copied to
+    # host memory and back, and the lend after the resume takes them as they are
     kt_kv_hot_lend.release("park")
     kt_kv_prefill_lend.hot_release("park")
     step("hot slots out")
@@ -200,7 +234,7 @@ def park() -> None:
     for t in kt_kv_vmm.HOST_MADE:
         if t.device.index == i:
             rows[t.data_ptr()] = (t, int(kt_kv_vmm._info(t)["dev"]))
-            if kt_kv_vmm._set_rows(t, 0) < 0:
+            if kt_kv_vmm._set_rows(t, 0, live=True) < 0:
                 raise RuntimeError("kv_vmm: a pool tensor's rows did not move to host memory")
     STATE["rows"] = rows
     step(f"KV rows of {len(rows)} pool tensors to host")

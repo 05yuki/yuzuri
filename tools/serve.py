@@ -580,8 +580,8 @@ def main():
         codes_note = ("NVFP4: kt-kernel keeps the checkpoint's e4m3 scale bytes; GPU experts and streamed groups on "
                       "cuTile from them" if takes else
                       "NVFP4: this kt-kernel reads no e4m3 scale codes, so the CPU experts' block scales are folded "
-                      "to bf16; the GPU stays FP4 (streamed groups on CUTLASS with the checkpoint's scale bytes), and "
-                      "the hot lend's cuTile slots are off")
+                      "to bf16; the GPU stays FP4 (streamed groups on CUTLASS with the checkpoint's scale bytes, the "
+                      "hot lend's cuTile slots with the bytes recovered from the folded scales)")
     # a feature off: its switches at their off values, over the profile's and the plan's, under --env
     for f in feat_off:
         env.update(f["off"])

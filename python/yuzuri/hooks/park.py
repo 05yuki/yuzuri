@@ -109,7 +109,7 @@ def _http(m):
 
 def _buffers(m):
     """SGLang's named persistent buffers (runtime_context.get_buffer: the attention backend's workspace) are made in
-    the park's region: they leave the card with it and come back at the same address."""
+    memory the park takes off the card (kt_park.buffers): they come back at the same address."""
     if not ON:
         return
     ctx = getattr(m, "_CONTEXT", None)
@@ -121,7 +121,7 @@ def _buffers(m):
             from sglang.srt.layers.moe import kt_park
 
             def made():
-                with kt_park.region():
+                with kt_park.buffers():
                     return factory()
 
             return orig(self, name, made)

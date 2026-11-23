@@ -718,7 +718,8 @@ def hot_release(why: str) -> None:
             fn(why)
     if STATE["lent"] is not None and STATE.get("owner") == "hot":
         # kt_lend calls this at a window's start and lend() right after, in the same step: the pages wait there
-        if why == "window start" and HANDOFF and ENABLED and STATE["ranges"]:
+        # (a park as well: the pages stay unmapped through it, and the lend after the resume takes them as they are)
+        if why in ("window start", "park") and HANDOFF and ENABLED and STATE["ranges"]:
             _hand_off(why)
         else:
             restore(why)

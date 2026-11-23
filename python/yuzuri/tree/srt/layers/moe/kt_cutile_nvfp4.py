@@ -122,6 +122,7 @@ def maybe_wrap(gpu_method, layer, weight_path=None, layer_idx=None):
     g12 = (1.0, 1.0)
     if acts == "static" and weight_path and layer_idx is not None:
         g12 = checkpoint_layer_globals(weight_path).get(int(layer_idx), (1.0, 1.0))
+        _cpu_a4(int(layer_idx), *g12)
     return CutileNvfp4Method(gpu_method, act, acts, g12)
 
 
@@ -150,6 +151,39 @@ def _alpha(g: torch.Tensor, divides: bool, experts: int) -> torch.Tensor:
     if a.shape[1] == 1 or torch.equal(a[:, 0], a[:, 1]):
         return a[:, 0].contiguous()
     return a[:, :2].contiguous()
+
+
+CPU_A4 = os.environ.get("KT_CPU_A4", "1") == "1"
+_CPU_A4_SAID = [False]
+
+
+def _cpu_a4(layer_idx: int, g1: float, g2: float) -> None:
+    """The CPU experts of a W4A4 checkpoint quantize their inputs as the card does: kt-kernel's knobs
+    KT_CPU_A4_G13_L<layer> / KT_CPU_A4_G2_L<layer> take this layer's activation globals (float bits; 0 leaves the
+    inputs as they are). Without it kt-kernel computes W4A16: the reference of the checkpoint's own arithmetic
+    (tools/ref-nll-hf.py) scores 1.6015 on Flash-Next NVFP4, the reference without activation quantization 1.5874,
+    and a server with every expert on the CPU scored 1.5894, so the answer moved with the share of experts in hot
+    slots. KT_CPU_A4=0 leaves the CPU side W4A16."""
+    if not CPU_A4:
+        return
+    import struct
+
+    try:
+        import kt_kernel.kt_kernel_ext as ext
+
+        set_knob = ext.set_knob
+    except (ImportError, AttributeError) as exc:
+        if not _CPU_A4_SAID[0]:
+            _CPU_A4_SAID[0] = True
+            print(f"[kt-cutile] this kt-kernel takes no activation globals ({type(exc).__name__}): its CPU experts "
+                  "compute W4A16 beside the card's W4A4", flush=True)
+        return
+    for name, g in ((f"KT_CPU_A4_G13_L{layer_idx}", g1), (f"KT_CPU_A4_G2_L{layer_idx}", g2)):
+        set_knob(name, struct.unpack("<i", struct.pack("<f", float(g)))[0])
+    if not _CPU_A4_SAID[0]:
+        _CPU_A4_SAID[0] = True
+        print(f"[kt-cutile] the CPU experts quantize their inputs to FP4 as the card does (layer {layer_idx}: "
+              f"globals {g1:.4g} / {g2:.4g})", flush=True)
 
 
 def checkpoint_activations(path: str) -> str:

@@ -69,6 +69,7 @@ typedef struct {
   int numa;       // their NUMA node
   CUmemGenericAllocationHandle* h;  // 0 = unmapped (zero: the zero chunk)
   void** park;  // per chunk, its contents in host memory while kv_vmm_park holds it (NULL: none parked)
+  void** pbuf;  // per chunk, the pinned host buffer a park copies into: kept from park to park
 } alloc_t;
 
 static alloc_t allocs[MAX_ALLOCS];
@@ -306,8 +307,13 @@ void kv_vmm_free(void* ptr, ssize_t size, int device, void* stream) {
       }
     }
     cuMemAddressFree(a->va, a->size);
+    if (a->pbuf) {
+      for (int i = 0; i < a->nch; i++)
+        if (a->pbuf[i]) cuMemFreeHost(a->pbuf[i]);
+      free(a->pbuf);
+      a->pbuf = NULL;
+    }
     if (a->park) {
-      for (int i = 0; i < a->nch; i++) free(a->park[i]);
       free(a->park);
     }
     free(a->h);
@@ -409,9 +415,12 @@ long long kv_vmm_park(int device) {
     for (int i = 0; i < a->nch && !bad; i++) {
       if (!a->h[i] || is_host(a, i)) continue;
       if (!a->park) a->park = (void**)calloc((size_t)a->nch, sizeof(void*));
-      void* buf = a->park ? malloc(a->chunk) : NULL;
+      if (!a->pbuf) a->pbuf = (void**)calloc((size_t)a->nch, sizeof(void*));
+      // pinned, and kept for the next park: a pageable buffer made each time took 0.75 s for 1.1 GiB
+      void* buf = a->park && a->pbuf ? a->pbuf[i] : NULL;
+      if (a->park && a->pbuf && !buf && !ok(cuMemAllocHost(&buf, a->chunk), "cuMemAllocHost (park)")) buf = NULL;
+      if (buf) a->pbuf[i] = buf;
       if (!buf || !ok(cuMemcpyDtoH(buf, a->va + (size_t)i * a->chunk, a->chunk), "cuMemcpyDtoH (park)")) {
-        free(buf);
         bad = 1;
         break;
       }
@@ -450,8 +459,7 @@ long long kv_vmm_unpark(int device) {
         bad = 1;
         continue;
       }
-      free(a->park[i]);
-      a->park[i] = NULL;
+      a->park[i] = NULL;  // (the buffer stays in pbuf)
       n += (long long)a->chunk;
     }
   }
@@ -587,6 +595,11 @@ long long kv_vmm_unplace(void* ptr, size_t device_bytes) {
 
 // the chunks wholly inside [ptr + off, ptr + off + len) to the card (to_device) or to host memory, each copied into
 // a new chunk mapped at the same address; returns the bytes moved, or -1 (a chunk could not be made)
+// kv_vmm_place_range_live: to host memory, a chunk that is released (lent, nothing mapped) stays as it is: it
+// holds nothing to keep, and a host chunk made for it would be zeros copied for no one (a park: the pool's
+// free pages are out on the hot lend)
+static int place_live_only;
+
 long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
   pthread_mutex_lock(&mu);
   alloc_t* a = find((uintptr_t)ptr);
@@ -608,6 +621,7 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
   }
   for (int i = i0; i < i1; i++) {
     if (a->hostm[i] == !to_device) continue;
+    if (!to_device && place_live_only && !a->h[i]) continue;
     CUmemAllocationProp p = prop_for(a->device);
     if (!to_device) {
       p.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
@@ -650,6 +664,13 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
     n += a->chunk;
   }
   pthread_mutex_unlock(&mu);
+  return n;
+}
+
+long long kv_vmm_place_range_live(void* ptr, size_t off, size_t len, int to_device) {
+  place_live_only = 1;
+  long long n = kv_vmm_place_range(ptr, off, len, to_device);
+  place_live_only = 0;
   return n;
 }
 

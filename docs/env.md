@@ -6,13 +6,14 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-279 names.
+281 names.
 
 ## KT_
 
 | Name | Default | Read in |
 |---|---|---|
 | `KT_AUTO_GROUP_MB` | `"800"` | auto_profile.py |
+| `KT_CPU_A4` | `"1"` | kt_cutile_nvfp4.py |
 | `KT_CUTILE_NVFP4` | `"1"` | kt_cutile_nvfp4.py |
 | `KT_FAST_PINNED` | - | kt_pinned.py |
 | `KT_FAST_PINNED_MIN` | `str(64 << 20)` | kt_pinned.py |
@@ -140,6 +141,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_KV_HOT_EXTRA` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_FILL_BATCH` | `"1"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_FILL_SLOTS` | `"8"` | kt_kv_hot_lend.py |
+| `KT_KV_HOT_FILL_SPREAD` | `"64"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_FILL_STAGE_MB` | `"256"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_FILL_THREADS` | `"0"` | kt_kv_hot_lend.py |
 | `KT_KV_HOT_FILL_VERIFY` | `"0"` | kt_kv_hot_lend.py |
