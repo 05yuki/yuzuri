@@ -394,6 +394,22 @@ These are the SGLang commits it has been launched on, on two RTX 5070 Ti (SM120)
 | `8c7ec05287` | upstream main with the [demo recipe](#demo-recipe)'s five model patches | 2026-11-18 |
 | `401d0c7929` | upstream main with the [demo recipe](#demo-recipe)'s six model patches | 2026-11-20 |
 
+The hooks check the function they replace, not a line of SGLang's source.
+So an upstream change to the same file does not stop them.
+
+SGLang main `5e5e0d7904` (2026-11-26) is 456 commits past `401d0c7929`.
+Those commits changed 25 of the 39 SGLang files the hooks attach to.
+All 40 hooks attach to `5e5e0d7904` without a change to Yuzuri.
+
+`tools/check-hooks.py` makes that check on the CPU, before any launch:
+
+```sh
+<server venv>/bin/python tools/check-hooks.py
+```
+
+It imports every SGLang module a hook waits for and prints the startup report.
+It exits 1 when a hook is off or gone.
+
 On another commit, the startup report says which hooks went in.
 
 `[yuzuri-features]` lines name every hook as on, the tree's own, off, gone or idle.
@@ -429,6 +445,7 @@ python -m unittest discover -s tests
   They check the KV library and Yuzuri's own GPU parts against plain torch.
 
 - `setup.sh` imports the venv's SGLang with every hook on before it changes anything.
+  `tools/check-hooks.py` then imports every module the hooks wait for and reports each hook.
   That is the check against a new SGLang commit.
 
 ## Related work

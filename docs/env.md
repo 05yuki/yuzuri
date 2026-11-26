@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-286 names.
+287 names.
 
 ## KT_
 
@@ -297,7 +297,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `YUZURI_CACHE` | - | _patched.py |
 | `YUZURI_FEATURES_OFF` | `""` | _features.py |
 | `YUZURI_HOOKS_OFF` | `""` | _finder.py |
-| `YUZURI_PACKAGE` | `"0"` | _boot.py |
+| `YUZURI_PACKAGE` | `"0"` | _boot.py, check-hooks.py |
 | `YUZURI_PARK` | - | kt_park.py, park.py, serve.py |
 | `YUZURI_PARK_LIST` | - | kt_park.py |
 | `YUZURI_RUN_DIR` | - | _features.py |
@@ -307,13 +307,19 @@ Default is the value the code falls back to. A dash means the code only checks w
 | Name | Default | Read in |
 |---|---|---|
 | `CUDA_HOME` | - | serve.py |
-| `CUDA_VISIBLE_DEVICES` | - | hostprobe.py |
+| `CUDA_VISIBLE_DEVICES` | `""` | check-hooks.py, hostprobe.py |
 
 ## KV_
 
 | Name | Default | Read in |
 |---|---|---|
 | `KV_VMM_CHUNK_MB` | `"8"` | kt_kv_vmm.py |
+
+## PYTHONPATH_
+
+| Name | Default | Read in |
+|---|---|---|
+| `PYTHONPATH` | - | check-hooks.py |
 
 ## TRITON_
 
