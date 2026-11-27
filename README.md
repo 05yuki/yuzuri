@@ -74,11 +74,13 @@ Nothing is sized by hand:
 
 - Host memory for the experts and for the KV past the cards.
 
+For a complete turnkey setup, start from the [demo recipe](#demo-recipe) below
+([yuzuri-deepseek-v4.1-flash-1017](https://github.com/05yuki/yuzuri-deepseek-v4.1-flash-1017)), which installs SGLang,
+kt-kernel and Yuzuri together.
+If you are reusing a venv from the earlier standalone tree
 [deepseek-v4.1-flash-1017-ktransformers](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers)
-(tag `2026-11-05-0936`) builds a venv with kt-kernel and the toolkit.
-
-Its SGLang is patched with mechanisms Yuzuri brings itself, so Yuzuri stops on it.
-Put an unpatched SGLang checkout ahead of it: `PYTHONPATH=<sglang checkout>/python`, for `setup.sh` and for the launch.
+(tag `2026-11-05-0936`), its SGLang already carries mechanisms Yuzuri brings itself, so put an unpatched SGLang
+checkout ahead of it (`PYTHONPATH=<sglang checkout>/python`) for `setup.sh` and for the launch.
 
 ## Demo recipe
 
@@ -393,6 +395,7 @@ These are the SGLang commits it has been launched on, on two RTX 5070 Ti (SM120)
 | `8c7ec05287` | upstream main with the recipe's tier 0 patches | 2026-11-15 |
 | `8c7ec05287` | upstream main with the [demo recipe](#demo-recipe)'s five model patches | 2026-11-18 |
 | `401d0c7929` | upstream main with the [demo recipe](#demo-recipe)'s six model patches | 2026-11-20 |
+| `a9a27e9255` | upstream main with the [demo recipe](#demo-recipe)'s six model patches | 2026-11-27 |
 
 The hooks check the function they replace, not a line of SGLang's source.
 So an upstream change to the same file does not stop them.

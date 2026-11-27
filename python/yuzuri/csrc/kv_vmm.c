@@ -277,6 +277,8 @@ static void* alloc_range(ssize_t size, int device, int lazy, size_t device_bytes
   for (int i = 0; i < a.nch && !lazy; i++) {
     if (!map_chunk(&a, i)) {
       for (int j = 0; j < i; j++) unmap_chunk(&a, j);
+      if (a.zero)
+        for (int j = 0; j < a.nch; j++) zero_unmap(&a, a.va + (size_t)j * chunk);
       cuMemAddressFree(a.va, a.size);
       free(a.h);
       pthread_mutex_unlock(&mu);
@@ -384,6 +386,7 @@ long long kv_vmm_restore(void* ptr, size_t off, size_t len) {
         return -1;
       }
       if (!ok(cuMemsetD8(a->va + (size_t)i * a->chunk, 0, a->chunk), "cuMemsetD8")) {
+        unmap_chunk(a, i);
         released[a->device] -= n;
         pthread_mutex_unlock(&mu);
         return -1;
@@ -527,6 +530,8 @@ long long kv_vmm_place(void* ptr, size_t device_bytes) {
     a->h[i] = 0;
     if (!map_handle(at, a->chunk, h, a->device)) {  // the host copy is gone: nothing sane to map back
       cuMemRelease(h);
+      if (a->zero) zero_map(a, at);
+      released[a->device] += a->chunk;
       pthread_mutex_unlock(&mu);
       return -1;
     }
@@ -583,6 +588,8 @@ long long kv_vmm_unplace(void* ptr, size_t device_bytes) {
     }
     if (!map_handle(at, a->chunk, h, a->device)) {
       cuMemRelease(h);
+      if (a->zero) zero_map(a, at);
+      released[a->device] += a->chunk;
       pthread_mutex_unlock(&mu);
       return -1;
     }
@@ -598,9 +605,7 @@ long long kv_vmm_unplace(void* ptr, size_t device_bytes) {
 // kv_vmm_place_range_live: to host memory, a chunk that is released (lent, nothing mapped) stays as it is: it
 // holds nothing to keep, and a host chunk made for it would be zeros copied for no one (a park: the pool's
 // free pages are out on the hot lend)
-static int place_live_only;
-
-long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
+static long long place_range_impl(void* ptr, size_t off, size_t len, int to_device, int live_only) {
   pthread_mutex_lock(&mu);
   alloc_t* a = find((uintptr_t)ptr);
   long long n = 0;
@@ -621,7 +626,7 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
   }
   for (int i = i0; i < i1; i++) {
     if (a->hostm[i] == !to_device) continue;
-    if (!to_device && place_live_only && !a->h[i]) continue;
+    if (!to_device && live_only && !a->h[i]) continue;
     CUmemAllocationProp p = prop_for(a->device);
     if (!to_device) {
       p.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
@@ -656,6 +661,8 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
     }
     if (!map_handle(at, a->chunk, h, a->device)) {
       cuMemRelease(h);
+      if (a->zero) zero_map(a, at);
+      released[a->device] += a->chunk;
       pthread_mutex_unlock(&mu);
       return -1;
     }
@@ -667,14 +674,21 @@ long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
   return n;
 }
 
-long long kv_vmm_place_range_live(void* ptr, size_t off, size_t len, int to_device) {
-  place_live_only = 1;
-  long long n = kv_vmm_place_range(ptr, off, len, to_device);
-  place_live_only = 0;
-  return n;
+long long kv_vmm_place_range(void* ptr, size_t off, size_t len, int to_device) {
+  return place_range_impl(ptr, off, len, to_device, 0);
 }
 
-size_t kv_vmm_released_bytes(int device) { return device >= 0 && device < MAX_DEV ? released[device] : 0; }
+long long kv_vmm_place_range_live(void* ptr, size_t off, size_t len, int to_device) {
+  return place_range_impl(ptr, off, len, to_device, 1);
+}
+
+size_t kv_vmm_released_bytes(int device) {
+  if (device < 0 || device >= MAX_DEV) return 0;
+  pthread_mutex_lock(&mu);
+  size_t r = released[device];
+  pthread_mutex_unlock(&mu);
+  return r;
+}
 
 size_t kv_vmm_chunk_bytes(int device) {
   pthread_mutex_lock(&mu);

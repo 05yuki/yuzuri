@@ -26,7 +26,7 @@ It does nothing unless `YUZURI_PACKAGE=1`, which `serve.py --package` sets.
 - Once the model has loaded, the server log lists every hook under `[yuzuri-features]`.
   `on` is Yuzuri's hook, `tree` is the tree's own mechanism, `off` names the reason, `gone` is a needed hook whose
   SGLang module is not in the tree.
-  Each line carries the patch name the DeepSeek-V4.1 recipe's `docs/tier1.md` uses, so the two can be read side by side.
+  Each line carries the legacy patch name from the earlier standalone DeepSeek-V4.1 tree so the two can be read side by side.
   `PYTHONPATH=python python3 -m yuzuri._features` prints the whole table.
 - `manifest.json` records the SGLang commit the hooks were checked on (`sglang_checked`). Nothing compares it.
 - `csrc/kv_vmm.c` is the KV library; `setup.sh --package` builds it next to `kt_kv_vmm.py`.

@@ -93,7 +93,7 @@ class Backend:
 
 
 class Front:
-    def __init__(self, backends, pause=0.2):
+    def __init__(self, backends, pause=0.2, park_timeout=120.0):
         self.backends = backends
         self.cv = threading.Condition()
         self.queue = []          # (token, backend index), in arrival order
@@ -103,6 +103,7 @@ class Front:
         self.switches = 0
         self.last = None
         self.pause = pause       # between two tries of a park that found the server still busy
+        self.park_timeout = park_timeout
 
     def discover(self):
         owner = {}
@@ -123,12 +124,15 @@ class Front:
 
     def _park(self, i):
         b = self.backends[i]
+        deadline = time.monotonic() + self.park_timeout
         while True:
             status, got = b.call("POST", "/yuzuri/park")
             if status == 200 and isinstance(got, dict) and got.get("success"):
                 return
             msg = (got or {}).get("message") if isinstance(got, dict) else None
             if status == 200 and msg and "running or queued" in msg:
+                if time.monotonic() >= deadline:
+                    raise Refused(503, f"{b.url} stayed busy past {self.park_timeout:.0f} s: {msg}")
                 time.sleep(self.pause)   # a request that was cut off is still leaving the scheduler
                 continue
             raise Refused(503, f"{b.url} did not park: HTTP {status} {msg or ''}".strip())
@@ -229,8 +233,28 @@ def handler(front):
             self._refuse(Refused(404, f"GET {path}: the front answers /v1/models, /yuzuri/front, /health; "
                                       "the rest is a server's own, at its own port"))
 
+        def _read_body(self):
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                parts = []
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        break
+                    n = int(line.split(b";", 1)[0].strip(), 16)
+                    if n == 0:
+                        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                            pass
+                        break
+                    parts.append(self.rfile.read(n))
+                    self.rfile.read(2)
+                return b"".join(parts)
+            return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
         def do_POST(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            try:
+                body = self._read_body()
+            except ValueError:
+                return self._refuse(Refused(400, "malformed request body length"))
             try:
                 model = json.loads(body).get("model")
             except (ValueError, AttributeError):
@@ -306,7 +330,8 @@ def launch(models, common, port, host, log_dir, serve, say=_say):
             if name in names:
                 raise Refused(400, f"two models named {name!r}: give one a --served-model-name of its own")
             names.add(name)
-            ours = (["--port", str(port + 1 + k), "--host", host, "--log-dir", os.path.join(log_dir, name),
+            backend_host = "127.0.0.1"
+            ours = (["--port", str(port + 1 + k), "--host", backend_host, "--log-dir", os.path.join(log_dir, name),
                      "--env", "YUZURI_PARK=1"]
                     + ([] if "--served-model-name" in own and not launcher else ["--served-model-name", name])
                     + (["--beside"] if k else []) + common)
@@ -331,7 +356,7 @@ def launch(models, common, port, host, log_dir, serve, say=_say):
                 raise Refused(503, f"{name} did not start: {said.strip()[-600:]}")
             pid = int(m.group(1))
             pids.append(pid)
-            b = Backend(f"http://{host}:{port + 1 + k}")
+            b = Backend(f"http://{backend_host}:{port + 1 + k}")
             while True:   # until it answers or its process is gone
                 try:
                     if b.call("GET", "/health")[0] == 200:

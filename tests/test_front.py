@@ -203,12 +203,75 @@ class FrontTest(unittest.TestCase):
         backends, pids = front.launch([os.path.join(d, "alpha"), os.path.join(d, "beta") + " --tp 1"], [], port,
                                       "127.0.0.1", d, fake, say=lambda m: None)
         self.addCleanup(front.stop, pids)
-        calls = [json.loads(x) for x in open(os.path.join(d, "calls"))]
+        with open(os.path.join(d, "calls")) as fh:
+            calls = [json.loads(x) for x in fh]
         self.assertEqual(calls, [["alpha", False, "YUZURI_PARK=1", None], ["beta", True, "YUZURI_PARK=1", "1"]])
         f = front.Front(backends, pause=0.01); f.discover()
         self.assertEqual(f.state()["active"], backends[1].url)   # the first was parked before the second started
         self.assertTrue(backends[0].parked())
         self.assertEqual(sorted(f.owner), ["alpha", "beta"])
+
+    def test_launch_keeps_backends_on_loopback_when_front_listens_on_all_interfaces(self):
+        import socket, tempfile, textwrap
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, "serve.py")
+        with open(fake, "w") as fh:
+            fh.write(textwrap.dedent('''
+                import argparse, json, os, subprocess, sys
+                ap = argparse.ArgumentParser()
+                for k in ("--config-dir", "--port", "--host", "--log-dir", "--served-model-name", "--env"):
+                    ap.add_argument(k)
+                ap.add_argument("--background", action="store_true"); ap.add_argument("--child", action="store_true")
+                a = ap.parse_args()
+                if not a.child:
+                    with open(os.path.join(os.path.dirname(__file__), "host"), "w") as fh:
+                        fh.write(a.host)
+                    p = subprocess.Popen([sys.executable, __file__, "--child"] + sys.argv[1:], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+                    print(f"started pid {p.pid}"); sys.exit(0)
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+                class H(BaseHTTPRequestHandler):
+                    def log_message(self, *x): pass
+                    def do_GET(self):
+                        raw = json.dumps({"status": "ok"}).encode(); self.send_response(200)
+                        self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+                HTTPServer((a.host, int(a.port)), H).serve_forever()
+            '''))
+        with socket.socket() as so:
+            so.bind(("127.0.0.1", 0)); port = so.getsockname()[1]
+        backends, pids = front.launch([os.path.join(d, "alpha")], [], port, "0.0.0.0", d, fake, say=lambda m: None)
+        self.addCleanup(front.stop, pids)
+        with open(os.path.join(d, "host")) as fh:
+            self.assertEqual(fh.read(), "127.0.0.1")
+        self.assertEqual(backends[0].host, "127.0.0.1")
+
+    def test_park_timeout_refuses_when_server_stays_busy(self):
+        a, b = Fake("a", parked=False, busy_parks=100), Fake("b", parked=True)
+        f = front.Front([front.Backend(a.url), front.Backend(b.url)], pause=0.01, park_timeout=0.05)
+        f.discover()
+        with self.assertRaises(front.Refused) as ctx:
+            f.enter("b")
+        self.assertEqual(ctx.exception.status, 503)
+
+    def test_chunked_post_body_is_forwarded(self):
+        import http.client, urllib.parse
+        a = Fake("a", parked=False)
+        f, url = self.up(a, Fake("b", parked=True))
+        u = urllib.parse.urlsplit(url)
+        payload = json.dumps({"model": "a", "tag": 9}).encode()
+        body = f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
+        c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+        try:
+            c.putrequest("POST", "/v1/chat/completions")
+            c.putheader("Content-Type", "application/json")
+            c.putheader("Transfer-Encoding", "chunked")
+            c.endheaders()
+            c.send(body)
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(json.loads(r.read()), {"served_by": "a", "tag": 9})
+        finally:
+            c.close()
 
     def test_same_name_on_two_servers_is_refused(self):
         with self.assertRaises(front.Refused):
