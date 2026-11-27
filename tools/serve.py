@@ -165,9 +165,11 @@ def wait_for_leaving(probe, limit_s=180.0, unlisted_min=1 << 30):
     A server that was just stopped leaves nvidia-smi's listing several seconds before the driver frees its memory:
     that waits for the last process with the card's device file open (its launcher). A plan made in between reads
     the memory as taken and sizes the launch from what is left. So when a card holds more than unlisted_min that no
-    listed process accounts for, and no listed process is using the cards, this waits for the processes hostprobe
-    found holding the card unlisted to end (or, when it can read none, for the memory to come back), then probes
-    again. After limit_s it stops with the cards, the memory and the processes."""
+    listed process accounts for, and no listed process is using the cards, this waits for the processes on their
+    way out (hostprobe's exiting) to end, or, with none, for the driver to give the memory back, then probes again.
+    The processes holding the card's device file are not waited for by themselves: on a card that drives a display
+    the desktop's processes hold it for good (11-27: ibus-x11 and mutter named while a stopped server exited).
+    After limit_s it stops with the cards, the memory and the processes that hold them."""
     t0 = time.time()
     said = set()
     while True:
@@ -177,18 +179,19 @@ def wait_for_leaving(probe, limit_s=180.0, unlisted_min=1 << 30):
         held = [g for g in host.get("gpu_leaving", []) if g["unlisted"] > unlisted_min]
         if not held:
             return host
-        pids = sorted({p["pid"] for g in held for p in g["pids"]})
+        leaving = {p["pid"]: p["name"] for p in host.get("exiting", [])}
+        pids = sorted(leaving)
         key = (tuple(pids), len(held))
         what = ", ".join("%.1f GiB" % (g["unlisted"] / (1 << 30)) for g in held)
         if key not in said:
             said.add(key)
             print(f"! the cards hold {what} for no listed process: waiting for "
-                  + (", ".join(sorted({f"{p['name']}({p['pid']})" for g in held for p in g["pids"]}))
-                     or "the driver to free it")
-                  + " to end", flush=True)
+                  + (", ".join(f"{leaving[p]}({p})" for p in pids) + " to finish exiting" if pids
+                     else "the driver to free it"), flush=True)
         if time.time() - t0 > limit_s:
+            holders = sorted({f"{p['name']}({p['pid']})" for g in held for p in g["pids"]})
             raise SystemExit(f"the cards still hold {what} for no listed process after {limit_s:.0f} s "
-                             f"(processes holding them: {pids or 'none readable'})")
+                             f"(processes with the cards open: {', '.join(holders) or 'none readable'})")
         end = time.time() + 5.0
         while time.time() < end and any(os.path.exists(f"/proc/{p}") for p in pids):
             time.sleep(0.1)

@@ -9,10 +9,11 @@ GIB = 1 << 30
 GONE = 2 ** 22 + 12345  # above the kernel's pid range: no such process
 
 
-def host(unlisted, pids=(), in_use=()):
+def host(unlisted, pids=(), in_use=(), exiting=()):
     return {"gpu_in_use": list(in_use),
             "gpu_leaving": [{"gpu_uuid": "GPU-a", "unlisted": unlisted,
-                             "pids": [{"pid": p, "name": "python"} for p in pids]}]}
+                             "pids": [{"pid": p, "name": "python"} for p in pids]}],
+            "exiting": [{"pid": p, "name": "sglang::schedul", "threads": 1} for p in exiting]}
 
 
 class WaitForLeaving(unittest.TestCase):
@@ -31,15 +32,24 @@ class WaitForLeaving(unittest.TestCase):
             self.assertIs(serve.wait_for_leaving(self.probes([h])), h)
         self.assertEqual(self.calls, 1)
 
-    def test_waits_for_the_holder_then_probes_again(self):
+    def test_waits_for_the_exiting_process_then_probes_again(self):
+        done = host(30 << 20)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            got = serve.wait_for_leaving(self.probes([host(14 * GIB, [GONE], exiting=[GONE]), done]))
+        self.assertIs(got, done)
+        self.assertEqual(self.calls, 2)
+        self.assertIn("14.0 GiB", out.getvalue())
+        self.assertIn(f"sglang::schedul({GONE}) to finish exiting", out.getvalue())
+
+    def test_a_desktop_holding_the_card_is_not_named(self):
         done = host(30 << 20)
         out = io.StringIO()
         with redirect_stdout(out):
             got = serve.wait_for_leaving(self.probes([host(14 * GIB, [GONE]), done]))
         self.assertIs(got, done)
-        self.assertEqual(self.calls, 2)
-        self.assertIn("14.0 GiB", out.getvalue())
-        self.assertIn(f"python({GONE})", out.getvalue())
+        self.assertIn("waiting for the driver to free it", out.getvalue())
+        self.assertNotIn("python", out.getvalue())
 
     def test_a_listed_server_is_left_to_the_in_use_check(self):
         h = host(14 * GIB, [GONE], in_use=[{"pid": 1, "name": "sglang::scheduler"}])
@@ -51,6 +61,7 @@ class WaitForLeaving(unittest.TestCase):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
             serve.wait_for_leaving(self.probes([h] * 10), limit_s=0.0)
         self.assertIn("14.0 GiB", str(e.exception))
+        self.assertIn(f"python({GONE})", str(e.exception))
 
 
 if __name__ == "__main__":
