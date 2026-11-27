@@ -85,6 +85,9 @@ MMQ_ROUTES = int(os.environ.get("KT_GPU_STREAM_MMQ_ROUTES", "8192") or 0)
 # KT_GPU_STREAM_SCALE_BYTES=1: pack kt-kernel's fp32 MXFP4 scale arenas into one-byte E8M0 exponents
 # once in THP-pinned host memory and DMA 1 byte/block instead of 4 (bit-identical in MMQ mode).
 SCALE_BYTES = os.environ.get("KT_GPU_STREAM_SCALE_BYTES", "0") == "1"
+# KT_GPU_STREAM_SCALE_PACK=1: pack MXFP4 E8M0 block scales per expert into 2-bit (range <= 3) or 4-bit
+# (range <= 15) delta codes in THP-pinned host memory (8-bit fallback), cutting scale H2D ~13x vs fp32.
+SCALE_PACK = os.environ.get("KT_GPU_STREAM_SCALE_PACK", "0") == "1"
 # KT_GPU_STREAM_SLOTS=<K>: number of device DMA slots in MMQ zero-copy mode (>= 2).
 PREFETCH_SLOTS = max(2, int(os.environ.get("KT_GPU_STREAM_SLOTS", "2") or 2))
 # KT_GPU_STREAM_INTER_PREFETCH=1: at the end of layer L's MMQ MoE, pre-stage layer L+1's first K groups
@@ -375,6 +378,56 @@ def _mxfp4_blocks_e8m0(packed: torch.Tensor, packed_stride: int, scales_u8: torc
     )
 
 
+@triton.jit
+def _mxfp4_blocks_e8m0_packed_kernel(
+    packed_ptr, scale_packed_ptr, rel_off_ptr, mode_ptr, base_exp_ptr, base_off, out_ptr,
+    n_blocks, nb, packed_stride, out_stride, in_rs, out_rs,
+    BB: tl.constexpr,
+):
+    """Bit-identical to _mxfp4_blocks_kernel, reading per-expert 2-bit/4-bit delta-packed (or 8-bit) E8M0 scales."""
+    e = tl.program_id(1)
+    blk = tl.program_id(0) * BB + tl.arange(0, BB)
+    m = blk < n_blocks
+    row = blk // nb
+    kb = blk % nb
+    src = packed_ptr + e * packed_stride + row * in_rs + kb * 16
+    j = tl.arange(0, 16)
+    sh = (j % 2) * 4
+    lo = tl.load(src[:, None] + (j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    hi = tl.load(src[:, None] + (8 + j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    qs = ((lo >> sh[None, :]) & 15) | (((hi >> sh[None, :]) & 15) << 4)
+
+    e_off = tl.load(rel_off_ptr + e) - base_off
+    mode = tl.load(mode_ptr + e)
+    bexp = tl.load(base_exp_ptr + e).to(tl.int32)
+    idx = row * nb + kb
+    if mode == 2:
+        byte = tl.load(scale_packed_ptr + e_off + (idx >> 2), mask=m, other=0).to(tl.int32)
+        ex = (bexp + ((byte >> ((idx & 3) * 2)) & 3)).to(tl.uint8)
+    elif mode == 4:
+        byte = tl.load(scale_packed_ptr + e_off + (idx >> 1), mask=m, other=0).to(tl.int32)
+        ex = (bexp + ((byte >> ((idx & 1) * 4)) & 15)).to(tl.uint8)
+    else:
+        ex = tl.load(scale_packed_ptr + e_off + idx, mask=m, other=127)
+
+    dst = out_ptr + e * out_stride + row * out_rs + kb * 17
+    tl.store(dst, ex, mask=m)
+    tl.store(dst[:, None] + 1 + j[None, :], qs.to(tl.uint8), mask=m[:, None])
+
+
+def _mxfp4_blocks_e8m0_packed(packed: torch.Tensor, packed_stride: int, scales_packed: torch.Tensor,
+                              rel_off: torch.Tensor, mode: torch.Tensor, base_exp: torch.Tensor,
+                              base_off: int, out: torch.Tensor, n: int, rows: int, cols: int):
+    """Bit-identical to _mxfp4_blocks, taking 2-bit/4-bit delta-packed (or 8-bit) E8M0 scales."""
+    nb = cols // 32
+    n_blocks = rows * nb
+    BB = 64
+    _mxfp4_blocks_e8m0_packed_kernel[(triton.cdiv(n_blocks, BB), n)](
+        packed, scales_packed, rel_off, mode, base_exp, base_off, out, n_blocks, nb, packed_stride,
+        out.stride(0), cols // 2, out.stride(1), BB=BB,
+    )
+
+
 def _rank_segments(rank: int, world: int, parts: int, inter: int):
     """[(part, first row in the part, rows, first row in the rank's slice, rows a part)] for
     rank's rows rank*N..(rank+1)*N of the intermediate size, N = inter / world, that
@@ -539,6 +592,7 @@ class KTStreamPrefill:
         self._free_slots = deque(range(self.num_slots))
         self._prefetched = {}
         self._sb_e8m0 = {}
+        self._sb_pack = {}
         self._sb_keep = []
         self._next_layer = {}
         if W16:
@@ -666,12 +720,25 @@ class KTStreamPrefill:
             self._map_expert_arenas(method)
         else:
             self._make_host_buffers()
-        self._use_scale_bytes = bool(
-            SCALE_BYTES and ZEROCOPY and self._mmq_mode and self._seg_whole and self._mxc is None
+        self._arena_e8m0 = False
+        if ZEROCOPY and self._arenas:
+            sample = next(iter(self._arenas.values()))
+            n_blk0 = self.N * (self.K // 32)
+            # Detect 1-byte E8M0 scale arenas from kt-kernel (KT_MXFP4_SCALE_ARENA_E8M0=1) vs 4-byte fp32 arenas.
+            self._arena_e8m0 = bool(sample[3][1] < 4 * n_blk0)
+        self._use_scale_pack = bool(
+            SCALE_PACK and ZEROCOPY and self._mmq_mode and self._seg_whole and self._mxc is None
         )
-        if self._use_scale_bytes and self._arenas:
-            # Guard against OOM on tight-RAM hosts: total E8M0 scale bytes across all ranks + 16 GiB headroom.
-            est_one_rank = sum(3 * (a[3][0].numel() // 4) for a in self._arenas.values())
+        self._use_scale_bytes = bool(
+            (SCALE_BYTES or self._arena_e8m0) and not self._use_scale_pack
+            and ZEROCOPY and self._mmq_mode and self._seg_whole and self._mxc is None
+        )
+        if (self._use_scale_pack or (self._use_scale_bytes and not self._arena_e8m0)) and self._arenas:
+            # Guard against OOM on tight-RAM hosts: total scale bytes across all ranks + 16 GiB headroom.
+            div = 1 if self._arena_e8m0 else 4
+            est_one_rank = sum(3 * (a[3][0].numel() // div) for a in self._arenas.values())
+            if self._use_scale_pack:
+                est_one_rank = est_one_rank // 2  # 2-bit/4-bit packed is <= 50% of 1-byte E8M0
             need_bytes = est_one_rank * self.world + (16 << 30)
             avail_bytes = 0
             try:
@@ -683,8 +750,10 @@ class KTStreamPrefill:
             except OSError:
                 avail_bytes = need_bytes
             if avail_bytes < need_bytes:
-                self._use_scale_bytes = False
-                _log(f"rank {self.rank}: skipping KT_GPU_STREAM_SCALE_BYTES (need {need_bytes / 2**30:.1f} GiB "
+                self._use_scale_pack = False
+                if not self._arena_e8m0:
+                    self._use_scale_bytes = False
+                _log(f"rank {self.rank}: skipping packed E8M0 scales (need {need_bytes / 2**30:.1f} GiB "
                      f"incl. 16 GiB headroom, MemAvailable {avail_bytes / 2**30:.1f} GiB)")
         if ZEROCOPY and self._arenas:
             ls = sorted(self._arenas)
@@ -699,7 +768,8 @@ class KTStreamPrefill:
             + ("zero-copy from kt-kernel's expert arenas, " if ZEROCOPY else
                f"{HOST_BUFFERS} host buffers x {sum(self.hosts[0].nbytes.values())/1e6:.0f} MB, ")
             + (f"{self.num_slots} packed DMA slots x {self.G * (3 * self.N * self.K // 2) / 1e6:.0f} MB"
-               + (", 1-byte E8M0 scales" if self._use_scale_bytes else "")
+               + (", 2/4-bit packed E8M0 scales" if self._use_scale_pack else
+                  ", 1-byte E8M0 scales" if self._use_scale_bytes else "")
                + (", inter-layer prefetch" if INTER_PREFETCH and self._mmq_mode else "")
                + (", MMQ (no bf16 buffer)" if self._mmq_mode else ", bf16 group buffer")
                if W16 else
@@ -893,6 +963,10 @@ class KTStreamPrefill:
             return
         arenas = self._arenas[layer_idx]
         sstride = arenas[3][1]
+        if self._arena_e8m0:
+            # Arena already holds 1-byte E8M0 scales directly: zero-copy, 0 bytes extra RAM!
+            self._sb_e8m0[layer_idx] = ([arenas[3][0], arenas[4][0], arenas[5][0]], sstride)
+            return
         assert sstride % 4 == 0 and all(a[1] == sstride for a in arenas[3:]), \
             f"scale arena strides {[a[1] for a in arenas[3:]]} not equal or not /4"
         n_exp = arenas[3][0].numel() // sstride
@@ -925,6 +999,97 @@ class KTStreamPrefill:
             _log(f"rank {self.rank}: packed layer {layer_idx} E8M0 scale bytes "
                  f"({nbytes / 1e6:.1f} MB, 4x smaller than fp32) in {(time.perf_counter() - t0) * 1e3:.1f} ms")
 
+    def _build_scale_pack(self, layer_idx: int):
+        """Pack layer_idx's three MXFP4 scale arenas (fp32 or 1-byte E8M0) into per-expert 2-bit
+        (range <= 3) or 4-bit (range <= 15) delta-coded E8M0 bytes (8-bit fallback) in one THP-pinned buffer."""
+        if layer_idx in self._sb_pack:
+            return
+        arenas = self._arenas[layer_idx]
+        sstride = arenas[3][1]
+        assert all(a[1] == sstride for a in arenas[3:]), \
+            f"scale arena strides {[a[1] for a in arenas[3:]]} not equal"
+        n_exp = arenas[3][0].numel() // sstride
+        proj_blks = (self.N * (self.K // 32), self.N * (self.K // 32), self.K * (self.N // 32))
+        t0 = time.perf_counter()
+
+        chunks_per_pi = [[], [], []]
+        offs_host = []
+        modes_host = []
+        bexps_host = []
+        n2 = n4 = n8 = 0
+        total_bytes = 0
+        for pi in range(3):
+            src_u8 = arenas[3 + pi][0]
+            n_blk = proj_blks[pi]
+            offs = [0]
+            modes = []
+            bexps = []
+            for e in range(n_exp):
+                if self._arena_e8m0:
+                    ex = src_u8[e * sstride : e * sstride + n_blk]
+                else:
+                    hi16 = src_u8[e * sstride : e * sstride + 4 * n_blk].view(torch.int16)[1::2]
+                    ex = ((hi16 >> 7) & 0xFF).to(torch.uint8)
+                mn = int(ex.min().item())
+                mx = int(ex.max().item())
+                rng = mx - mn
+                if rng <= 3 and (n_blk % 4 == 0):
+                    c = (ex - mn).view(-1, 4)
+                    p = (c[:, 0] | (c[:, 1] << 2) | (c[:, 2] << 4) | (c[:, 3] << 6)).contiguous()
+                    modes.append(2)
+                    bexps.append(mn)
+                    n2 += 1
+                elif rng <= 15 and (n_blk % 2 == 0):
+                    c = (ex - mn).view(-1, 2)
+                    p = (c[:, 0] | (c[:, 1] << 4)).contiguous()
+                    modes.append(4)
+                    bexps.append(mn)
+                    n4 += 1
+                else:
+                    p = ex.contiguous()
+                    modes.append(8)
+                    bexps.append(0)
+                    n8 += 1
+                chunks_per_pi[pi].append(p)
+                offs.append(offs[-1] + p.numel())
+            offs_host.append(offs)
+            modes_host.append(modes)
+            bexps_host.append(bexps)
+            total_bytes += offs[-1]
+
+        try:
+            from sglang.srt.layers.moe import kt_pinned
+
+            buf = kt_pinned._PinnedBuffer(total_bytes)
+            self._sb_keep.append(buf)
+            flat = torch.frombuffer(
+                memoryview(buf._mm)[buf._off : buf._off + total_bytes],
+                dtype=torch.uint8,
+                count=total_bytes,
+            )
+        except Exception:
+            flat = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
+
+        pb_host = []
+        pos = 0
+        for pi in range(3):
+            sz = offs_host[pi][-1]
+            dst = flat[pos : pos + sz]
+            pos += sz
+            torch.cat(chunks_per_pi[pi], out=dst)
+            pb_host.append(dst)
+
+        offs_gpu = [torch.tensor(offs_host[pi][:-1], dtype=torch.int64, device=self.device) for pi in range(3)]
+        modes_gpu = [torch.tensor(modes_host[pi], dtype=torch.uint8, device=self.device) for pi in range(3)]
+        bexps_gpu = [torch.tensor(bexps_host[pi], dtype=torch.uint8, device=self.device) for pi in range(3)]
+        self._sb_pack[layer_idx] = (pb_host, offs_host, offs_gpu, modes_gpu, bexps_gpu)
+        if TIMING or layer_idx == min(self._arenas):
+            fp32_bytes = 3 * n_exp * (sstride * 4 if self._arena_e8m0 else sstride)
+            src_tag = "e8m0 arena" if self._arena_e8m0 else "fp32 arena"
+            _log(f"rank {self.rank}: packed layer {layer_idx} 2/4-bit E8M0 scales from {src_tag} "
+                 f"({total_bytes / 1e6:.1f} MB, {fp32_bytes / max(1, total_bytes):.1f}x smaller than fp32; "
+                 f"2b={n2} 4b={n4} 8b={n8}) in {(time.perf_counter() - t0) * 1e3:.1f} ms")
+
     def _register_arenas(self, layer_idx: int):
         if layer_idx in self._registered:
             return
@@ -948,7 +1113,9 @@ class KTStreamPrefill:
         finally:
             if lock is not None:
                 lock.close()
-        if self._use_scale_bytes:
+        if self._use_scale_pack:
+            self._build_scale_pack(layer_idx)
+        elif self._use_scale_bytes:
             self._build_scale_bytes(layer_idx)
         self._registered.add(layer_idx)
         if TIMING:
@@ -1133,8 +1300,11 @@ class KTStreamPrefill:
 
             with kt_lend.scratch_region():
                 slot.raw = torch.empty((3, self.G, wstride), dtype=torch.uint8, device=self.device)
-                if self._use_scale_bytes:
-                    slot.raw_e = torch.empty((3, self.G, sstride // 4), dtype=torch.uint8, device=self.device)
+                es_slot = sstride if self._arena_e8m0 else (sstride // 4)
+                if self._use_scale_pack:
+                    slot.raw_e = torch.empty((3, self.G * es_slot), dtype=torch.uint8, device=self.device)
+                elif self._use_scale_bytes:
+                    slot.raw_e = torch.empty((3, self.G, es_slot), dtype=torch.uint8, device=self.device)
                 else:
                     slot.raw_s = torch.empty((3, self.G, sstride), dtype=torch.uint8, device=self.device)
         wstride = slot.raw.shape[2]
@@ -1142,13 +1312,23 @@ class KTStreamPrefill:
         with torch.cuda.stream(self.transfer_stream):
             if slot.compute_used:
                 self.transfer_stream.wait_event(slot.compute_done)
-            if self._use_scale_bytes:
+            if self._use_scale_pack:
+                pb_host, offs_host, _, _, _ = self._sb_pack[layer_idx]
+                slot.pack_layer = layer_idx
+                slot.pack_base = base
+                for pi in range(3):
+                    slot.raw[pi, :n].view(-1).copy_(
+                        arenas[pi][0][base * wstride : (base + n) * wstride], non_blocking=True)
+                    o0 = offs_host[pi][base]
+                    o1 = offs_host[pi][base + n]
+                    slot.raw_e[pi, : o1 - o0].copy_(pb_host[pi][o0:o1], non_blocking=True)
+            elif self._use_scale_bytes:
                 sb, es = self._sb_e8m0[layer_idx]
                 for pi in range(3):
                     slot.raw[pi, :n].view(-1).copy_(
                         arenas[pi][0][base * wstride : (base + n) * wstride], non_blocking=True)
                     slot.raw_e[pi, :n].view(-1).copy_(
-                        sb[pi, base * es : (base + n) * es], non_blocking=True)
+                        sb[pi][base * es : (base + n) * es], non_blocking=True)
             else:
                 sstride = slot.raw_s.shape[2]
                 for pi in range(3):
@@ -1431,6 +1611,16 @@ class KTStreamPrefill:
         N, K = self.N, self.K
         if self._seg_whole:
             ws = slot.raw.shape[2]
+            if self._use_scale_pack:
+                _, offs_host, offs_gpu, modes_gpu, bexps_gpu = self._sb_pack[slot.pack_layer]
+                base = slot.pack_base
+                for pi, (rows, cols) in enumerate(((N, K), (N, K), (K, N))):
+                    _mxfp4_blocks_e8m0_packed(
+                        slot.raw[pi], ws, slot.raw_e[pi],
+                        offs_gpu[pi][base:], modes_gpu[pi][base:], bexps_gpu[pi][base:],
+                        offs_host[pi][base], self._mmq_blk[pi], n, rows, cols,
+                    )
+                return
             if self._use_scale_bytes:
                 es = slot.raw_e.shape[2]
                 for pi, (rows, cols) in enumerate(((N, K), (N, K), (K, N))):
@@ -1441,12 +1631,21 @@ class KTStreamPrefill:
                 _mxfp4_blocks(slot.raw[pi], ws, sf[pi], ss, self._mmq_blk[pi], n, rows, cols)
             return
         for (_, lo, c, d, m), raw, raw_s in zip(self._segs, slot.raws, slot.raw_ss):
-            ws, sf, ss = raw.shape[2], raw_s.view(torch.float32), raw_s.shape[2] // 4
-            for pi in (0, 1):
-                _mxfp4_blocks(raw[pi][:, lo * K // 2:], ws, sf[pi][:, lo * (K // 32):], ss,
-                              self._mmq_blk[pi][:, d:d + c], n, c, K)
-            _mxfp4_blocks(raw[2], ws, sf[2], ss, self._mmq_blk[2][:, :, d // 32 * 17:], n, K, c,
-                          in_cols=m, col_off=lo)
+            ws = raw.shape[2]
+            if self._arena_e8m0:
+                es = raw_s.shape[2]
+                for pi in (0, 1):
+                    _mxfp4_blocks_e8m0(raw[pi][:, lo * K // 2:], ws, raw_s[pi][:, lo * (K // 32):], es,
+                                       self._mmq_blk[pi][:, d:d + c], n, c, K)
+                _mxfp4_blocks_e8m0(raw[2], ws, raw_s[2], es, self._mmq_blk[2][:, :, d // 32 * 17:], n, K, c,
+                                   in_cols=m, col_off=lo)
+            else:
+                sf, ss = raw_s.view(torch.float32), raw_s.shape[2] // 4
+                for pi in (0, 1):
+                    _mxfp4_blocks(raw[pi][:, lo * K // 2:], ws, sf[pi][:, lo * (K // 32):], ss,
+                                  self._mmq_blk[pi][:, d:d + c], n, c, K)
+                _mxfp4_blocks(raw[2], ws, sf[2], ss, self._mmq_blk[2][:, :, d // 32 * 17:], n, K, c,
+                              in_cols=m, col_off=lo)
 
     def _alloc_stage_zc(self, layer_idx: int, base: int, n: int, stats) -> int:
         slot_idx = self._free_slots.popleft()

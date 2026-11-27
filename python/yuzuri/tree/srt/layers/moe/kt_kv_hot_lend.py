@@ -1581,11 +1581,16 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
     w13[:n].view(-1).copy_(ar[a][0][e * ws:e * ws + nb], non_blocking=True)
     w13[n:].view(-1).copy_(ar[b][0][e * ws:e * ws + nb], non_blocking=True)
     w2.view(-1).copy_(ar[2][0][e * ws:e * ws + w2.numel()], non_blocking=True)
-    stage = DYN["stage"]
-    for src, out in ((ar[3 + a], s13[:n]), (ar[3 + b], s13[n:]), (ar[5], s2)):
-        c = out.numel()
-        stage[:c].view(torch.uint8).copy_(src[0][e * ss:e * ss + 4 * c], non_blocking=True)
-        out.view(-1).copy_(((stage[:c].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
+    if getattr(st, "_arena_e8m0", False):
+        for src, out in ((ar[3 + a], s13[:n]), (ar[3 + b], s13[n:]), (ar[5], s2)):
+            c = out.numel()
+            out.view(-1).copy_(src[0][e * ss:e * ss + c], non_blocking=True)
+    else:
+        stage = DYN["stage"]
+        for src, out in ((ar[3 + a], s13[:n]), (ar[3 + b], s13[n:]), (ar[5], s2)):
+            c = out.numel()
+            stage[:c].view(torch.uint8).copy_(src[0][e * ss:e * ss + 4 * c], non_blocking=True)
+            out.view(-1).copy_(((stage[:c].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
 
 
 def _mxc_unpin_done() -> None:
@@ -1673,6 +1678,7 @@ def _arena_load_parts(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> No
     the down projection's columns of a part come through a staging buffer on the device."""
     n, k = w13.shape[0] // 2, w2.shape[0]
     a, b = (0, 1) if order == 0 else (1, 0)
+    e8m0 = getattr(st, "_arena_e8m0", False)
     stage = DYN["stage"]
     for (_, lo, c, d, m), ar in zip(st._segs, st._arena_parts[L.layer_idx]):
         ws, ss = ar[0][1], ar[3][1]
@@ -1681,9 +1687,13 @@ def _arena_load_parts(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> No
             w13[row0 + d:row0 + d + c].view(-1).copy_(
                 ar[src][0][e * ws + lo * kb:e * ws + (lo + c) * kb], non_blocking=True)
             cnt = c * kg
-            stage[:cnt].view(torch.uint8).copy_(
-                ar[3 + src][0][e * ss + 4 * lo * kg:e * ss + 4 * (lo + c) * kg], non_blocking=True)
-            s13[row0 + d:row0 + d + c].view(-1).copy_(((stage[:cnt].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
+            if e8m0:
+                s13[row0 + d:row0 + d + c].view(-1).copy_(
+                    ar[3 + src][0][e * ss + lo * kg:e * ss + (lo + c) * kg], non_blocking=True)
+            else:
+                stage[:cnt].view(torch.uint8).copy_(
+                    ar[3 + src][0][e * ss + 4 * lo * kg:e * ss + 4 * (lo + c) * kg], non_blocking=True)
+                s13[row0 + d:row0 + d + c].view(-1).copy_(((stage[:cnt].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
         # down: k rows of m/2 bytes and m/32 scales in the part; columns lo..lo+c
         if DYN.get("stage_b") is None or DYN["stage_b"].numel() < k * m // 2:
             DYN["stage_b"] = torch.empty(k * m // 2, dtype=torch.uint8, device=w2.device)
@@ -1691,11 +1701,18 @@ def _arena_load_parts(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> No
         sb.copy_(ar[2][0][e * ws:e * ws + k * m // 2], non_blocking=True)
         w2[:, d // 2:(d + c) // 2].copy_(sb.view(k, m // 2)[:, lo // 2:(lo + c) // 2])
         cnt = k * (m // 32)
-        if stage.numel() < cnt:
-            DYN["stage"] = stage = torch.empty(cnt, dtype=torch.float32, device=w2.device)
-        stage[:cnt].view(torch.uint8).copy_(ar[5][0][e * ss:e * ss + 4 * cnt], non_blocking=True)
-        s2[:, d // 32:(d + c) // 32].copy_(
-            ((stage[:cnt].view(torch.int32).view(k, m // 32)[:, lo // 32:(lo + c) // 32] >> 23) & 0xFF).to(torch.uint8))
+        if e8m0:
+            if DYN.get("stage_s") is None or DYN["stage_s"].numel() < cnt:
+                DYN["stage_s"] = torch.empty(cnt, dtype=torch.uint8, device=w2.device)
+            ss_b = DYN["stage_s"][:cnt]
+            ss_b.copy_(ar[5][0][e * ss:e * ss + cnt], non_blocking=True)
+            s2[:, d // 32:(d + c) // 32].copy_(ss_b.view(k, m // 32)[:, lo // 32:(lo + c) // 32])
+        else:
+            if stage.numel() < cnt:
+                DYN["stage"] = stage = torch.empty(cnt, dtype=torch.float32, device=w2.device)
+            stage[:cnt].view(torch.uint8).copy_(ar[5][0][e * ss:e * ss + 4 * cnt], non_blocking=True)
+            s2[:, d // 32:(d + c) // 32].copy_(
+                ((stage[:cnt].view(torch.int32).view(k, m // 32)[:, lo // 32:(lo + c) // 32] >> 23) & 0xFF).to(torch.uint8))
 
 
 # KT_KV_HOT_FILL_BATCH (on by default): a lend fills a layer's slots from the MXFP4 arenas with every host copy
@@ -1759,6 +1776,7 @@ def _arena_fill_batch(L: _Layer, pairs, order: int, outs=None) -> None:
     K = W2.shape[1]
     a, b = (0, 1) if order == 0 else (1, 0)
     whole = getattr(st, "_seg_whole", True)
+    e8m0 = getattr(st, "_arena_e8m0", False)
     segs = [(0, 0, n, 0, n)] if whole else st._segs
     parts = [st._arenas[L.layer_idx]] if whole else st._arena_parts[L.layer_idx]
     for b0 in range(0, len(pairs), FILL_SLOTS):
@@ -1767,6 +1785,28 @@ def _arena_fill_batch(L: _Layer, pairs, order: int, outs=None) -> None:
         js = [j for j, _ in batch]
         for si, ((_, lo, c, d, m), ar) in enumerate(zip(segs, parts)):
             ws, ss = ar[0][1], ar[3][1]
+            if e8m0:
+                if not whole:
+                    db = _stage("fbd", q * K * (m // 2), torch.uint8, dev).view(q, K, m // 2)
+                    sb2 = _stage("fb2u", q * K * (m // 32), torch.uint8, dev).view(q, K, m // 32)
+                for i, (j, e) in enumerate(batch):
+                    for h, src in ((0, a), (1, b)):
+                        W13[j, h * n + d:h * n + d + c].view(-1).copy_(
+                            ar[src][0][e * ws + lo * kb:e * ws + (lo + c) * kb], non_blocking=True)
+                        S13[j, h * n + d:h * n + d + c].view(-1).copy_(
+                            ar[3 + src][0][e * ss + lo * kg:e * ss + (lo + c) * kg], non_blocking=True)
+                    if whole:
+                        W2[j].view(-1).copy_(ar[2][0][e * ws:e * ws + W2[j].numel()], non_blocking=True)
+                        S2[j].view(-1).copy_(ar[5][0][e * ss:e * ss + S2[j].numel()], non_blocking=True)
+                    else:
+                        db[i].view(-1).copy_(ar[2][0][e * ws:e * ws + K * m // 2], non_blocking=True)
+                        sb2[i].view(-1).copy_(ar[5][0][e * ss:e * ss + K * (m // 32)], non_blocking=True)
+                if not whole:
+                    for j0, j1, i0 in _runs(js):
+                        r = slice(i0, i0 + j1 - j0)
+                        W2[j0:j1, :, d // 2:(d + c) // 2].copy_(db[r, :, lo // 2:(lo + c) // 2])
+                        S2[j0:j1, :, d // 32:(d + c) // 32].copy_(sb2[r, :, lo // 32:(lo + c) // 32])
+                continue
             # the FP32 scales of the batch: gate/up rows lo..lo+c (two halves), then the down projection's
             f13 = _stage("fb13", q * 2 * c * kg, torch.int32, dev).view(q, 2, c, kg)
             if whole:

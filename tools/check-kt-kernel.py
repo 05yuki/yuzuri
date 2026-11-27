@@ -38,12 +38,15 @@ def main() -> int:
 
     # 2. GGUF (LLAMAFILE) experts: a load-time check that every weight type has a CPU kernel
     guard = None
+    e8m0_arena = None
     if ext:
         try:
             with open(ext, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
                 guard = m.find(b"this build has no CPU kernel for the") >= 0
+                e8m0_arena = m.find(b"KT_MXFP4_SCALE_ARENA_E8M0") >= 0
         except OSError:
             guard = None
+            e8m0_arena = None
     if guard:
         print("  GGUF kernel check at load: yes (a weight type without a CPU kernel stops the load with its name)")
     else:
@@ -54,6 +57,15 @@ def main() -> int:
         print("            'terminate called after throwing std::runtime_error'.")
         print("    build:  kt-kernel with those types' kernels in third_party/llamafile and the load check;")
         print("            safetensors checkpoints (bf16, FP8, MXFP4, NVFP4) are not affected.")
+
+    # 3. MXFP4 1-byte E8M0 scale arenas (KT_MXFP4_SCALE_ARENA_E8M0=1)
+    if e8m0_arena:
+        print("  MXFP4 1-byte E8M0 scale arenas: yes (saves ~68 GB host RAM on 1017-class MXFP4 models)")
+    else:
+        print("  MXFP4 1-byte E8M0 scale arenas: " + ("no" if e8m0_arena is False else "unknown (extension file not read)"))
+        print("    effect: MXFP4 experts keep 4-byte fp32 scale arenas; 2/4-bit packed scale DMA (KT_GPU_STREAM_SCALE_PACK=1)")
+        print("            still runs automatically and cuts scale H2D 13.3x, but host RAM is ~68 GB higher on 1017-class models.")
+        print("    build:  kt-kernel with patches/kt-kernel-mxfp4-e8m0-arena.patch, then run setup.sh --package again.")
     return 0
 
 

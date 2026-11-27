@@ -52,7 +52,8 @@ FORMAT_ENV = {
     # beside the FP32 arena the streamer reads; an extension without the codes reads no such variable
     "MXFP4": {"KT_GPU_STREAM_W16": "1", "KT_GPU_STREAM_ZEROCOPY": "1", "KT_GPU_STREAM_GRAPH": "1",
               "KT_GPU_STREAM_MMQ": "1", "KT_GPU_STREAM_HOST_BUFS": "3", "KT_WRITE_UP_FIRST": "1", "KT_GPU_MASK_ZERO": "1",
-              "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_GPU_STREAM_SLOTS": "6", "KT_GPU_STREAM_INTER_PREFETCH": "1",
+              "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_GPU_STREAM_SCALE_PACK": "1",
+              "KT_GPU_STREAM_SLOTS": "6", "KT_GPU_STREAM_INTER_PREFETCH": "1",
               "KT_MXFP4_SCALE_CODES": "1",
               # two bits a group in the decode loop where a matrix holds at most four scales (kt-kernel decides
               # per matrix at load; bit-identical). As above: an extension without it reads no such variable
@@ -242,6 +243,10 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
         cmd += ["--max-mamba-cache-size", "{mamba_slots}"]
     env = dict(COMMON_ENV)
     env.update(FORMAT_ENV.get(method, {}))
+    if method == "MXFP4" and "F8_E8M0" in why:
+        # OCP MXFP4 checkpoints store exact power-of-two E8M0 block scales: kt-kernel keeps 1-byte E8M0
+        # arenas directly when built with KT_MXFP4_SCALE_ARENA_E8M0 (ignored safely by older builds)
+        env["KT_MXFP4_SCALE_ARENA_E8M0"] = "1"
     note = ""
     env["KT_GPU_STREAM_GROUP"] = str(group)
     if no_hot:
