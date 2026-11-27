@@ -82,6 +82,14 @@ W16 = os.environ.get("KT_GPU_STREAM_W16", "0") == "1"
 # at a time.
 MMQ = os.environ.get("KT_GPU_STREAM_MMQ", "0") == "1"
 MMQ_ROUTES = int(os.environ.get("KT_GPU_STREAM_MMQ_ROUTES", "8192") or 0)
+# KT_GPU_STREAM_SCALE_BYTES=1: pack kt-kernel's fp32 MXFP4 scale arenas into one-byte E8M0 exponents
+# once in THP-pinned host memory and DMA 1 byte/block instead of 4 (bit-identical in MMQ mode).
+SCALE_BYTES = os.environ.get("KT_GPU_STREAM_SCALE_BYTES", "0") == "1"
+# KT_GPU_STREAM_SLOTS=<K>: number of device DMA slots in MMQ zero-copy mode (>= 2).
+PREFETCH_SLOTS = max(2, int(os.environ.get("KT_GPU_STREAM_SLOTS", "2") or 2))
+# KT_GPU_STREAM_INTER_PREFETCH=1: at the end of layer L's MMQ MoE, pre-stage layer L+1's first K groups
+# on transfer_stream so expert H2D overlaps Attention + Dense + mHC.
+INTER_PREFETCH = os.environ.get("KT_GPU_STREAM_INTER_PREFETCH", "0") == "1"
 GGML_TYPE_MXFP4 = 39
 # rows per CUTLASS MoE call (0 = the chunk);
 # the W16 group body and the resident experts' call during a streamed prefill
@@ -330,6 +338,43 @@ def _mxfp4_blocks(packed: torch.Tensor, packed_stride: int, scales_f32: torch.Te
     )
 
 
+@triton.jit
+def _mxfp4_blocks_e8m0_kernel(
+    packed_ptr, scale_e8m0_ptr, out_ptr,
+    n_blocks, nb, packed_stride, scale_stride, out_stride, in_rs, s_rs, out_rs,
+    BB: tl.constexpr,
+):
+    """Same as _mxfp4_blocks_kernel, reading 1-byte E8M0 scale exponents directly instead of fp32."""
+    e = tl.program_id(1)
+    blk = tl.program_id(0) * BB + tl.arange(0, BB)
+    m = blk < n_blocks
+    row = blk // nb
+    kb = blk % nb
+    src = packed_ptr + e * packed_stride + row * in_rs + kb * 16
+    j = tl.arange(0, 16)
+    sh = (j % 2) * 4
+    lo = tl.load(src[:, None] + (j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    hi = tl.load(src[:, None] + (8 + j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    qs = ((lo >> sh[None, :]) & 15) | (((hi >> sh[None, :]) & 15) << 4)
+    ex = tl.load(scale_e8m0_ptr + e * scale_stride + row * s_rs + kb, mask=m, other=127)
+    dst = out_ptr + e * out_stride + row * out_rs + kb * 17
+    tl.store(dst, ex.to(tl.uint8), mask=m)
+    tl.store(dst[:, None] + 1 + j[None, :], qs.to(tl.uint8), mask=m[:, None])
+
+
+def _mxfp4_blocks_e8m0(packed: torch.Tensor, packed_stride: int, scales_u8: torch.Tensor, scale_stride: int,
+                       out: torch.Tensor, n: int, rows: int, cols: int, in_cols: int = 0, col_off: int = 0):
+    """Bit-identical to _mxfp4_blocks, taking 1-byte uint8 E8M0 scales instead of fp32."""
+    in_cols = in_cols or cols
+    nb = cols // 32
+    n_blocks = rows * nb
+    BB = 64
+    _mxfp4_blocks_e8m0_kernel[(triton.cdiv(n_blocks, BB), n)](
+        packed[:, col_off // 2:], scales_u8[:, col_off // 32:], out, n_blocks, nb, packed_stride, scale_stride,
+        out.stride(0), in_cols // 2, in_cols // 32, out.stride(1), BB=BB,
+    )
+
+
 def _rank_segments(rank: int, world: int, parts: int, inter: int):
     """[(part, first row in the part, rows, first row in the rank's slice, rows a part)] for
     rank's rows rank*N..(rank+1)*N of the intermediate size, N = inter / world, that
@@ -444,9 +489,10 @@ class _DeviceSlot:
         self.compute_done = torch.cuda.Event()
         self.compute_used = False
         # Zero-copy: the group's gate/up/down blocks exactly as kt-kernel
-        # stores them (packed weights then fp32 scales, 64-aligned stride).
+        # stores them (packed weights then fp32 or e8m0 scales, 64-aligned stride).
         self.raw = None
         self.raw_s = None
+        self.raw_e = None
 
 
 class KTStreamPrefill:
@@ -480,23 +526,36 @@ class KTStreamPrefill:
         # the lend scratch (plain allocations when lending is off)
         from sglang.srt.layers.moe import kt_lend
 
+        from collections import deque
+
+        self._mmq_mode = MMQ and ZEROCOPY and W16 and not NOMOE
+        self.num_slots = PREFETCH_SLOTS if (self._mmq_mode and not MXC) else 2
         with kt_lend.scratch_region():
             self.slots = [
                 _DeviceSlot(self.G, self.N, self.K, self.device,
                             raw_dtype=None if ZEROCOPY else torch.bfloat16)
-                for _ in range(2)
+                for _ in range(self.num_slots)
             ]
+        self._free_slots = deque(range(self.num_slots))
+        self._prefetched = {}
+        self._sb_e8m0 = {}
+        self._sb_keep = []
+        self._next_layer = {}
         if W16:
             if not (ZEROCOPY and USE_GRAPH):
                 raise RuntimeError("KT_GPU_STREAM_W16 needs the zero-copy graph mode")
-            # One bf16 landing for the group being computed; the groups run
-            # back to back on the compute stream, so a single buffer serves
-            # both DMA slots.
-            with kt_lend.scratch_region():
-                self.w13_bf16 = torch.empty((self.G, 2 * self.N, self.K), dtype=torch.bfloat16, device=self.device)
-                self.w2_bf16 = torch.empty((self.G, self.K, self.N), dtype=torch.bfloat16, device=self.device)
-            _log(f"rank {self.rank}: W16 mode, bf16 group buffer "
-                 f"{(self.w13_bf16.numel() + self.w2_bf16.numel()) * 2 / 1e6:.0f} MB")
+            if self._mmq_mode:
+                # MMQ mode regroups raw MXFP4 bytes directly into _mmq_blk and never touches bf16 group buffers.
+                self.w13_bf16 = self.w2_bf16 = None
+            else:
+                # One bf16 landing for the group being computed; the groups run
+                # back to back on the compute stream, so a single buffer serves
+                # both DMA slots.
+                with kt_lend.scratch_region():
+                    self.w13_bf16 = torch.empty((self.G, 2 * self.N, self.K), dtype=torch.bfloat16, device=self.device)
+                    self.w2_bf16 = torch.empty((self.G, self.K, self.N), dtype=torch.bfloat16, device=self.device)
+                _log(f"rank {self.rank}: W16 mode, bf16 group buffer "
+                     f"{(self.w13_bf16.numel() + self.w2_bf16.numel()) * 2 / 1e6:.0f} MB")
         # Per-expert constants the runner reads, sized G like the resident
         # method sizes its own (Mxfp4FlashinferCutlassMoEMethod.create_moe_runner).
         gm = method.gpu_method
@@ -607,12 +666,42 @@ class KTStreamPrefill:
             self._map_expert_arenas(method)
         else:
             self._make_host_buffers()
+        self._use_scale_bytes = bool(
+            SCALE_BYTES and ZEROCOPY and self._mmq_mode and self._seg_whole and self._mxc is None
+        )
+        if self._use_scale_bytes and self._arenas:
+            # Guard against OOM on tight-RAM hosts: total E8M0 scale bytes across all ranks + 16 GiB headroom.
+            est_one_rank = sum(3 * (a[3][0].numel() // 4) for a in self._arenas.values())
+            need_bytes = est_one_rank * self.world + (16 << 30)
+            avail_bytes = 0
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            avail_bytes = int(line.split()[1]) * 1024
+                            break
+            except OSError:
+                avail_bytes = need_bytes
+            if avail_bytes < need_bytes:
+                self._use_scale_bytes = False
+                _log(f"rank {self.rank}: skipping KT_GPU_STREAM_SCALE_BYTES (need {need_bytes / 2**30:.1f} GiB "
+                     f"incl. 16 GiB headroom, MemAvailable {avail_bytes / 2**30:.1f} GiB)")
+        if ZEROCOPY and self._arenas:
+            ls = sorted(self._arenas)
+            self._next_layer = {ls[i]: ls[i + 1] for i in range(len(ls) - 1)}
+        if not self._seg_whole and len(self.slots) > 2:
+            self.slots = self.slots[:2]
+            self.num_slots = 2
+            self._free_slots = deque(range(2))
         self.calls = 0
         _log(
             f"rank {self.rank}: streamed prefill on above {STREAM_THRESHOLD} tokens, G={self.G}, "
             + ("zero-copy from kt-kernel's expert arenas, " if ZEROCOPY else
                f"{HOST_BUFFERS} host buffers x {sum(self.hosts[0].nbytes.values())/1e6:.0f} MB, ")
-            + (f"2 packed DMA slots x {self.G * (3 * self.N * self.K // 2) / 1e6:.0f} MB, bf16 group buffer"
+            + (f"{self.num_slots} packed DMA slots x {self.G * (3 * self.N * self.K // 2) / 1e6:.0f} MB"
+               + (", 1-byte E8M0 scales" if self._use_scale_bytes else "")
+               + (", inter-layer prefetch" if INTER_PREFETCH and self._mmq_mode else "")
+               + (", MMQ (no bf16 buffer)" if self._mmq_mode else ", bf16 group buffer")
                if W16 else
                f"2 device slots x {(self.slots[0].w13_weight.numel() + self.slots[0].w2_weight.numel())/1e6:.0f} MB of weights")
         )
@@ -796,6 +885,46 @@ class KTStreamPrefill:
                  f"arena gate_w[:8]={gate_w[:8].tolist()} writer[:8]={gate_w_writer[:8].tolist()} "
                  f"gate_s[:4]={gate_s[:4].tolist()} writer_s[:4]={gate_s_writer[:4].tolist()}")
 
+    def _build_scale_bytes(self, layer_idx: int):
+        """Pack layer_idx's three fp32 MXFP4 scale arenas (gate, up, down) into one THP-pinned
+        [3, E, sstride // 4] uint8 tensor of E8M0 exponent bytes. Bit-identical to extracting
+        (fp32_bits >> 23) & 0xFF on the GPU, while cutting scale H2D traffic by 4x."""
+        if layer_idx in self._sb_e8m0:
+            return
+        arenas = self._arenas[layer_idx]
+        sstride = arenas[3][1]
+        assert sstride % 4 == 0 and all(a[1] == sstride for a in arenas[3:]), \
+            f"scale arena strides {[a[1] for a in arenas[3:]]} not equal or not /4"
+        n_exp = arenas[3][0].numel() // sstride
+        es = sstride // 4
+        nbytes = 3 * n_exp * es
+        t0 = time.perf_counter()
+        try:
+            from sglang.srt.layers.moe import kt_pinned
+
+            buf = kt_pinned._PinnedBuffer(nbytes)
+            self._sb_keep.append(buf)
+            flat = torch.frombuffer(
+                memoryview(buf._mm)[buf._off : buf._off + nbytes],
+                dtype=torch.uint8,
+                count=nbytes,
+            )
+        except Exception:
+            flat = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        sb = flat.view(3, n_exp * es)
+        # Extract exponent bits [23..30] from little-endian fp32 in 64-expert chunks (L3-friendly).
+        chunk_e = 64
+        for pi in range(3):
+            src_u8 = arenas[3 + pi][0]
+            for e0 in range(0, n_exp, chunk_e):
+                e1 = min(n_exp, e0 + chunk_e)
+                hi16 = src_u8[e0 * sstride : e1 * sstride].view(torch.int16)[1::2]
+                sb[pi, e0 * es : e1 * es].copy_(((hi16 >> 7) & 0xFF).to(torch.uint8))
+        self._sb_e8m0[layer_idx] = (sb, es)
+        if TIMING or layer_idx == min(self._arenas):
+            _log(f"rank {self.rank}: packed layer {layer_idx} E8M0 scale bytes "
+                 f"({nbytes / 1e6:.1f} MB, 4x smaller than fp32) in {(time.perf_counter() - t0) * 1e3:.1f} ms")
+
     def _register_arenas(self, layer_idx: int):
         if layer_idx in self._registered:
             return
@@ -819,6 +948,8 @@ class KTStreamPrefill:
         finally:
             if lock is not None:
                 lock.close()
+        if self._use_scale_bytes:
+            self._build_scale_bytes(layer_idx)
         self._registered.add(layer_idx)
         if TIMING:
             _log(f"rank {self.rank}: registered layer {layer_idx} arenas, {total/1e9:.1f} GB in {time.time()-t0:.1f} s"
@@ -986,16 +1117,9 @@ class KTStreamPrefill:
         return (f"expert cache: {X['hits']} experts streamed from the cache, {X['reads']} read from the drive "
                 f"({X['read_bytes'] / 1e9:.1f} GB, waited for {X['read_s']:.1f} s)")
 
-    def _stage_zc(self, layer_idx: int, gi: int, experts, stats):
-        """Three contiguous H2D copies: the group's consecutive expert blocks
-        of the gate, up and down arenas, into the slot's raw landing."""
-        if self._mxc is not None:
-            self._stage_cache(layer_idx, gi, experts, stats)
-            return
+    def _stage_zc_slot(self, slot, layer_idx: int, base: int, n: int, stats):
+        """Stage experts [base, base + n) of layer_idx into the given device slot."""
         self._register_arenas(layer_idx)
-        slot = self.slots[gi % 2]
-        n = len(experts)
-        base = experts[0]
         if not self._seg_whole:
             self._stage_zc_parts(layer_idx, slot, base, n, stats)
             return
@@ -1009,19 +1133,40 @@ class KTStreamPrefill:
 
             with kt_lend.scratch_region():
                 slot.raw = torch.empty((3, self.G, wstride), dtype=torch.uint8, device=self.device)
-                slot.raw_s = torch.empty((3, self.G, sstride), dtype=torch.uint8, device=self.device)
+                if self._use_scale_bytes:
+                    slot.raw_e = torch.empty((3, self.G, sstride // 4), dtype=torch.uint8, device=self.device)
+                else:
+                    slot.raw_s = torch.empty((3, self.G, sstride), dtype=torch.uint8, device=self.device)
         wstride = slot.raw.shape[2]
-        sstride = slot.raw_s.shape[2]
         t0 = time.perf_counter()
         with torch.cuda.stream(self.transfer_stream):
             if slot.compute_used:
                 self.transfer_stream.wait_event(slot.compute_done)
-            for pi in range(3):
-                slot.raw[pi, :n].view(-1).copy_(arenas[pi][0][base * wstride:(base + n) * wstride], non_blocking=True)
-                slot.raw_s[pi, :n].view(-1).copy_(
-                    arenas[3 + pi][0][base * sstride:(base + n) * sstride], non_blocking=True)
+            if self._use_scale_bytes:
+                sb, es = self._sb_e8m0[layer_idx]
+                for pi in range(3):
+                    slot.raw[pi, :n].view(-1).copy_(
+                        arenas[pi][0][base * wstride : (base + n) * wstride], non_blocking=True)
+                    slot.raw_e[pi, :n].view(-1).copy_(
+                        sb[pi, base * es : (base + n) * es], non_blocking=True)
+            else:
+                sstride = slot.raw_s.shape[2]
+                for pi in range(3):
+                    slot.raw[pi, :n].view(-1).copy_(
+                        arenas[pi][0][base * wstride : (base + n) * wstride], non_blocking=True)
+                    slot.raw_s[pi, :n].view(-1).copy_(
+                        arenas[3 + pi][0][base * sstride : (base + n) * sstride], non_blocking=True)
             slot.dma_done.record(self.transfer_stream)
         stats["dma_enq"] += time.perf_counter() - t0
+
+    def _stage_zc(self, layer_idx: int, gi: int, experts, stats):
+        """Three contiguous H2D copies: the group's consecutive expert blocks
+        of the gate, up and down arenas, into the slot's raw landing."""
+        if self._mxc is not None:
+            self._stage_cache(layer_idx, gi, experts, stats)
+            return
+        slot = self.slots[gi % 2]
+        self._stage_zc_slot(slot, layer_idx, experts[0], len(experts), stats)
 
     def _stage_zc_parts(self, layer_idx: int, slot, base: int, n: int, stats):
         """_stage_zc when this rank's rows sit in other than one whole kt-kernel part: each
@@ -1285,7 +1430,13 @@ class KTStreamPrefill:
         (down) into this rank's rows / columns d..d+c."""
         N, K = self.N, self.K
         if self._seg_whole:
-            ws, sf, ss = slot.raw.shape[2], slot.raw_s.view(torch.float32), slot.raw_s.shape[2] // 4
+            ws = slot.raw.shape[2]
+            if self._use_scale_bytes:
+                es = slot.raw_e.shape[2]
+                for pi, (rows, cols) in enumerate(((N, K), (N, K), (K, N))):
+                    _mxfp4_blocks_e8m0(slot.raw[pi], ws, slot.raw_e[pi], es, self._mmq_blk[pi], n, rows, cols)
+                return
+            sf, ss = slot.raw_s.view(torch.float32), slot.raw_s.shape[2] // 4
             for pi, (rows, cols) in enumerate(((N, K), (N, K), (K, N))):
                 _mxfp4_blocks(slot.raw[pi], ws, sf[pi], ss, self._mmq_blk[pi], n, rows, cols)
             return
@@ -1296,6 +1447,11 @@ class KTStreamPrefill:
                               self._mmq_blk[pi][:, d:d + c], n, c, K)
             _mxfp4_blocks(raw[2], ws, sf[2], ss, self._mmq_blk[2][:, :, d // 32 * 17:], n, K, c,
                           in_cols=m, col_off=lo)
+
+    def _alloc_stage_zc(self, layer_idx: int, base: int, n: int, stats) -> int:
+        slot_idx = self._free_slots.popleft()
+        self._stage_zc_slot(self.slots[slot_idx], layer_idx, base, n, stats)
+        return slot_idx
 
     def _run_mmq(self, method, layer_idx: int, x, ids, topk_weights, groups, acc, stats):
         """The layer's streamed groups through MMQ: the routes sorted by expert once (one host sync for their
@@ -1316,10 +1472,72 @@ class KTStreamPrefill:
         b32 = bounds.to(torch.int32)
         bl = bounds.tolist()
         lim = self.swiglu_limit_value if SWIGLU_CLAMP else None
-        self._stage_zc(layer_idx, 0, groups[0], stats)
+        use_ring = (self._mxc is None and ZEROCOPY and self._seg_whole and (self.num_slots > 2 or INTER_PREFETCH))
+        if not use_ring:
+            self._stage_zc(layer_idx, 0, groups[0], stats)
+            for gi, experts in enumerate(groups):
+                base, n = experts[0], len(experts)
+                slot = self.slots[gi % 2]
+                lo, hi = bl[base], bl[base + n]
+                t0 = time.perf_counter()
+                if hi > lo:
+                    cur.wait_event(slot.dma_done)
+                    self._mmq_regroup(slot, n)
+                slot.compute_done.record(cur)
+                slot.compute_used = True
+                pending = None
+                if gi + 1 < len(groups):
+                    if self._mxc is not None and ZEROCOPY:
+                        pending = self._stage_cache_begin(layer_idx, gi + 1, groups[gi + 1], stats)
+                    else:
+                        self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
+                step = MMQ_ROUTES if MMQ_ROUTES > 0 else max(1, hi - lo)
+                for r0 in range(lo, hi, step):
+                    r1 = min(hi, r0 + step)
+                    r = order[r0:r1]
+                    t = torch.div(r, topk, rounding_mode="floor")
+                    sidx = r - t * topk
+                    e1 = e_sorted[r0:r1] - base
+                    bb = (b32[base:base + n + 1] - r0).clamp_(0, r1 - r0)
+                    xc = x.index_select(0, t)
+                    gate = MMQ.moe_mmq_sorted(xc, self._mmq_blk[0][:n], e1, bb, GGML_TYPE_MXFP4, self.N).view(-1, self.N)
+                    up = MMQ.moe_mmq_sorted(xc, self._mmq_blk[1][:n], e1, bb, GGML_TYPE_MXFP4, self.N).view(-1, self.N)
+                    if lim is not None:
+                        gate.clamp_(max=lim)
+                        up.clamp_(-lim, lim)
+                    h = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+                    down = MMQ.moe_mmq_sorted(h, self._mmq_blk[2][:n], e1, bb, GGML_TYPE_MXFP4, self.K).view(-1, self.K)
+                    down.mul_(topk_weights[t, sidx].to(torch.float32).unsqueeze(1))
+                    acc.index_add_(0, t, down.to(acc.dtype))
+                stats["moe_enq"] += time.perf_counter() - t0
+                if pending is not None:
+                    self._stage_cache_end(pending, stats)
+            return
+
+        # Ring-buffered zero-copy MMQ with optional inter-layer expert prefetch.
+        staged = {}
+        for gi, experts in enumerate(groups):
+            pk = (layer_idx, experts[0], len(experts))
+            if pk in self._prefetched:
+                staged[gi] = self._prefetched.pop(pk)
+        if self._prefetched:
+            for old_idx in self._prefetched.values():
+                self._free_slots.append(old_idx)
+            self._prefetched.clear()
+        next_to_stage = 0
+        while next_to_stage < len(groups) and next_to_stage in staged:
+            next_to_stage += 1
+        if 0 not in staged:
+            staged[0] = self._alloc_stage_zc(layer_idx, groups[0][0], len(groups[0]), stats)
+            next_to_stage = 1
+            while next_to_stage < len(groups) and next_to_stage in staged:
+                next_to_stage += 1
+        next_L = self._next_layer.get(layer_idx) if INTER_PREFETCH else None
+        next_L_gi = 0
         for gi, experts in enumerate(groups):
             base, n = experts[0], len(experts)
-            slot = self.slots[gi % 2]
+            slot_idx = staged.pop(gi) if gi in staged else self._alloc_stage_zc(layer_idx, base, n, stats)
+            slot = self.slots[slot_idx]
             lo, hi = bl[base], bl[base + n]
             t0 = time.perf_counter()
             if hi > lo:
@@ -1327,12 +1545,23 @@ class KTStreamPrefill:
                 self._mmq_regroup(slot, n)
             slot.compute_done.record(cur)
             slot.compute_used = True
-            pending = None
-            if gi + 1 < len(groups):
-                if self._mxc is not None and ZEROCOPY:
-                    pending = self._stage_cache_begin(layer_idx, gi + 1, groups[gi + 1], stats)
+            self._free_slots.append(slot_idx)
+            # Refill lookahead queue using every free slot (reused slots wait on compute_done on transfer_stream).
+            while self._free_slots:
+                if next_to_stage < len(groups):
+                    ex = groups[next_to_stage]
+                    staged[next_to_stage] = self._alloc_stage_zc(layer_idx, ex[0], len(ex), stats)
+                    next_to_stage += 1
+                    while next_to_stage < len(groups) and next_to_stage in staged:
+                        next_to_stage += 1
+                elif next_L is not None and next_L_gi < len(groups):
+                    ex = groups[next_L_gi]
+                    self._prefetched[(next_L, ex[0], len(ex))] = self._alloc_stage_zc(
+                        next_L, ex[0], len(ex), stats
+                    )
+                    next_L_gi += 1
                 else:
-                    self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
+                    break
             step = MMQ_ROUTES if MMQ_ROUTES > 0 else max(1, hi - lo)
             for r0 in range(lo, hi, step):
                 r1 = min(hi, r0 + step)
@@ -1352,8 +1581,6 @@ class KTStreamPrefill:
                 down.mul_(topk_weights[t, sidx].to(torch.float32).unsqueeze(1))
                 acc.index_add_(0, t, down.to(acc.dtype))
             stats["moe_enq"] += time.perf_counter() - t0
-            if pending is not None:
-                self._stage_cache_end(pending, stats)
 
     def _group_body(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids32, acc, out):
         """Scale prep + MoE + accumulate for one group, on the current stream.

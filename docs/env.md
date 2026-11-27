@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-287 names.
+293 names.
 
 ## KT_
 
@@ -65,6 +65,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GPU_STREAM_GRAPH` | `"1"` | kt_stream_prefill.py, kt_stream_prefill_bf16.py |
 | `KT_GPU_STREAM_GROUP` | `"0" / "32" / "8"` | kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py, mxfp4_runner_resident.py |
 | `KT_GPU_STREAM_HOST_BUFS` | `"3"` | kt_stream_prefill.py |
+| `KT_GPU_STREAM_INTER_PREFETCH` | `"0"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_IN_WINDOW` | `"0"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_KEEP` | `"32"` | kt_stream_threshold.py |
 | `KT_GPU_STREAM_MMQ` | `"0"` | kt_stream_prefill.py |
@@ -78,9 +79,10 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GPU_STREAM_REPS` | `"3"` | kt_stream_threshold.py |
 | `KT_GPU_STREAM_ROW_BLOCK` | `"0"` | kt_cutile_nvfp4.py, kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_ROW_STEP` | `"2048"` | kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
-| `KT_GPU_STREAM_SCALE_BYTES` | `"0"` | kt_stream_prefill_nvfp4.py |
+| `KT_GPU_STREAM_SCALE_BYTES` | `"0"` | kt_stream_prefill.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_SCALE_BYTES_VERIFY` | `"0"` | kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_SELFTEST` | - | kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
+| `KT_GPU_STREAM_SLOTS` | `"2"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_SYNC_DMA` | - | kt_stream_prefill.py |
 | `KT_GPU_STREAM_TIMING` | - | kt_ep_methods.py, kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_TUNE_TOKENS` | `"2048"` | kt_stream_prefill_bf16.py |
@@ -261,6 +263,9 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `SGLANG_DSV4_ROPE_LAZY_VERIFY` | `"0"` | lazy_rope_table.py |
 | `SGLANG_EMBED_ON_HOST` | `"0"` | loader_seams.py, model_runner_seams.py |
 | `SGLANG_FP8_GEMV` | `"1"` | fp8_decode_gemm.py |
+| `SGLANG_FP8_PREFILL_MXFP8` | `"1"` | fp8_decode_gemm.py |
+| `SGLANG_FP8_PREFILL_MXFP8_BACKEND` | `""` | fp8_decode_gemm.py |
+| `SGLANG_FP8_PREFILL_MXFP8_MIN_M` | `"32"` | fp8_decode_gemm.py |
 | `SGLANG_FP8_SKINNY` | `"1"` | fp8_decode_gemm.py |
 | `SGLANG_FP8_SKINNY_BLOCK_N` | `"128"` | fp8_decode_gemm.py |
 | `SGLANG_FP8_SKINNY_LOG` | - | fp8_decode_gemm.py |
@@ -274,7 +279,8 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `SGLANG_HICACHE_STAGING_MB` | `"32"` | hicache_staging_cap.py |
 | `SGLANG_HOST_STAGED_ALLREDUCE` | - | host_allreduce.py |
 | `SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES` | `str(1 << 20)` | host_staged_allreduce.py |
-| `SGLANG_HOST_STAGED_ALLREDUCE_PIECE` | `str(4 << 20)` | host_staged_allreduce.py |
+| `SGLANG_HOST_STAGED_ALLREDUCE_PIECE` | `str(8 << 20)` | host_staged_allreduce.py |
+| `SGLANG_HOST_STAGED_ALLREDUCE_REGION` | `str(16 << 20)` | host_staged_allreduce.py |
 | `SGLANG_LL_ALLREDUCE` | - | host_allreduce.py |
 | `SGLANG_LL_ALLREDUCE_MAX_BYTES` | `str(64 << 10)` | ll_allreduce.py |
 | `SGLANG_MARLIN_MOE_FP32_GLUE` | `"0"` | marlin_fp32_glue.py |

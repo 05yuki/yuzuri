@@ -147,11 +147,12 @@
   },
   {
    "name": "fp8-decode",
-   "for": "decode-sized block-FP8 GEMMs on their own kernels",
+   "for": "decode-sized and SM100+ block-[32,32] prefill FP8 GEMMs on their own kernels",
    "requires": [],
    "off": {
     "SGLANG_FP8_GEMV": "0",
-    "SGLANG_FP8_SKINNY": "0"
+    "SGLANG_FP8_SKINNY": "0",
+    "SGLANG_FP8_PREFILL_MXFP8": "0"
    },
    "recipe": "fp8-decode",
    "base": true

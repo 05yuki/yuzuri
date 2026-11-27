@@ -52,6 +52,7 @@ FORMAT_ENV = {
     # beside the FP32 arena the streamer reads; an extension without the codes reads no such variable
     "MXFP4": {"KT_GPU_STREAM_W16": "1", "KT_GPU_STREAM_ZEROCOPY": "1", "KT_GPU_STREAM_GRAPH": "1",
               "KT_GPU_STREAM_MMQ": "1", "KT_GPU_STREAM_HOST_BUFS": "3", "KT_WRITE_UP_FIRST": "1", "KT_GPU_MASK_ZERO": "1",
+              "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_GPU_STREAM_SLOTS": "6", "KT_GPU_STREAM_INTER_PREFETCH": "1",
               "KT_MXFP4_SCALE_CODES": "1",
               # two bits a group in the decode loop where a matrix holds at most four scales (kt-kernel decides
               # per matrix at load; bit-identical). As above: an extension without it reads no such variable
@@ -204,12 +205,14 @@ def build(config_dir, experts_dir=None, gguf=None, tp=2):
         # that keeps none (its experts live only under --experts) leaves them empty, so the slots are not made
         no_hot = "the config directory's own weights hold no expert tensor, and a hot expert is filled from them"
     if per_rank and fmt_env.get("KT_GPU_STREAM_W16") == "1":
-        # the W16 streamer keeps, for every expert of a group, two packed DMA slots and the bf16 copy the kernel
-        # reads (three matrices of hidden x intermediate), plus the MMQ buffers: count what stays on the card,
-        # not the packed file (V4.1 MXFP4: 8.8 MB packed, 62 MB kept an expert a rank)
+        # the W16 streamer keeps, for every expert of a group, its packed DMA slots and either the bf16 copy
+        # (non-MMQ) or the MMQ block_mxfp4 buffer (MMQ drops the bf16 buffer): count what stays on the card,
+        # not the packed file (V4.1 MXFP4: 8.8 MB packed, 6 slots + MMQ buffer = ~62 MB an expert a rank)
         H, I = c.get("hidden_size") or 0, c.get("moe_intermediate_size") or 0
-        bf16 = (3 * H * I * 2) / max(1, tp) if H and I else 4 * per_rank
-        kept = 2 * per_rank + bf16 + (per_rank if fmt_env.get("KT_GPU_STREAM_MMQ") == "1" else 0)
+        mmq = fmt_env.get("KT_GPU_STREAM_MMQ") == "1"
+        slots = max(2, int(fmt_env.get("KT_GPU_STREAM_SLOTS", "2") or 2)) if mmq else 2
+        bf16 = 0 if mmq else ((3 * H * I * 2) / max(1, tp) if H and I else 4 * per_rank)
+        kept = slots * per_rank + bf16 + (per_rank if mmq else 0)
     elif method == "NVFP4" and no_hot:
         # with no expert resident on the card the layer holds no activation scale, and the NVFP4 streamer expands
         # each group to bf16: it runs a quarter of the group it is given, in two packed slots of that quarter and a
