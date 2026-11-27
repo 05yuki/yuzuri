@@ -275,12 +275,41 @@ def mounts(paths):
     return out
 
 
+PF_EXITING = 0x4  # include/linux/sched.h: the task is in do_exit
+
+
+def exiting(proc="/proc"):
+    """The processes with a thread still on its way out: PF_EXITING set and not yet a zombie. Such a thread is
+    giving back its memory (a stopped server unmapping its expert arenas holds them for seconds after its CUDA
+    context is gone, 11-27: 340 GiB over 10 s, the RAM falling in steps with pauses of 5 s). A process whose
+    threads are all zombies (a child nobody reaped) has given its memory back and is not listed."""
+    out = []
+    for d in os.listdir(proc):
+        if not d.isdigit():
+            continue
+        try:
+            tids = os.listdir(f"{proc}/{d}/task")
+        except OSError:
+            continue
+        n = 0
+        for t in tids:
+            st = _read(f"{proc}/{d}/task/{t}/stat")
+            if ")" not in st:
+                continue
+            rest = st[st.rindex(")") + 2:].split()
+            if len(rest) > 6 and int(rest[6]) & PF_EXITING and rest[0] not in ("Z", "X"):
+                n += 1
+        if n:
+            out.append({"pid": int(d), "name": _read(f"{proc}/{d}/comm").strip() or "?", "threads": n})
+    return sorted(out, key=lambda x: x["pid"])
+
 def probe(mount_paths):
     g, gmeta = gpus()
     return {"hostname": os.uname().nodename, "kernel": os.uname().release, "cpu": cpu_info(), "numa": numa_nodes(),
             "allowed": allowed(),
             "gpus": g, "driver": gmeta.get("driver"), "cuda_toolkit": gmeta.get("cuda_toolkit"),
-            "gpu_in_use": gmeta.get("in_use", []), "gpu_leaving": gmeta.get("leaving", []), "memory": memory_settings(),
+            "gpu_in_use": gmeta.get("in_use", []), "gpu_leaving": gmeta.get("leaving", []), "exiting": exiting(),
+            "memory": memory_settings(),
             "load_1m": os.getloadavg()[0], "mounts": mounts(mount_paths)}
 
 

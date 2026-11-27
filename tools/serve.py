@@ -196,6 +196,30 @@ def wait_for_leaving(probe, limit_s=180.0, unlisted_min=1 << 30):
             time.sleep(1.0)
 
 
+def wait_for_exiting(probe, host, limit_s=180.0):
+    """The host once no process is on its way out.
+
+    A server leaves the cards before its process has given back its RAM: a scheduler unmapping a few hundred GiB of
+    expert arenas is in do_exit for seconds after its CUDA context is gone (11-27: 340 GiB over 10 s, falling in
+    steps with pauses of 5 s). A plan made in between counts those arenas as another server's and serves the experts
+    from a cache, or stops for lack of RAM. hostprobe lists the processes with a thread still exiting; with no server
+    on the cards this waits for them to end and probes again. After limit_s it plans from what is held then."""
+    t0, said = time.time(), set()
+    while not host["gpu_in_use"] and host.get("exiting"):
+        names = ", ".join(f"{p['name']}({p['pid']})" for p in host["exiting"])
+        pids = {p["pid"] for p in host["exiting"]}
+        if not pids <= said:
+            said |= pids
+            print(f"! waiting for {names} to finish exiting: the RAM it gives back is the next plan's", flush=True)
+        if time.time() - t0 > limit_s:
+            print(f"! {names} still exiting after {limit_s:.0f} s: planning from what is held now", flush=True)
+            break
+        end = time.time() + 5.0
+        while time.time() < end and any(os.path.exists(f"/proc/{p}") for p in pids):
+            time.sleep(0.1)
+        host = probe()
+    return host
+
 def model_layers(config_dir):
     c = json.load(open(os.path.join(config_dir, "config.json")))
     t = c.get("text_config", c)
@@ -396,8 +420,8 @@ def main():
         cuda_home = wheels[0] if wheels and os.path.exists(os.path.join(wheels[0], "bin", "nvcc")) else "/usr/local/cuda"
 
     # --- host, defaults for this TP, model, plan
-    host = wait_for_leaving(lambda: json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json",
-                                                   "--mounts", experts_dir])))
+    probe = lambda: json.loads(sh([sys.executable, os.path.join(HERE, "hostprobe.py"), "--json", "--mounts", experts_dir]))
+    host = wait_for_exiting(probe, wait_for_leaving(probe))
     if host["gpu_in_use"]:
         who = ", ".join(f"{u['name']}({u['pid']}, {u['used'] / (1 << 30):.1f} GiB)" for u in host["gpu_in_use"])
         if not a.beside:
