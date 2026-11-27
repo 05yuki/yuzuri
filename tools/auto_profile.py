@@ -32,7 +32,7 @@ COMMON_ENV = {
     "NCCL_IB_DISABLE": "1", "NCCL_P2P_DISABLE": "1", "SGLANG_HOST_STAGED_ALLREDUCE": "1", "SGLANG_LL_ALLREDUCE": "1",
     "KT_STREAM_MEMOPS": "1", "KT_TASKQUEUE_SPIN_US": "300", "KT_LOAD_PREFETCH": "4",
     # tier-1 19 (cpu-gpu-overlap): the hand-off packed by one kernel, the shared expert forked after the CPU request
-    "KT_HANDOFF_PACK": "1", "KT_SHARED_AFTER_SUBMIT": "1",
+    "KT_HANDOFF_PACK": "1", "KT_SHARED_AFTER_SUBMIT": "1", "KT_HC_MIX_M1": "1",
     "KT_KV_VMM_LIB": "{kv_vmm_lib}", "KT_GPU_STREAM_DROP_CACHE": "{config_dir}",
     # the barrier after loading: a rank pinning its expert arenas can take minutes past the other (SGLang's 480 s)
     "SGLANG_UNBALANCED_LOAD_TIMEOUT_S": "1800",
@@ -66,7 +66,8 @@ FORMAT_ENV = {
     # a matrix has at most 127 e4m3 values times one scale_2). Flash-Next, every expert on the CPU: 43.9 -> 47
     # tok/s, the same tokens (11-23). serve.py turns it off where the arenas hold the codes already
     # (KT_SCALE_ARENA_CODES=1)
-    "NVFP4": {"KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_MXFP4_SCALE_CODES": "1"},
+    "NVFP4": {"KT_GPU_STREAM_ROW_BLOCK": "8192", "KT_GPU_STREAM_SCALE_BYTES": "1", "KT_MXFP4_SCALE_CODES": "1",
+              "KT_GPU_STREAM_SLOTS": "4", "KT_GPU_STREAM_INTER_PREFETCH": "1"},
     "BF16": {"KT_GPU_STREAM_GRAPH": "1"},
     "LLAMAFILE": {"KT_GGUF_NOCOPY": "1", "KT_GGUF_ZEROCOPY": "1", "KT_GGUF_STREAM_MMQ": "1",
                   "KT_GGUF_STREAM_SOURCE": "bank",

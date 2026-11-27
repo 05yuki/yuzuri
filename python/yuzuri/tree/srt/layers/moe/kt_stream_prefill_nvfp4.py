@@ -62,6 +62,8 @@ from sglang.srt.layers.moe import kt_stream_threshold  # noqa: E402
 # on or off, and the length before one is measured; the length in force is kt_stream_threshold.get()
 STREAM_THRESHOLD = kt_stream_threshold.START
 GROUP_SIZE = int(os.environ.get("KT_GPU_STREAM_GROUP", "8") or 8)
+SLOTS = max(2, int(os.environ.get("KT_GPU_STREAM_SLOTS", "2") or 2))
+INTER_PREFETCH = os.environ.get("KT_GPU_STREAM_INTER_PREFETCH", "0") == "1"
 TIMING = os.environ.get("KT_GPU_STREAM_TIMING") == "1"
 # Chunks shorter than the prefill chunk run padded through the full chunk's
 # graphs.
@@ -261,7 +263,7 @@ def preallocate(layer):
         return
     N = layer.intermediate_size_per_partition
     K = layer.hidden_size
-    slots = [_DeviceSlot(GROUP_SIZE, N, K, device) for _ in range(2)]
+    slots = [_DeviceSlot(GROUP_SIZE, N, K, device) for _ in range(SLOTS)]
     _prealloc[key] = slots
     # the graph inputs for the one chunk length the streamer runs (shorter
     # steps use views of their head), made now so no long-lived buffer is
@@ -413,7 +415,9 @@ class KTStreamPrefill:
             # group shrinks by that factor so they stay one packed slot's size
             self.G = max(1, self.G // 4)
         self.slots = _prealloc.get(self.device.index) or [
-            _DeviceSlot(self.G, self.N, self.K, self.device, raw=not self.cutile) for _ in range(2)]
+            _DeviceSlot(self.G, self.N, self.K, self.device, raw=not self.cutile) for _ in range(SLOTS)]
+        self._n_slots = len(self.slots)
+        self._prefetched = {}
         self._tp_size, self._tp_rank = layer.moe_tp_size, layer.moe_tp_rank
         self._ep_size, self._ep_rank = layer.moe_ep_size, layer.moe_ep_rank
         self.transfer_stream = torch.cuda.Stream(device=self.device)
@@ -432,6 +436,8 @@ class KTStreamPrefill:
         self._arenas = {}
         self._registered = set()
         self._map_expert_arenas(method)
+        _order = sorted(self._arenas)
+        self._next_layer = {_order[i]: _order[i + 1] for i in range(len(_order) - 1)}
         self._s2 = {}      # layer_idx -> (scale_2 gate/up [E], scale_2 down [E]) on device
         self._s2u = {}     # layer_idx -> scale_2 up [E] on device, when the checkpoint names up (cuTile path)
         self._alphas = {}  # layer_idx -> (g1 [E], g2 [E]) on device, from the layer's input scales
@@ -450,7 +456,8 @@ class KTStreamPrefill:
             + (f"cuTile {'W4A4' if self._a4 else 'W4A16'}"
                f"{' with static activation globals for ' + str(len(self._g12)) + ' layers' if self._g12 else ''}"
                f" on the checkpoint's bytes, " if self.cutile else "")
-            + f"2 device slots x {(self.slots[0].w13_weight.numel() + self.slots[0].w2_weight.numel())/1e6:.0f} MB")
+            + f"{self._n_slots} device slots x {(self.slots[0].w13_weight.numel() + self.slots[0].w2_weight.numel())/1e6:.0f} MB"
+            + (", inter-layer prefetch" if INTER_PREFETCH else ""))
         if self.rank == 0 and os.environ.get("KT_GPU_STREAM_SELFTEST") == "1":
             self._selftest(method)
 
@@ -495,7 +502,7 @@ class KTStreamPrefill:
 
     def _group_body_w16(self, layer, gi: int, base: int, n: int, g):
         """Dequantize the group to bf16 and run the bf16 CUTLASS MoE ([up; gate] rows, as the W4A4 body)."""
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         N, K = self.N, self.K
         x, topk_weights, ids32, acc, out = g["x"], g["w"], g["ids"], g["acc"], g["out"]
         ws, ss = slot.raw.shape[2], slot.raw_s.shape[2] // 4
@@ -745,7 +752,7 @@ class KTStreamPrefill:
         self._register_arenas(layer_idx)
         if self.cutile:
             return self._stage_cutile(layer_idx, gi, experts, stats)
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         n = len(experts)
         base = experts[0]
         arenas = self._arenas[layer_idx]
@@ -800,7 +807,7 @@ class KTStreamPrefill:
         scale codes (the checkpoint's e4m3 bytes, row-major; each arena block's 1 KiB table stays behind). Six
         strided copies, one per arena: copying expert by expert (six each) took 58% more transfer time than the
         CUTLASS path's six contiguous copies (Flash-Next NVFP4, 64 experts a group, 11-08)."""
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         arenas = self._arenas[layer_idx]
         N, K = self.N, self.K
         wb, cb = N * K // 2, N * (K // 16)  # bytes of one matrix's weights, codes (gate, up and down alike)
@@ -891,7 +898,7 @@ class KTStreamPrefill:
     def _verify_scale_bytes(self, layer_idx: int, gi: int, base: int, n: int):
         """KT_GPU_STREAM_SCALE_BYTES_VERIFY: the bytes the DMA put in the slot
         against the FP32 arenas converted now. Synchronous; a diagnostic."""
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         arenas = self._arenas[layer_idx]
         torch.cuda.current_stream(self.device).wait_event(slot.dma_done)
         self._land_scales(slot, arenas, base, n)
@@ -914,7 +921,7 @@ class KTStreamPrefill:
             return self._group_body_w16(layer, gi, base, n, g)
         if self.cutile:
             return self._group_body_cutile(gi, base, n, g)
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         N, K = self.N, self.K
         w13_bytes = N * K // 2
         w13_s = N * (K // 16)
@@ -951,7 +958,7 @@ class KTStreamPrefill:
         graph per (token count, group). The whole slot (G experts) is passed: the ids reach only the n loaded."""
         from sglang.srt.layers.moe import kt_cutile_nvfp4
 
-        slot = self.slots[gi % 2]
+        slot = self.slots[gi % self._n_slots]
         x, w, ids32, acc, out = g["x"], g["w"], g["ids"], g["acc"], g["out"]
         local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
         wl = torch.where(local >= 0, w, torch.zeros_like(w))
@@ -1257,9 +1264,14 @@ class KTStreamPrefill:
         cur = torch.cuda.current_stream(self.device)
         if SCALE_BYTES and not self.w16 and not self.cutile:  # W4A4's bytes
             self._build_scale_bytes(layer_idx)
-        self._stage(layer_idx, 0, groups[0], stats)
+        pref = self._prefetched.pop(layer_idx, None)
+        self._prefetched.clear()
+        lead = min(self._n_slots - 1, len(groups))
+        for pre_gi in range(lead):
+            if pref is None or pre_gi not in pref:
+                self._stage(layer_idx, pre_gi, groups[pre_gi], stats)
         for gi, experts in enumerate(groups):
-            slot = self.slots[gi % 2]
+            slot = self.slots[gi % self._n_slots]
             graph = self._graph_for(layer, T, gi, experts[0], len(experts), g)
             t1 = time.perf_counter()
             self._set_group_inputs(g, layer, layer_idx, experts[0], len(experts))
@@ -1277,8 +1289,20 @@ class KTStreamPrefill:
             slot.compute_done.record(cur)
             slot.compute_used = True
             stats["graph_enq"] += time.perf_counter() - t1
-            if gi + 1 < len(groups):
-                self._stage(layer_idx, gi + 1, groups[gi + 1], stats)
+            nxt_gi = gi + lead
+            if nxt_gi < len(groups):
+                self._stage(layer_idx, nxt_gi, groups[nxt_gi], stats)
+        if INTER_PREFETCH:
+            nxt_l = self._next_layer.get(layer_idx)
+            if nxt_l is not None and nxt_l in self._arenas:
+                nxt_last = self._num_experts(nxt_l)
+                nxt_groups = [list(range(b, min(b + self.G, nxt_last))) for b in range(first, nxt_last, self.G)]
+                nxt_lead = min(self._n_slots - 1, len(nxt_groups))
+                if not (SCALE_BYTES and not self.w16 and not self.cutile and nxt_l not in self._sb):
+                    pstats = {"dma_enq": 0.0} if TIMING else stats
+                    for pre_gi in range(nxt_lead):
+                        self._stage(nxt_l, pre_gi, nxt_groups[pre_gi], pstats)
+                    self._prefetched[nxt_l] = set(range(nxt_lead))
         self.calls += 1
         if TIMING:
             cur.synchronize()

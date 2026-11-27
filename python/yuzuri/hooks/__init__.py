@@ -6,6 +6,7 @@ from yuzuri.hooks import (  # noqa: F401
     fp8_decode_gemm,
     gguf_dense,
     gguf_grouped,
+    hc_mix_m1,
     hicache_staging_cap,
     host_allreduce,
     indexer_live_topk,

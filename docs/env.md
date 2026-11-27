@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-294 names.
+296 names.
 
 ## KT_
 
@@ -65,7 +65,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GPU_STREAM_GRAPH` | `"1"` | kt_stream_prefill.py, kt_stream_prefill_bf16.py |
 | `KT_GPU_STREAM_GROUP` | `"0" / "32" / "8"` | kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py, mxfp4_runner_resident.py |
 | `KT_GPU_STREAM_HOST_BUFS` | `"3"` | kt_stream_prefill.py |
-| `KT_GPU_STREAM_INTER_PREFETCH` | `"0"` | kt_stream_prefill.py |
+| `KT_GPU_STREAM_INTER_PREFETCH` | `"0"` | kt_stream_prefill.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_IN_WINDOW` | `"0"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_KEEP` | `"32"` | kt_stream_threshold.py |
 | `KT_GPU_STREAM_MMQ` | `"0"` | kt_stream_prefill.py |
@@ -83,13 +83,15 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GPU_STREAM_SCALE_BYTES_VERIFY` | `"0"` | kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_SCALE_PACK` | `"0"` | kt_stream_prefill.py |
 | `KT_GPU_STREAM_SELFTEST` | - | kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
-| `KT_GPU_STREAM_SLOTS` | `"2"` | kt_stream_prefill.py |
+| `KT_GPU_STREAM_SLOTS` | `"2"` | kt_stream_prefill.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_SYNC_DMA` | - | kt_stream_prefill.py |
 | `KT_GPU_STREAM_TIMING` | - | kt_ep_methods.py, kt_stream_prefill.py, kt_stream_prefill_bf16.py, kt_stream_prefill_gguf.py, kt_stream_prefill_nvfp4.py |
 | `KT_GPU_STREAM_TUNE_TOKENS` | `"2048"` | kt_stream_prefill_bf16.py |
 | `KT_GPU_STREAM_W16` | `"0"` | kt_stream_prefill.py, mxfp4_runner_resident.py |
 | `KT_GPU_STREAM_ZEROCOPY` | - | kt_stream_prefill.py |
 | `KT_HANDOFF_PACK` | `"0"` | kt_handoff_pack.py |
+| `KT_HC_MIX_M1` | `"1"` | hc_mix_m1.py |
+| `KT_HC_MIX_M1_SPLIT_K` | `"8"` | hc_mix_m1.py |
 | `KT_HOST_KV` | `"1"` | kv_pool_seams.py |
 | `KT_HOST_KV_DEBUG` | - | kt_kv_vmm.py, kv_pool_seams.py |
 | `KT_HOST_KV_HEADROOM_TOKENS` | `"8192"` | kt_kv_vmm.py |
