@@ -472,11 +472,13 @@ def _quant_fused_in_proj(mod, st, handled):
     fq, fs = _quant_mxfp8_dense(fw)
     w1 = mod._fused_in_proj_qkvz_width
     mod._fused_in_proj_weight = fq
-    mod.register_buffer("_fused_in_proj_fp8_scale", fs, persistent=False)
+    _scale_param(mod, "_fused_in_proj_fp8_scale", fs)
     mod.in_proj_qkvz.weight = nn.Parameter(fq[:w1], requires_grad=False)
-    mod.in_proj_qkvz.register_buffer("_dense_fp8_scale", fs[:w1].contiguous(), persistent=False)
+    _scale_param(mod.in_proj_qkvz, "_dense_fp8_scale", fs[:w1].contiguous())
     mod.in_proj_ba.weight = nn.Parameter(fq[w1:], requires_grad=False)
-    mod.in_proj_ba.register_buffer("_dense_fp8_scale", fs[w1:].contiguous(), persistent=False)
+    # its own bytes: under the lend's smallest parameter it is not taken into the span, and as a view it kept the
+    # fused codes' first storage alive after the lend had moved them
+    _scale_param(mod.in_proj_ba, "_dense_fp8_scale", fs[w1:].clone())
     handled.add(id(mod.in_proj_qkvz))
     handled.add(id(mod.in_proj_ba))
     st["freed"] += before - (fq.numel() * fq.element_size() + fs.numel() * fs.element_size())
@@ -502,9 +504,19 @@ def _quant_dense_linear(name, mod, st, unquant):
     before = w.numel() * w.element_size()
     wq, ws = _quant_mxfp8_dense(w.data)
     mod.weight = nn.Parameter(wq, requires_grad=False)
-    mod.register_buffer("_dense_fp8_scale", ws, persistent=False)
+    _scale_param(mod, "_dense_fp8_scale", ws)
     st["freed"] += before - (wq.numel() * wq.element_size() + ws.numel() * ws.element_size())
     st["lin"] += 1
+
+
+def _scale_param(mod, name, s):
+    """A weight's scale codes as a parameter of its module: the prefill lend lays a layer's parameters into the
+    layer's span, and a buffer stays torch's own. One of 1.3 MiB went into the 1.5 MiB left over in the segment of
+    the token embedding, and when the embedding moved to the host its 1.2 GiB could not go back to the driver
+    (a one-GPU launch's window was 0.8 GiB smaller for it, 11-28)."""
+    import torch.nn as nn
+
+    mod.register_parameter(name, nn.Parameter(s, requires_grad=False))
 
 
 def _quant_lm_head(mod, st):
@@ -520,10 +532,23 @@ def _quant_lm_head(mod, st):
     ng = k // 32
     dev = w.device
     before = w.numel() * w.element_size()
+    import gc
+    import weakref
+
     host = w.detach().to("cpu")
+    alive = weakref.ref(w)
+    held0 = torch.cuda.memory_reserved(dev)
     mod.weight = None
     del w
+    # the bf16 head has a segment of torch's to itself: it goes back to the driver only while nothing else has been
+    # cut from it, so the head is the first module made FP8 and the segment is given back here
+    gc.collect()
     torch.cuda.empty_cache()
+    back = held0 - torch.cuda.memory_reserved(dev)
+    if alive() is not None or back < before:
+        print(f"[yuzuri] dense_fp8: the bf16 output head ({before >> 20} MiB) "
+              f"{'is still referred to' if alive() is not None else 'left the module'}, {back >> 20} MiB went back "
+              f"to the driver", flush=True)
     q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=dev)
     s = torch.empty((n, ng), dtype=torch.uint8, device=dev)
     for i in range(0, n, 16384):
@@ -534,7 +559,7 @@ def _quant_lm_head(mod, st):
         del qc, sc
     del host
     mod.weight = nn.Parameter(q, requires_grad=False)
-    mod.register_buffer("_dense_fp8_scale", s, persistent=False)
+    _scale_param(mod, "_dense_fp8_scale", s)
     st["freed"] += before - (q.numel() * q.element_size() + s.numel() * s.element_size())
     st["head"] += 1
 
@@ -552,7 +577,6 @@ def _quantize_model(model):
         kt_lend = None
     st = dict(hc=0, hc_freed=0, fused=0, lin=0, head=0, freed=0)
     handled = set()
-    heads = []
     cur = cur_mod = None
 
     def close():
@@ -562,6 +586,13 @@ def _quantize_model(model):
 
     at = "?"
     try:
+        # the output head first: its bf16 weight has a segment of torch's to itself with 1.5 MiB over, and a scale
+        # buffer of a layer made before it went into that 1.5 MiB and kept the whole 1.2 GiB from the driver (11-28)
+        if _DENSE_FP8 and _DENSE_FP8_LM_HEAD:
+            for name, mod in model.named_modules():
+                if name == "lm_head" or name.endswith(".lm_head"):
+                    at = name
+                    _quant_lm_head(mod, st)
         for name, mod in model.named_modules():
             at = name
             i = getattr(mod, "_kt_lend_layer", None)
@@ -573,16 +604,11 @@ def _quantize_model(model):
             if not _DENSE_FP8 or id(mod) in handled:
                 continue
             if name == "lm_head" or name.endswith(".lm_head"):
-                if _DENSE_FP8_LM_HEAD:
-                    heads.append((name, mod))
                 continue
             _quant_fused_in_proj(mod, st, handled)
             _quant_dense_linear(name, mod, st, UnquantizedLinearMethod)
         close()
         cur_mod = None
-        for name, mod in heads:
-            at = name
-            _quant_lm_head(mod, st)
     except torch.OutOfMemoryError as e:
         dev = torch.cuda.current_device()
         raise RuntimeError(
