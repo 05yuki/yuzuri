@@ -349,7 +349,8 @@ def _fp8_linear(x, w, s_u8, bias=None):
         and bias is None
         and x2.is_cuda
         and x2.dtype in (torch.bfloat16, torch.float16)
-        and n <= 16384
+        and 128 <= n <= 16384  # mm_mxfp8 takes n and k from 128 up (a one-GPU in_proj_ba is 96 rows wide)
+        and k >= 128
         and n % 32 == 0
         and k % 32 == 0
         and not torch.cuda.is_current_stream_capturing()
