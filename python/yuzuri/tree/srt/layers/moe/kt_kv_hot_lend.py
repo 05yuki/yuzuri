@@ -2609,8 +2609,11 @@ def _spread_back() -> None:
 
 
 def _spread_step(dev) -> None:
-    """One forward's share of the waiting slots, on the current stream: the copies, then their table entries (the
-    same order on every rank: the same lists, the same scores, the same count a forward)."""
+    """One forward's share of the waiting slots, on the current stream: the copies, then their table entries.
+    Ranks whose slots hold the same experts fill the same rows a forward. Under EP each rank fills its own share,
+    the lists differ in length, and one rank's list ends a forward before another's: the union and the end of
+    the fill are then taken on the same forward by every rank (one all-reduce of the counts over the CPU group),
+    or a rank waits in the union's all-reduce for a rank that has gone on to the next request."""
     bl, n = STATE["backlog"], STATE["backlog_n"]
     rows, have = [], {}
     while bl and len(rows) < n:
@@ -2633,9 +2636,13 @@ def _spread_step(dev) -> None:
     if rows:
         t = torch.tensor(rows, dtype=torch.int64).to(dev)
         STATE["tbl"][t[:, 0], t[:, 1]] = t[:, 2]
+    filled, left = len(rows), len(bl)
+    if _ep(LAYERS[0]) and _world() > 1:
+        filled, left = _over_ranks([filled, left], torch.distributed.ReduceOp.MAX)
+    if filled:
         _union()
     STATE["backlog_done"] = STATE.get("backlog_done", 0) + len(rows)
-    if not bl:
+    if not left:
         STATE["backlog"] = None
         if STATE["lends"] in (1, 2, 3, 10, 100, 1000) or CHECK or PHASES:
             _log(f"lend {STATE['lends']}: {STATE.pop('backlog_done', 0)} waiting slots filled over "
@@ -2669,7 +2676,7 @@ def tick(runner) -> None:
     STATE.pop("stood", None)
     STATE.pop("stood_t", None)
     STATE["owed"] = 0
-    if more and not regrow and STATE.get("backlog"):
+    if more and not regrow and STATE.get("backlog") is not None:
         # a fresh lend's slots are still being filled: no round and no growth until they are
         _spread_step(LAYERS[0].slots[LAYERS[0].names[0][1]].device)
         return
@@ -2802,7 +2809,7 @@ def tick(runner) -> None:
         ev0.record()
     if regrow and DYNAMIC and DYN["on"]:
         _dyn_settle(dev)
-    later = []
+    later, spread = [], False
     for L, k, b in zip(LAYERS, ks, base):
         if regrow and DYNAMIC and DYN["on"]:
             _dyn_fill(L, k, lo=b)
@@ -2817,12 +2824,13 @@ def tick(runner) -> None:
         elif k and DYNAMIC:
             if FILL_SPREAD and DYN["on"]:
                 later += _spread_hold(L, k)
+                spread = True
             _dyn_fill(L, k)
         elif k > b:
             for _, nm in L.names:
                 L.slots[nm][b:k].copy_(L.banks[nm][b:k], non_blocking=True)
         L.k = k
-    if later:
+    if spread:  # also with nothing waiting on this rank: under EP another rank's share may wait
         later.sort()  # the highest score last: _spread_step pops from the end
         STATE["backlog"], STATE["backlog_t"] = later, time.perf_counter()
         STATE["backlog_n"] = -(-len(later) // FILL_SPREAD)
