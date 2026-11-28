@@ -6,7 +6,7 @@ The launcher sets what a run needs. A variable here is a switch for a measuremen
 
 Default is the value the code falls back to. A dash means the code only checks whether it is set, or takes the default from elsewhere.
 
-296 names.
+301 names.
 
 ## KT_
 
@@ -15,6 +15,10 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_AUTO_GROUP_MB` | `"800"` | auto_profile.py |
 | `KT_CPU_A4` | `"1"` | kt_cutile_nvfp4.py |
 | `KT_CUTILE_NVFP4` | `"1"` | kt_cutile_nvfp4.py |
+| `KT_DENSE_BF16_GEMV` | `"1"` | hc_mix_m1.py |
+| `KT_DENSE_FP8` | `"0"` | hc_mix_m1.py |
+| `KT_DENSE_FP8_LM_HEAD` | `"0"` | hc_mix_m1.py |
+| `KT_DENSE_PREFILL_MXFP8` | `"1"` | hc_mix_m1.py |
 | `KT_FAST_PINNED` | - | kt_pinned.py |
 | `KT_FAST_PINNED_MIN` | `str(64 << 20)` | kt_pinned.py |
 | `KT_FAULTHANDLER` | `"0"` | kt_lend.py |
@@ -90,6 +94,7 @@ Default is the value the code falls back to. A dash means the code only checks w
 | `KT_GPU_STREAM_W16` | `"0"` | kt_stream_prefill.py, mxfp4_runner_resident.py |
 | `KT_GPU_STREAM_ZEROCOPY` | - | kt_stream_prefill.py |
 | `KT_HANDOFF_PACK` | `"0"` | kt_handoff_pack.py |
+| `KT_HC_MIX_FP8` | `"0"` | hc_mix_m1.py |
 | `KT_HC_MIX_M1` | `"1"` | hc_mix_m1.py |
 | `KT_HC_MIX_M1_SPLIT_K` | `"8"` | hc_mix_m1.py |
 | `KT_HOST_KV` | `"1"` | kv_pool_seams.py |
