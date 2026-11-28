@@ -417,138 +417,192 @@ def _bf16_small_gemv(x, w):
     return out.view(*orig_shape[:-1], n)
 
 
-def _quantize_gated_residuals(model):
+def _quant_gated_residual(mod, st):
     import torch
     import torch.nn as nn
 
-    count = 0
-    freed = 0
-    for mod in model.modules():
-        wd_lin = getattr(mod, "input_mix_weight_down", None)
-        wu_lin = getattr(mod, "input_mix_weight_up", None)
-        if not (isinstance(wd_lin, nn.Linear) and isinstance(wu_lin, nn.Linear)):
-            continue
-        wd = wd_lin.weight
-        wu = wu_lin.weight
-        if not (wd.is_cuda and wu.is_cuda and wd.dtype == torch.bfloat16 and wu.dtype == torch.bfloat16):
-            continue
-        before = wd.numel() * wd.element_size() + wu.numel() * wu.element_size()
-        wd_q, sd = _quant_fp8_row(wd.data)
-        wu_q, su = _quant_fp8_row(wu.data)
-        p_d = nn.Parameter(wd_q, requires_grad=False)
-        p_u = nn.Parameter(wu_q, requires_grad=False)
-        p_d._hc_fp8_scale = sd
-        p_u._hc_fp8_scale = su
-        wd_lin.weight = p_d
-        wu_lin.weight = p_u
-        mod.register_buffer("_hc_down_scale", sd, persistent=False)
-        mod.register_buffer("_hc_up_scale", su, persistent=False)
-        after = (
-            wd_q.numel() * wd_q.element_size()
-            + wu_q.numel() * wu_q.element_size()
-            + sd.numel() * sd.element_size()
-            + su.numel() * su.element_size()
-        )
-        freed += before - after
-        count += 1
-    if count:
-        logger.info(
-            "[yuzuri] hc_mix_fp8: quantized %d GatedResidual modules in-place (pre-kt_lend), freed %.1f MiB",
-            count,
-            freed / (1024 * 1024),
-        )
-    return count
+    wd_lin = getattr(mod, "input_mix_weight_down", None)
+    wu_lin = getattr(mod, "input_mix_weight_up", None)
+    if not (isinstance(wd_lin, nn.Linear) and isinstance(wu_lin, nn.Linear)):
+        return
+    wd = wd_lin.weight
+    wu = wu_lin.weight
+    if not (wd.is_cuda and wu.is_cuda and wd.dtype == torch.bfloat16 and wu.dtype == torch.bfloat16):
+        return
+    before = wd.numel() * wd.element_size() + wu.numel() * wu.element_size()
+    wd_q, sd = _quant_fp8_row(wd.data)
+    wu_q, su = _quant_fp8_row(wu.data)
+    p_d = nn.Parameter(wd_q, requires_grad=False)
+    p_u = nn.Parameter(wu_q, requires_grad=False)
+    p_d._hc_fp8_scale = sd
+    p_u._hc_fp8_scale = su
+    wd_lin.weight = p_d
+    wu_lin.weight = p_u
+    mod.register_buffer("_hc_down_scale", sd, persistent=False)
+    mod.register_buffer("_hc_up_scale", su, persistent=False)
+    after = (
+        wd_q.numel() * wd_q.element_size()
+        + wu_q.numel() * wu_q.element_size()
+        + sd.numel() * sd.element_size()
+        + su.numel() * su.element_size()
+    )
+    st["hc_freed"] += before - after
+    st["hc"] += 1
 
 
-def _quantize_dense_linears(model):
+def _quant_fused_in_proj(mod, st, handled):
     import torch
     import torch.nn as nn
+
+    fw = getattr(mod, "_fused_in_proj_weight", None)
+    if not (
+        fw is not None
+        and isinstance(fw, torch.Tensor)
+        and fw.is_cuda
+        and fw.dim() == 2
+        and fw.dtype == torch.bfloat16
+        and fw.shape[1] % 32 == 0
+        and hasattr(mod, "in_proj_qkvz")
+        and hasattr(mod, "in_proj_ba")
+        and getattr(mod, "_fused_in_proj_qkvz_width", 0) > 0
+    ):
+        return
+    before = fw.numel() * fw.element_size()
+    fq, fs = _quant_mxfp8_dense(fw)
+    w1 = mod._fused_in_proj_qkvz_width
+    mod._fused_in_proj_weight = fq
+    mod.register_buffer("_fused_in_proj_fp8_scale", fs, persistent=False)
+    mod.in_proj_qkvz.weight = nn.Parameter(fq[:w1], requires_grad=False)
+    mod.in_proj_qkvz.register_buffer("_dense_fp8_scale", fs[:w1].contiguous(), persistent=False)
+    mod.in_proj_ba.weight = nn.Parameter(fq[w1:], requires_grad=False)
+    mod.in_proj_ba.register_buffer("_dense_fp8_scale", fs[w1:].contiguous(), persistent=False)
+    handled.add(id(mod.in_proj_qkvz))
+    handled.add(id(mod.in_proj_ba))
+    st["freed"] += before - (fq.numel() * fq.element_size() + fs.numel() * fs.element_size())
+    st["fused"] += 1
+
+
+def _quant_dense_linear(name, mod, st, unquant):
+    import torch
+    import torch.nn as nn
+
+    if not isinstance(getattr(mod, "quant_method", None), unquant):
+        return
+    if any(skip in name for skip in ("embed_tokens", "hyper_connection", "visual", "mtp", "shared_expert_gate", "lm_head")):
+        return
+    if name.endswith(".gate") or ".mlp.gate" in name:
+        return
+    w = getattr(mod, "weight", None)
+    if w is None or not w.is_cuda or w.dim() != 2 or w.dtype != torch.bfloat16 or getattr(mod, "bias", None) is not None:
+        return
+    n, k = w.shape
+    if n < 256 or k < 256 or k % 64 != 0:
+        return
+    before = w.numel() * w.element_size()
+    wq, ws = _quant_mxfp8_dense(w.data)
+    mod.weight = nn.Parameter(wq, requires_grad=False)
+    mod.register_buffer("_dense_fp8_scale", ws, persistent=False)
+    st["freed"] += before - (wq.numel() * wq.element_size() + ws.numel() * ws.element_size())
+    st["lin"] += 1
+
+
+def _quant_lm_head(mod, st):
+    """The output head through host memory: its bf16 bytes leave the card before the FP8 ones are made, so the card
+    holds the larger of the two and one 16,384-row piece, not both (a one-GPU launch has no room for both)."""
+    import torch
+    import torch.nn as nn
+
+    w = getattr(mod, "weight", None)
+    if not (w is not None and w.is_cuda and w.dim() == 2 and w.dtype == torch.bfloat16 and w.shape[1] % 128 == 0):
+        return
+    n, k = w.shape
+    ng = k // 32
+    dev = w.device
+    before = w.numel() * w.element_size()
+    host = w.detach().to("cpu")
+    mod.weight = None
+    del w
+    torch.cuda.empty_cache()
+    q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=dev)
+    s = torch.empty((n, ng), dtype=torch.uint8, device=dev)
+    for i in range(0, n, 16384):
+        j = min(i + 16384, n)
+        qc, sc = _quant_mxfp8_dense(host[i:j].to(dev))
+        q[i:j] = qc
+        s[i:j] = sc
+        del qc, sc
+    del host
+    mod.weight = nn.Parameter(q, requires_grad=False)
+    mod.register_buffer("_dense_fp8_scale", s, persistent=False)
+    st["freed"] += before - (q.numel() * q.element_size() + s.numel() * s.element_size())
+    st["head"] += 1
+
+
+def _quantize_model(model):
+    """One pass over the modules. A decoder layer the prefill lend holds in a span is taken back into that span as
+    soon as its modules are done (kt_lend.after_module), so the FP8 copies made outside the spans are one layer's at
+    a time: made for the whole model before the lend's end of load, they did not fit beside the spans on one card."""
+    import torch
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+    try:
+        from sglang.srt.layers.moe import kt_lend
+    except ImportError:
+        kt_lend = None
+    st = dict(hc=0, hc_freed=0, fused=0, lin=0, head=0, freed=0)
     handled = set()
-    fused_count = 0
-    lin_count = 0
-    lm_head_count = 0
-    freed = 0
+    heads = []
+    cur = cur_mod = None
 
-    for name, mod in model.named_modules():
-        fw = getattr(mod, "_fused_in_proj_weight", None)
-        if (
-            fw is not None
-            and isinstance(fw, torch.Tensor)
-            and fw.is_cuda
-            and fw.dim() == 2
-            and fw.dtype == torch.bfloat16
-            and fw.shape[1] % 32 == 0
-            and hasattr(mod, "in_proj_qkvz")
-            and hasattr(mod, "in_proj_ba")
-            and getattr(mod, "_fused_in_proj_qkvz_width", 0) > 0
-        ):
-            before = fw.numel() * fw.element_size()
-            fq, fs = _quant_mxfp8_dense(fw)
-            w1 = mod._fused_in_proj_qkvz_width
-            mod._fused_in_proj_weight = fq
-            mod.register_buffer("_fused_in_proj_fp8_scale", fs, persistent=False)
-            mod.in_proj_qkvz.weight = nn.Parameter(fq[:w1], requires_grad=False)
-            mod.in_proj_qkvz.register_buffer("_dense_fp8_scale", fs[:w1].contiguous(), persistent=False)
-            mod.in_proj_ba.weight = nn.Parameter(fq[w1:], requires_grad=False)
-            mod.in_proj_ba.register_buffer("_dense_fp8_scale", fs[w1:].contiguous(), persistent=False)
-            handled.add(id(mod.in_proj_qkvz))
-            handled.add(id(mod.in_proj_ba))
-            after = fq.numel() * fq.element_size() + fs.numel() * fs.element_size()
-            freed += before - after
-            fused_count += 1
+    def close():
+        if cur_mod is not None and kt_lend is not None:
+            kt_lend.after_module(cur_mod)
+            torch.cuda.empty_cache()
 
-    for name, mod in model.named_modules():
-        if id(mod) in handled:
-            continue
-        if _DENSE_FP8_LM_HEAD and (name == "lm_head" or name.endswith(".lm_head")):
-            w = getattr(mod, "weight", None)
-            if w is not None and w.is_cuda and w.dim() == 2 and w.dtype == torch.bfloat16 and w.shape[1] % 128 == 0:
-                before = w.numel() * w.element_size()
-                wq, ws = _quant_mxfp8_dense(w.data)
-                mod.weight = nn.Parameter(wq, requires_grad=False)
-                del w
-                mod.register_buffer("_dense_fp8_scale", ws, persistent=False)
-                after = wq.numel() * wq.element_size() + ws.numel() * ws.element_size()
-                freed += before - after
-                lm_head_count += 1
-            continue
-        if not isinstance(getattr(mod, "quant_method", None), UnquantizedLinearMethod):
-            continue
-        if any(skip in name for skip in ("embed_tokens", "hyper_connection", "visual", "mtp", "shared_expert_gate", "lm_head")):
-            continue
-        if name.endswith(".gate") or ".mlp.gate" in name:
-            continue
-        w = getattr(mod, "weight", None)
-        if (
-            w is None
-            or not w.is_cuda
-            or w.dim() != 2
-            or w.dtype != torch.bfloat16
-            or getattr(mod, "bias", None) is not None
-        ):
-            continue
-        n, k = w.shape
-        if n < 256 or k < 256 or k % 64 != 0:
-            continue
-        before = w.numel() * w.element_size()
-        wq, ws = _quant_mxfp8_dense(w.data)
-        mod.weight = nn.Parameter(wq, requires_grad=False)
-        mod.register_buffer("_dense_fp8_scale", ws, persistent=False)
-        after = wq.numel() * wq.element_size() + ws.numel() * ws.element_size()
-        freed += before - after
-        lin_count += 1
-
-    if fused_count or lin_count or lm_head_count:
+    at = "?"
+    try:
+        for name, mod in model.named_modules():
+            at = name
+            i = getattr(mod, "_kt_lend_layer", None)
+            if i != cur:
+                close()
+                cur, cur_mod = i, (mod if i is not None else None)
+            if _FP8_ENABLED:
+                _quant_gated_residual(mod, st)
+            if not _DENSE_FP8 or id(mod) in handled:
+                continue
+            if name == "lm_head" or name.endswith(".lm_head"):
+                if _DENSE_FP8_LM_HEAD:
+                    heads.append((name, mod))
+                continue
+            _quant_fused_in_proj(mod, st, handled)
+            _quant_dense_linear(name, mod, st, UnquantizedLinearMethod)
+        close()
+        cur_mod = None
+        for name, mod in heads:
+            at = name
+            _quant_lm_head(mod, st)
+    except torch.OutOfMemoryError as e:
+        dev = torch.cuda.current_device()
+        raise RuntimeError(
+            f"KT_HC_MIX_FP8 / KT_DENSE_FP8: no room on cuda:{dev} to make the FP8 copy of {at} "
+            f"({torch.cuda.mem_get_info(dev)[0] >> 20} MiB free): launch without them, or on more cards"
+        ) from e
+    if st["hc"]:
+        logger.info(
+            "[yuzuri] hc_mix_fp8: quantized %d GatedResidual modules in-place (pre-kt_lend), freed %.1f MiB",
+            st["hc"],
+            st["hc_freed"] / (1024 * 1024),
+        )
+    if st["fused"] or st["lin"] or st["head"]:
         logger.info(
             "[yuzuri] dense_fp8(mxfp8-b32): quantized %d fused in_proj + %d dense linears + %d lm_head in-place (pre-kt_lend), freed %.1f MiB",
-            fused_count,
-            lin_count,
-            lm_head_count,
-            freed / (1024 * 1024),
+            st["fused"],
+            st["lin"],
+            st["head"],
+            st["freed"] / (1024 * 1024),
         )
-    return fused_count + lin_count + lm_head_count
+    return st["hc"] + st["fused"] + st["lin"] + st["head"]
 
 
 def _install_hc_mix(m):
@@ -782,11 +836,7 @@ def _install_loader(m):
     def make_postprocess(orig):
         def postprocess_weights(model, target_device):
             got = orig(model, target_device)
-            did = 0
-            if _FP8_ENABLED:
-                did += _quantize_gated_residuals(model)
-            if _DENSE_FP8:
-                did += _quantize_dense_linears(model)
+            did = _quantize_model(model)
             if did:
                 torch.cuda.empty_cache()
             return got

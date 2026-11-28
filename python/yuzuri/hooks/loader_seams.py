@@ -90,7 +90,8 @@ def _install(m):
                 return orig(self, source, *args, **kwargs)
             gguf, model_config, model = primary
             logger.info("loading the dense weights from GGUF %s", gguf)
-            if self.counter_before_loading_weights == 0.0:
+            # the loader's own start mark, where the SGLang served has one (gone by a9a27e92)
+            if getattr(self, "counter_before_loading_weights", None) == 0.0:
                 self.counter_before_loading_weights = time.perf_counter()
             return kt_gguf_dense.weights(gguf, model_config, model)
 
